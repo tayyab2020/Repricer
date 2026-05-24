@@ -205,7 +205,11 @@ app.get('/api/pm2-logs', (req, res) => {
   res.flushHeaders();
 
   const send = (line, source) => {
-    res.write(`data: ${JSON.stringify({ ts: new Date().toISOString(), line, source })}\n\n`);
+    // Use timestamp embedded in log line (e.g. [2026-05-24T12:54:10.037Z]) so the
+    // UI shows when the event actually happened, not when it was streamed.
+    const match = line.match(/\[(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\]/);
+    const ts = match ? match[1] : new Date().toISOString();
+    res.write(`data: ${JSON.stringify({ ts, line, source })}\n\n`);
   };
 
   // Windows = local dev (no PM2/tail); Linux = production VPS

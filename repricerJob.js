@@ -460,14 +460,14 @@ function _cronPattern(minutes) {
 // Re-read all settings from DB and apply them in this worker process.
 // Called before every run so changes made via the Settings UI take effect
 // without requiring a worker restart.
-async function reloadSettings() {
+async function reloadSettings({ log = false } = {}) {
   try {
     const { rows } = await db.query('SELECT key, value FROM settings');
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
     setProxyApiUrl(s.webshare_proxy_api || null);
     if (s.onbuy_fee_percent)   setRepricerDefaults({ feeRate:    parseFloat(s.onbuy_fee_percent) });
     if (s.default_roi_percent) setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
-    console.log(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
+    if (log) console.log(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
   } catch (e) {
     console.warn('[RepricerJob] Could not reload settings:', e.message);
   }
@@ -481,7 +481,7 @@ function _applySchedule() {
       console.log(`[Scheduler] Before start time ${_startTime} — skipping tick`);
       return;
     }
-    await reloadSettings();
+    await reloadSettings({ log: true });
     runRepricerJob();
   });
   console.log(`[Scheduler] ✅ Pattern: "${pattern}"  Start time: ${_startTime}  Interval: ${_intervalMinutes}min`);
@@ -508,7 +508,7 @@ redisSub.subscribe('repricer:settings-updated', (err) => {
 redisSub.on('message', (channel) => {
   if (channel === 'repricer:settings-updated') {
     console.log('[RepricerJob] Settings change detected — reloading from DB');
-    reloadSettings();
+    reloadSettings({ log: true });
   }
 });
 
