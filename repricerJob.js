@@ -61,6 +61,10 @@ const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', 
 const FAST_CONCURRENCY = parseInt(process.env.FAST_WORKERS ?? '20');
 const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
 
+// Timestamped console.log — keeps live-logs timestamps accurate for lines
+// that don't come from amazonScraper.js (which adds its own timestamps).
+const wlog = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
+
 // ─────────────────────────────────────────────
 // ONBUY API
 // ─────────────────────────────────────────────
@@ -72,7 +76,7 @@ async function updateOnBuyPrice(listingId, newPrice, token, siteId) {
     body: JSON.stringify({ listings: [{ uid: listingId, price: newPrice.toFixed(2) }] }),
   });
   const raw = await res.text();
-  console.log(`[OnBuy Price] uid=${listingId} HTTP ${res.status} → ${raw.slice(0, 200)}`);
+  wlog(`[OnBuy Price] uid=${listingId} HTTP ${res.status} → ${raw.slice(0, 200)}`);
   if (!res.ok) throw new Error(`OnBuy ${res.status}: ${raw.slice(0, 200)}`);
   const data = JSON.parse(raw);
   const item = Array.isArray(data?.results) ? data.results[0]
@@ -89,7 +93,7 @@ async function updateOnBuyPriceBySku(sku, newPrice, token, siteId) {
     body: JSON.stringify({ listings: [{ sku, price: newPrice.toFixed(2) }] }),
   });
   const raw = await res.text();
-  console.log(`[OnBuy Price] sku=${sku} HTTP ${res.status} → ${raw.slice(0, 200)}`);
+  wlog(`[OnBuy Price] sku=${sku} HTTP ${res.status} → ${raw.slice(0, 200)}`);
   if (!res.ok) throw new Error(`OnBuy ${res.status}: ${raw.slice(0, 200)}`);
   const data = JSON.parse(raw);
   const item = Array.isArray(data?.results) ? data.results[0]
@@ -105,14 +109,14 @@ async function setOnBuyStock(identifier, quantity, token, siteId, isSku) {
     : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
   const listingField = isSku ? { sku: identifier } : { uid: identifier };
   const body = JSON.stringify({ listings: [{ ...listingField, stock: quantity }] });
-  console.log(`[OnBuy Stock] ${isSku ? 'sku' : 'uid'}=${identifier} → stock=${quantity}`);
+  wlog(`[OnBuy Stock] ${isSku ? 'sku' : 'uid'}=${identifier} → stock=${quantity}`);
   const res = await fetch(endpoint, {
     method: 'PUT',
     headers: { Authorization: token, 'Content-Type': 'application/json' },
     body,
   });
   const raw = await res.text();
-  console.log(`[OnBuy Stock] HTTP ${res.status} → ${raw.slice(0, 200)}`);
+  wlog(`[OnBuy Stock] HTTP ${res.status} → ${raw.slice(0, 200)}`);
   return raw;
 }
 
@@ -206,7 +210,7 @@ async function applyResult(scraped, mapping, token, siteId) {
       `UPDATE product_mappings SET markup_value = $1 WHERE id = $2`,
       [markup_value, id]
     );
-    console.log(`[Worker] Calibrated ROI for #${id}: ${markup_value.toFixed(2)}% (target £${target_price})`);
+    wlog(`[Worker] Calibrated ROI for #${id}: ${markup_value.toFixed(2)}% (target £${target_price})`);
   }
 
   const label = `${product_name || primary_asin} (#${id})`;
@@ -216,10 +220,10 @@ async function applyResult(scraped, mapping, token, siteId) {
     const wasAlreadyOos = amazon_in_stock === false;
     const identifier    = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
     if (!wasAlreadyOos) {
-      console.log(`[Worker] ⚠️  ${label} — OOS, setting stock=0`);
+      wlog(`[Worker] ⚠️  ${label} — OOS, setting stock=0`);
       await setOnBuyStock(identifier, 0, token, siteId, !!onbuy_sku);
     } else {
-      console.log(`[Worker] ⏭  ${label} — still OOS, no change`);
+      wlog(`[Worker] ⏭  ${label} — still OOS, no change`);
     }
     await db.query(
       `UPDATE product_mappings SET amazon_in_stock = false, last_checked_at = NOW() WHERE id = $1`, [id]
@@ -236,7 +240,7 @@ async function applyResult(scraped, mapping, token, siteId) {
   // not that the item is back in stock. Never restore from a failed scrape.
   if (amazon_in_stock === false && scraped.price) {
     const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
-    console.log(`[Worker] ✅ ${label} — back in stock, restoring stock=2`);
+    wlog(`[Worker] ✅ ${label} — back in stock, restoring stock=2`);
     await setOnBuyStock(identifier, 2, token, siteId, !!onbuy_sku);
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
@@ -254,7 +258,7 @@ async function applyResult(scraped, mapping, token, siteId) {
 
   const amazonPrice   = scraped.price;
   const newOnBuyPrice = computeOnBuyPrice(amazonPrice, markup_type, markup_value, min_price);
-  console.log(`[Worker] ${label} — Amazon £${amazonPrice} → OnBuy £${newOnBuyPrice} (${scraped.method})`);
+  wlog(`[Worker] ${label} — Amazon £${amazonPrice} → OnBuy £${newOnBuyPrice} (${scraped.method})`);
 
   // ── Skip if unchanged ──
   const alreadyCorrect = last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
@@ -351,7 +355,7 @@ async function processFastJob(job) {
     const drainMs    = batches * 12000 + 10000;
     const delay      = Math.max(5000, Math.min(drainMs, 300000)); // 5 s – 5 min cap
 
-    console.log(`[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
+    wlog(`[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
     await slowQueue.add('scrape', { mapping, token, siteId }, {
       jobId:             `slow-${mapping.id}`,
       delay,
@@ -405,7 +409,7 @@ try {
       startTime:       s.job_start_time       || undefined,
     });
   }
-  console.log(`[RepricerJob] Settings pre-loaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}  fee: ${s.onbuy_fee_percent || 15}%  interval: ${s.job_interval_minutes || 30}min  start: ${s.job_start_time || '00:00'}`);
+  wlog(`[RepricerJob] Settings pre-loaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}  fee: ${s.onbuy_fee_percent || 15}%  interval: ${s.job_interval_minutes || 30}min  start: ${s.job_start_time || '00:00'}`);
 } catch (e) {
   console.warn('[RepricerJob] Could not pre-load settings from DB:', e.message);
 }
@@ -433,7 +437,7 @@ slowWorker.on('failed', (job, err) =>
   console.error(`[SlowWorker] ❌ job ${job?.id} failed: ${err.message}`)
 );
 
-console.log(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
+wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
 
 // ─────────────────────────────────────────────
 // SCHEDULER
@@ -467,7 +471,7 @@ async function reloadSettings({ log = false } = {}) {
     setProxyApiUrl(s.webshare_proxy_api || null);
     if (s.onbuy_fee_percent)   setRepricerDefaults({ feeRate:    parseFloat(s.onbuy_fee_percent) });
     if (s.default_roi_percent) setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
-    if (log) console.log(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
+    if (log) wlog(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
   } catch (e) {
     console.warn('[RepricerJob] Could not reload settings:', e.message);
   }
@@ -478,13 +482,13 @@ function _applySchedule() {
   const pattern = _cronPattern(_intervalMinutes);
   _activeCron = cron.schedule(pattern, async () => {
     if (!_isAfterStartTime()) {
-      console.log(`[Scheduler] Before start time ${_startTime} — skipping tick`);
+      wlog(`[Scheduler] Before start time ${_startTime} — skipping tick`);
       return;
     }
     await reloadSettings({ log: true });
     runRepricerJob();
   });
-  console.log(`[Scheduler] ✅ Pattern: "${pattern}"  Start time: ${_startTime}  Interval: ${_intervalMinutes}min`);
+  wlog(`[Scheduler] ✅ Pattern: "${pattern}"  Start time: ${_startTime}  Interval: ${_intervalMinutes}min`);
 }
 
 // Called by server.js after settings are loaded from DB, so proxy URL / fee rate
@@ -503,11 +507,11 @@ startScheduler();
 // Changes from the Settings UI take effect immediately without a PM2 restart.
 redisSub.subscribe('repricer:settings-updated', (err) => {
   if (err) console.warn('[RepricerJob] Could not subscribe to settings channel:', err.message);
-  else     console.log('[RepricerJob] Subscribed to repricer:settings-updated');
+  else     wlog('[RepricerJob] Subscribed to repricer:settings-updated');
 });
 redisSub.on('message', (channel) => {
   if (channel === 'repricer:settings-updated') {
-    console.log('[RepricerJob] Settings change detected — reloading from DB');
+    wlog('[RepricerJob] Settings change detected — reloading from DB');
     reloadSettings({ log: true });
   }
 });
