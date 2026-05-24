@@ -466,7 +466,7 @@ app.get('/api/logs', async (req, res) => {
 // ─────────────────────────────────────────────
 // FILE UPLOAD (multer in-memory)
 // ─────────────────────────────────────────────
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 // ─────────────────────────────────────────────
 // ONBUY ACCOUNTS
