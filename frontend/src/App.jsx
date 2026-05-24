@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend
@@ -1091,11 +1091,12 @@ export default function App() {
   const nav = [
     { id:"dashboard",      label:"📊 Dashboard" },
     { id:"mappings",       label:"🔗 Mappings" },
-    { id:"compare",        label:"⚖️ Compare" },
+    // { id:"compare",        label:"⚖️ Compare" },
     { id:"current-prices", label:"💷 Current Prices" },
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
     { id:"settings",       label:"⚙️ Settings" },
+    { id:"logs",           label:"📋 Live Logs" },
   ];
 
   return (
@@ -1186,6 +1187,7 @@ export default function App() {
             {page === "accounts"       && "Connect and manage your OnBuy seller accounts"}
             {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
             {page === "settings"       && "Configure proxies and global repricer options"}
+            {page === "logs"           && "Real-time output from API server and job worker"}
           </p>
         </div>
 
@@ -1197,6 +1199,7 @@ export default function App() {
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
         {page === "settings"       && <SettingsPage />}
+        {page === "logs"           && <LiveLogsPage />}
         {page === "chart"          && chartMapping && (
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:24 }}>
@@ -1381,6 +1384,148 @@ const IMPORT_STEPS = [
   { icon: "🔄", text: "Syncing with OnBuy…" },
   { icon: "✅", text: "Finalising import…" },
 ];
+
+// ════════════════════════════════════════════
+//  LIVE LOGS PAGE
+// ════════════════════════════════════════════
+
+const LOG_COLORS = {
+  worker:     "#4ade80",
+  "worker-err": "#f87171",
+  api:        "#60a5fa",
+  "api-err":  "#fb923c",
+};
+
+const LOG_LABELS = {
+  worker:       "Worker",
+  "worker-err": "Worker ERR",
+  api:          "API",
+  "api-err":    "API ERR",
+};
+
+function LiveLogsPage() {
+  const [process_, setProcess] = useState("worker");
+  const [lines, setLines]      = useState([]);
+  const [paused, setPaused]    = useState(false);
+  const [connected, setConnected] = useState(false);
+  const bottomRef  = useRef(null);
+  const esRef      = useRef(null);
+  const pausedRef  = useRef(false);
+
+  pausedRef.current = paused;
+
+  function connect(proc) {
+    if (esRef.current) esRef.current.close();
+    setLines([]);
+    setConnected(false);
+    const es = new EventSource(`${API}/pm2-logs?process=${proc}`);
+    es.onopen = () => setConnected(true);
+    es.onmessage = e => {
+      if (pausedRef.current) return;
+      const data = JSON.parse(e.data);
+      setLines(prev => {
+        const next = [...prev, data];
+        return next.length > 500 ? next.slice(-500) : next;
+      });
+    };
+    es.onerror = () => setConnected(false);
+    esRef.current = es;
+  }
+
+  useEffect(() => {
+    connect(process_);
+    return () => esRef.current?.close();
+  }, [process_]);
+
+  useEffect(() => {
+    if (!paused) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [lines, paused]);
+
+  const isDev  = import.meta.env.DEV;
+  const PROCS  = isDev
+    ? [{ id:"worker", label:"⚙️ Worker" }]
+    : [
+        { id:"worker", label:"⚙️ Worker" },
+        { id:"api",    label:"🌐 API" },
+        { id:"all",    label:"📋 All" },
+      ];
+
+  return (
+    <div>
+      {/* Toolbar */}
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16, flexWrap:"wrap" }}>
+        <div style={{ display:"flex", gap:6 }}>
+          {PROCS.map(p => (
+            <button key={p.id} onClick={() => { setProcess(p.id); connect(p.id); }} style={{
+              padding:"6px 14px", borderRadius:8, fontSize:13, fontWeight:600, cursor:"pointer",
+              border:`1px solid ${process_ === p.id ? C.accent : C.border}`,
+              background: process_ === p.id ? C.accentDim : "transparent",
+              color: process_ === p.id ? C.accent : C.muted,
+            }}>{p.label}</button>
+          ))}
+        </div>
+
+        <div style={{ display:"flex", gap:6, marginLeft:"auto" }}>
+          <button onClick={() => setPaused(p => !p)} style={{
+            padding:"6px 14px", borderRadius:8, fontSize:13, fontWeight:600, cursor:"pointer",
+            border:`1px solid ${paused ? C.amber : C.border}`,
+            background: paused ? "#f59e0b22" : "transparent",
+            color: paused ? C.amber : C.muted,
+          }}>{paused ? "▶ Resume" : "⏸ Pause"}</button>
+          <button onClick={() => setLines([])} style={{
+            padding:"6px 14px", borderRadius:8, fontSize:13, fontWeight:600, cursor:"pointer",
+            border:`1px solid ${C.border}`, background:"transparent", color:C.muted,
+          }}>🗑 Clear</button>
+        </div>
+
+        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background: connected ? C.accent : C.red }} />
+          <span style={{ fontSize:12, color: connected ? C.accent : C.red }}>
+            {connected ? "Live" : "Disconnected"}
+          </span>
+        </div>
+      </div>
+
+      {/* Log window */}
+      <div style={{
+        background:"#050812", border:`1px solid ${C.border}`, borderRadius:12,
+        padding:"16px", height:"70vh", overflowY:"auto", fontFamily:"'JetBrains Mono', monospace",
+        fontSize:12, lineHeight:1.6,
+      }}>
+        {lines.length === 0 && (
+          <div style={{ color:C.muted, textAlign:"center", marginTop:40 }}>
+            Waiting for log output…
+          </div>
+        )}
+        {lines.map((l, i) => (
+          <div key={i} style={{ display:"flex", gap:12, marginBottom:2, wordBreak:"break-all" }}>
+            <span style={{ color:C.muted, flexShrink:0, fontSize:11 }}>
+              {l.ts ? l.ts.slice(11,19) : ""}
+            </span>
+            <span style={{
+              flexShrink:0, fontSize:10, fontWeight:700, padding:"1px 6px",
+              borderRadius:4, background:`${LOG_COLORS[l.source]}22`,
+              color: LOG_COLORS[l.source] || C.muted,
+            }}>
+              {LOG_LABELS[l.source] || l.source}
+            </span>
+            <span style={{ color: l.source?.includes("err") ? "#fca5a5" : C.text }}>
+              {l.line}
+            </span>
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      <p style={{ color:C.muted, fontSize:11, marginTop:8 }}>
+        {import.meta.env.DEV
+          ? "Dev mode — streaming scraper.log · Showing last 500 lines · Pause to freeze output"
+          : "Showing last 500 lines · Auto-scrolls · Pause to freeze output"}
+      </p>
+    </div>
+  );
+}
+
 
 function ImportPage() {
   const [step, setStep]           = useState(1);

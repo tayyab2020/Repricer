@@ -1,0 +1,2 @@
+npx puppeteer browsers install chrome
+pm2 restart repricer-worker

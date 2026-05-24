@@ -11,9 +11,10 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
-import { createReadStream, existsSync } from 'fs';
+import { createReadStream, existsSync, readFileSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
@@ -184,6 +185,108 @@ app.get('/api/queue-status', async (req, res) => {
 // GET /api/scraper-logs — last 200 scraper log entries (in-memory)
 app.get('/api/scraper-logs', (req, res) => {
   res.json(scraperLogs);
+});
+
+// GET /api/pm2-logs?process=worker|api|all — SSE stream of live log output
+// Dev:  tails scraper.log via Node.js fsWatch (Windows-compatible, no PM2 needed)
+// Prod: tails PM2 log files via `tail -f`
+app.get('/api/pm2-logs', (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+
+  const send = (line, source) => {
+    res.write(`data: ${JSON.stringify({ ts: new Date().toISOString(), line, source })}\n\n`);
+  };
+
+  // Windows = local dev (no PM2/tail); Linux = production VPS
+  const isProduction = process.platform !== 'win32';
+
+  if (!isProduction) {
+    // ── Local dev: stream scraper.log using Node.js fs (Windows-compatible) ──
+    const logPath = join(__dirname, 'scraper.log');
+
+    if (!existsSync(logPath)) {
+      send('scraper.log not found — run `npm run job` to generate logs', 'worker');
+    } else {
+      const content = readFileSync(logPath, 'utf8');
+      content.split('\n').filter(Boolean).slice(-80).forEach(line => send(line, 'worker'));
+    }
+
+    let lastSize = existsSync(logPath) ? statSync(logPath).size : 0;
+    let watcher  = null;
+
+    try {
+      // Watch the directory so we also detect file creation
+      watcher = fsWatch(__dirname, { persistent: false }, (event, filename) => {
+        if (filename && filename !== 'scraper.log') return;
+        if (!existsSync(logPath)) return;
+        try {
+          const newSize = statSync(logPath).size;
+          if (newSize <= lastSize) return;
+          const stream = createReadStream(logPath, { start: lastSize, encoding: 'utf8' });
+          let buf = '';
+          stream.on('data', chunk => { buf += chunk; });
+          stream.on('end', () => {
+            lastSize = newSize;
+            buf.split('\n').filter(Boolean).forEach(line => send(line, 'worker'));
+          });
+        } catch {}
+      });
+    } catch (err) {
+      send(`Watch error: ${err.message}`, 'worker');
+    }
+
+    const hb = setInterval(() => res.write(': heartbeat\n\n'), 20000);
+
+    req.on('close', () => {
+      clearInterval(hb);
+      if (watcher) watcher.close();
+    });
+
+    return;
+  }
+
+  // ── Production: stream PM2 log files via tail -f ──
+  const target = req.query.process || 'all';
+  const pm2Dir = `${process.env.HOME || '/root'}/.pm2/logs`;
+
+  const fileMap = {
+    worker: [`${pm2Dir}/repricer-worker-out.log`, `${pm2Dir}/repricer-worker-error.log`],
+    api:    [`${pm2Dir}/repricer-api-out.log`,    `${pm2Dir}/repricer-api-error.log`],
+    all:    [
+      `${pm2Dir}/repricer-worker-out.log`,
+      `${pm2Dir}/repricer-worker-error.log`,
+      `${pm2Dir}/repricer-api-out.log`,
+      `${pm2Dir}/repricer-api-error.log`,
+    ],
+  };
+
+  const files = fileMap[target] || fileMap.all;
+
+  const procs = files.flatMap(file => {
+    const source = file.includes('worker') ? (file.includes('error') ? 'worker-err' : 'worker') :
+                   file.includes('error') ? 'api-err' : 'api';
+    if (!existsSync(file)) {
+      send(`Log file not found: ${file}`, source);
+      return [];
+    }
+    const tail = spawn('tail', ['-n', '80', '-f', file], { stdio: ['ignore', 'pipe', 'ignore'] });
+    tail.stdout.setEncoding('utf8');
+    tail.stdout.on('data', chunk => {
+      chunk.split('\n').filter(Boolean).forEach(line => send(line, source));
+    });
+    tail.on('error', err => send(`tail error: ${err.message}`, source));
+    return [tail];
+  });
+
+  const hb = setInterval(() => res.write(': heartbeat\n\n'), 20000);
+
+  req.on('close', () => {
+    clearInterval(hb);
+    procs.forEach(p => p.kill());
+  });
 });
 
 // GET /api/scraper-logs/file — download the full scraper.log file
