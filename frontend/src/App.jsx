@@ -832,7 +832,7 @@ const INTERVAL_OPTIONS = [
   { value: "720", label: "Every 12 hours" },
 ];
 
-function SettingsPage() {
+function SettingsPage({ onIntervalChange }) {
   const [proxyUrl,   setProxyUrl]   = useState("");
   const [feePercent, setFeePercent] = useState("15");
   const [defaultRoi, setDefaultRoi] = useState("20");
@@ -869,6 +869,7 @@ function SettingsPage() {
       setStatus(s._proxy_status);
       const proxyMsg = s._proxy_status?.count > 0 ? ` · ${s._proxy_status.count} proxies loaded` : "";
       setMsg({ ok: true, text: `Settings saved${proxyMsg}` });
+      if (onIntervalChange) onIntervalChange(parseInt(interval));
     } catch (e) {
       setMsg({ ok: false, text: e.message });
     } finally { setSaving(false); }
@@ -1058,6 +1059,7 @@ export default function App() {
   const [queueBusy, setQueueBusy]   = useState(false);
   const [queueCounts, setQueueCounts] = useState(null);
   const [chartMapping, setChartMapping] = useState(null);
+  const [jobInterval, setJobInterval] = useState(null);
 
   const loadDashboard = useCallback(() => {
     api("/stats").then(setStats).catch(console.error);
@@ -1071,7 +1073,12 @@ export default function App() {
     }).catch(() => {});
   }, []);
 
-  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+  useEffect(() => {
+    loadDashboard();
+    api("/settings").then(s => {
+      if (s.job_interval_minutes) setJobInterval(parseInt(s.job_interval_minutes));
+    }).catch(() => {});
+  }, [loadDashboard]);
 
   // Poll queue every 5 s so the button reflects live state
   useEffect(() => {
@@ -1167,7 +1174,9 @@ export default function App() {
           <p style={{ color: queueBusy ? C.amber : C.muted, fontSize:10, textAlign:"center", marginTop:8 }}>
             {queueBusy
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
-              : "Auto-runs every 30 min"}
+              : jobInterval
+                ? `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`
+                : "Auto-runs every 30 min"}
           </p>
         </div>
       </div>
@@ -1198,7 +1207,7 @@ export default function App() {
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
-        {page === "settings"       && <SettingsPage />}
+        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "chart"          && chartMapping && (
           <div>
