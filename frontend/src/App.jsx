@@ -260,11 +260,16 @@ function DashboardPage({ stats, logs }) {
 }
 
 // ── Mappings Page ─────────────────────────────
+const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
+
 function MappingsPage({ onSelectMapping }) {
   const [mappings, setMappings] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [syncing, setSyncing] = useState(null);
   const [editMarkup, setEditMarkup] = useState(null); // { id, value, type }
+  const [pageNum, setPageNum]   = useState(1);
+  const [pageSize, setPageSize] = useState(100);
+  const [search, setSearch]     = useState("");
   const [form, setForm] = useState({
     product_name: "", onbuy_listing_id: "", onbuy_sku: "",
     primary_asin: "", markup_type: "percent", markup_value: 20,
@@ -318,11 +323,57 @@ function MappingsPage({ onSelectMapping }) {
     return `+${parseFloat(m.markup_value).toFixed(2)}${sign}${tag}`;
   };
 
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? mappings.filter(m =>
+        (m.product_name  || "").toLowerCase().includes(q) ||
+        (m.primary_asin  || "").toLowerCase().includes(q) ||
+        (m.onbuy_sku     || "").toLowerCase().includes(q) ||
+        (m.onbuy_listing_id || "").toLowerCase().includes(q)
+      )
+    : mappings;
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage   = Math.min(pageNum, totalPages);
+  const pageStart  = (safePage - 1) * pageSize;
+  const paginated  = filtered.slice(pageStart, pageStart + pageSize);
+
+  const onSearch = (v) => { setSearch(v); setPageNum(1); };
+  const onSizeChange = (v) => { setPageSize(Number(v)); setPageNum(1); };
+
   return (
     <div>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom: 24 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom: 16 }}>
         <h2 style={{ color: C.text, margin: 0 }}>Product Mappings</h2>
         <Btn onClick={() => setShowForm(true)}>+ Add Mapping</Btn>
+      </div>
+
+      {/* Search + page size */}
+      <div style={{ display:"flex", gap:10, marginBottom:16, alignItems:"center" }}>
+        <input
+          placeholder="Search product, ASIN, SKU…"
+          value={search}
+          onChange={e => onSearch(e.target.value)}
+          style={{
+            flex:1, background:C.surface, border:`1px solid ${C.border}`,
+            borderRadius:8, padding:"7px 12px", color:C.text, fontSize:13, outline:"none",
+          }}
+        />
+        <select
+          value={pageSize}
+          onChange={e => onSizeChange(e.target.value)}
+          style={{
+            background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+            padding:"7px 10px", color:C.text, fontSize:13, cursor:"pointer",
+          }}
+        >
+          {PAGE_SIZE_OPTIONS.map(n => (
+            <option key={n} value={n}>{n} per page</option>
+          ))}
+        </select>
+        <span style={{ color:C.muted, fontSize:12, whiteSpace:"nowrap" }}>
+          {filtered.length.toLocaleString()} record{filtered.length !== 1 ? "s" : ""}
+        </span>
       </div>
 
       <Section>
@@ -336,12 +387,12 @@ function MappingsPage({ onSelectMapping }) {
             </tr>
           </thead>
           <tbody>
-            {mappings.length === 0 && (
+            {paginated.length === 0 && (
               <tr><td colSpan={9} style={{ color:C.muted, padding:"32px", textAlign:"center" }}>
-                No mappings yet. Click "Add Mapping" to get started.
+                {search ? "No results match your search." : "No mappings yet. Click \"Add Mapping\" to get started."}
               </td></tr>
             )}
-            {mappings.map(m => (
+            {paginated.map(m => (
               <tr key={m.id} style={{ borderBottom:`1px solid ${C.border}20` }}>
                 <td style={{ padding:"10px 12px" }}>
                   <span style={{ color:C.text, fontWeight:500 }}>{m.product_name || "Unnamed"}</span>
@@ -411,6 +462,29 @@ function MappingsPage({ onSelectMapping }) {
             ))}
           </tbody>
         </table>
+
+        {/* Pagination controls */}
+        {totalPages > 1 && (
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+            padding:"12px 4px 4px", marginTop:8 }}>
+            <span style={{ color:C.muted, fontSize:12 }}>
+              {(pageStart + 1).toLocaleString()}–{Math.min(pageStart + pageSize, filtered.length).toLocaleString()} of {filtered.length.toLocaleString()}
+            </span>
+            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+              <Btn small variant="secondary" disabled={safePage <= 1}
+                onClick={() => setPageNum(1)}>«</Btn>
+              <Btn small variant="secondary" disabled={safePage <= 1}
+                onClick={() => setPageNum(p => Math.max(1, p - 1))}>‹ Prev</Btn>
+              <span style={{ color:C.text, fontSize:13, padding:"0 8px" }}>
+                Page {safePage} / {totalPages}
+              </span>
+              <Btn small variant="secondary" disabled={safePage >= totalPages}
+                onClick={() => setPageNum(p => Math.min(totalPages, p + 1))}>Next ›</Btn>
+              <Btn small variant="secondary" disabled={safePage >= totalPages}
+                onClick={() => setPageNum(totalPages)}>»</Btn>
+            </div>
+          </div>
+        )}
       </Section>
 
       {showForm && (
