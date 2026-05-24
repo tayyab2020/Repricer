@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
-import { createReadStream, existsSync, readFileSync, statSync, watch as fsWatch } from 'fs';
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
@@ -252,18 +252,30 @@ app.get('/api/pm2-logs', (req, res) => {
   const target = req.query.process || 'all';
   const pm2Dir = `${process.env.HOME || '/root'}/.pm2/logs`;
 
+  // Discover log files dynamically — handles any PM2 process names
+  let allPm2Logs = [];
+  try {
+    allPm2Logs = readdirSync(pm2Dir)
+      .filter(f => f.endsWith('.log'))
+      .map(f => join(pm2Dir, f));
+  } catch {
+    send(`PM2 logs directory not found: ${pm2Dir}`, 'worker');
+  }
+
+  const workerFiles = allPm2Logs.filter(f => /worker/i.test(f));
+  const apiFiles    = allPm2Logs.filter(f => /\bapi\b/i.test(f) && !/worker/i.test(f));
+
   const fileMap = {
-    worker: [`${pm2Dir}/repricer-worker-out.log`, `${pm2Dir}/repricer-worker-error.log`],
-    api:    [`${pm2Dir}/repricer-api-out.log`,    `${pm2Dir}/repricer-api-error.log`],
-    all:    [
-      `${pm2Dir}/repricer-worker-out.log`,
-      `${pm2Dir}/repricer-worker-error.log`,
-      `${pm2Dir}/repricer-api-out.log`,
-      `${pm2Dir}/repricer-api-error.log`,
-    ],
+    worker: workerFiles.length ? workerFiles : allPm2Logs,
+    api:    apiFiles.length    ? apiFiles    : allPm2Logs,
+    all:    allPm2Logs,
   };
 
-  const files = fileMap[target] || fileMap.all;
+  if (allPm2Logs.length === 0) {
+    send('No PM2 log files found — make sure PM2 processes are running', 'worker');
+  }
+
+  const files = fileMap[target] || allPm2Logs;
 
   const procs = files.flatMap(file => {
     const source = file.includes('worker') ? (file.includes('error') ? 'worker-err' : 'worker') :
