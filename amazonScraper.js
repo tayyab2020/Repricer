@@ -588,7 +588,13 @@ async function puppeteerScrape(url, { forceProxy = true } = {}) {
     log('debug', 'Using direct connection (no proxy)');
   }
 
-  const browser = await puppeteer.launch({ headless: true, args: launchArgs });
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: launchArgs,
+    ...(process.env.PUPPETEER_EXECUTABLE_PATH
+      ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
+      : {}),
+  });
 
   try {
     const page = await browser.newPage();
@@ -1097,7 +1103,13 @@ export async function getAllSellers(asin, { maxRetries = 3 } = {}) {
         launchArgs.push(`--proxy-server=${proxy.server}`);
       }
 
-      const browser = await puppeteer.launch({ headless: true, args: launchArgs });
+      const browser = await puppeteer.launch({
+    headless: true,
+    args: launchArgs,
+    ...(process.env.PUPPETEER_EXECUTABLE_PATH
+      ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
+      : {}),
+  });
 
       try {
         const page = await browser.newPage();
