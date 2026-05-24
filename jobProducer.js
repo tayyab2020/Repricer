@@ -118,7 +118,12 @@ export async function runRepricerJob() {
       });
     }
 
-    await fastQueue.addBulk(jobs);
+    // Chunk into 500-job batches — a single addBulk with 43k items causes Redis
+    // pipeline timeouts and silently drops most jobs past the first ~650.
+    const CHUNK = 500;
+    for (let i = 0; i < jobs.length; i += CHUNK) {
+      await fastQueue.addBulk(jobs.slice(i, i + CHUNK));
+    }
 
     const [fastCounts, slowCounts] = await Promise.all([
       fastQueue.getJobCounts('waiting', 'active', 'delayed'),
