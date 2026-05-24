@@ -14,6 +14,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
+import IORedis from 'ioredis';
 import { createReadStream, existsSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -31,6 +32,13 @@ const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
+
+// Redis publisher — notifies the worker process when settings change
+const redisPub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+  maxRetriesPerRequest: null,
+  lazyConnect: true,
+});
+redisPub.connect().catch(() => {}); // best-effort; log streaming still works without it
 
 app.use(cors());
 app.use(express.json());
@@ -1177,6 +1185,8 @@ app.put('/api/settings', async (req, res) => {
     }
     const { rows } = await db.query('SELECT key, value FROM settings');
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
+    // Notify worker process to reload settings immediately (no PM2 restart needed)
+    redisPub.publish('repricer:settings-updated', '1').catch(() => {});
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

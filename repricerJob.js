@@ -53,6 +53,11 @@ const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
   maxRetriesPerRequest: null,
 });
 
+// Separate connection for pub/sub (Redis requires a dedicated connection for subscriptions)
+const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+  maxRetriesPerRequest: null,
+});
+
 const FAST_CONCURRENCY = parseInt(process.env.FAST_WORKERS ?? '20');
 const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
 
@@ -493,3 +498,19 @@ export { fastWorker, slowWorker };
 
 // Start the scheduler now that workers and settings are ready.
 startScheduler();
+
+// Subscribe to settings-change events published by the API server.
+// Changes from the Settings UI take effect immediately without a PM2 restart.
+redisSub.subscribe('repricer:settings-updated', (err) => {
+  if (err) console.warn('[RepricerJob] Could not subscribe to settings channel:', err.message);
+  else     console.log('[RepricerJob] Subscribed to repricer:settings-updated');
+});
+redisSub.on('message', (channel) => {
+  if (channel === 'repricer:settings-updated') {
+    console.log('[RepricerJob] Settings change detected — reloading from DB');
+    reloadSettings();
+  }
+});
+
+// 60-second poll as fallback in case a pub/sub message is missed.
+setInterval(reloadSettings, 60_000);
