@@ -77,18 +77,37 @@ app.get('/api/stats', async (req, res) => {
 // PRODUCT MAPPINGS CRUD
 // ─────────────────────────────────────────────
 
-// GET /api/mappings — list all product mappings
+// GET /api/mappings — paginated product mappings
+// Query params: page (default 1), limit (default 100, max 1000), search
 app.get('/api/mappings', async (req, res) => {
   try {
-    const { rows } = await db.query(`
-      SELECT
-        pm.*,
-        (SELECT COUNT(*) FROM supplier_asins sa WHERE sa.product_mapping_id = pm.id) AS supplier_count,
-        (SELECT status FROM sync_logs sl WHERE sl.product_mapping_id = pm.id ORDER BY created_at DESC LIMIT 1) AS last_sync_status
-      FROM product_mappings pm
-      ORDER BY pm.created_at DESC
-    `);
-    res.json(rows);
+    const limit  = Math.min(1000, Math.max(1, parseInt(req.query.limit)  || 100));
+    const page   = Math.max(1,                parseInt(req.query.page)   || 1);
+    const search = (req.query.search || '').trim();
+    const offset = (page - 1) * limit;
+
+    const where  = search ? `WHERE (pm.product_name ILIKE $3 OR pm.primary_asin ILIKE $3
+                               OR pm.onbuy_sku ILIKE $3 OR pm.onbuy_listing_id ILIKE $3)` : '';
+    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+
+    const [{ rows }, countResult] = await Promise.all([
+      db.query(`
+        SELECT
+          pm.*,
+          (SELECT COUNT(*) FROM supplier_asins sa WHERE sa.product_mapping_id = pm.id) AS supplier_count,
+          (SELECT status FROM sync_logs sl WHERE sl.product_mapping_id = pm.id ORDER BY created_at DESC LIMIT 1) AS last_sync_status
+        FROM product_mappings pm
+        ${where}
+        ORDER BY pm.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, params),
+      db.query(
+        `SELECT COUNT(*) FROM product_mappings pm ${where}`,
+        search ? [`%${search}%`] : []
+      ),
+    ]);
+
+    res.json({ rows, total: parseInt(countResult.rows[0].count), page, limit });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

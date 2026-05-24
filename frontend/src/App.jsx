@@ -264,44 +264,58 @@ const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
 
 function MappingsPage({ onSelectMapping }) {
   const [mappings, setMappings] = useState([]);
+  const [total, setTotal]       = useState(0);
+  const [loading, setLoading]   = useState(false);
   const [showForm, setShowForm] = useState(false);
-  const [syncing, setSyncing] = useState(null);
-  const [editMarkup, setEditMarkup] = useState(null); // { id, value, type }
+  const [syncing, setSyncing]   = useState(null);
+  const [editMarkup, setEditMarkup] = useState(null);
   const [pageNum, setPageNum]   = useState(1);
   const [pageSize, setPageSize] = useState(100);
   const [search, setSearch]     = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const searchTimer = useRef(null);
   const [form, setForm] = useState({
     product_name: "", onbuy_listing_id: "", onbuy_sku: "",
     primary_asin: "", markup_type: "percent", markup_value: 20,
     min_price: "", notes: "",
   });
 
-  const load = () => api("/mappings").then(setMappings).catch(console.error);
-  useEffect(() => { load(); }, []);
+  const load = useCallback((pg = pageNum, sz = pageSize, q = search) => {
+    setLoading(true);
+    const params = new URLSearchParams({ page: pg, limit: sz, ...(q ? { search: q } : {}) });
+    api(`/mappings?${params}`)
+      .then(data => { setMappings(data.rows); setTotal(data.total); })
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, [pageNum, pageSize, search]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const reload = () => load(pageNum, pageSize, search);
 
   const save = async () => {
     await api("/mappings", { method: "POST", body: JSON.stringify(form) });
     setShowForm(false);
     setForm({ product_name:"",onbuy_listing_id:"",onbuy_sku:"",primary_asin:"",markup_type:"percent",markup_value:20,min_price:"",notes:"" });
-    load();
+    reload();
   };
 
   const toggle = async (m) => {
     await api(`/mappings/${m.id}`, { method: "PUT", body: JSON.stringify({ ...m, is_active: !m.is_active }) });
-    load();
+    reload();
   };
 
   const del = async (id) => {
     if (!confirm("Delete this mapping?")) return;
     await api(`/mappings/${id}`, { method: "DELETE" });
-    load();
+    reload();
   };
 
   const syncOne = async (id) => {
     setSyncing(id);
     await api(`/sync/${id}`, { method: "POST" }).catch(console.error);
     setSyncing(null);
-    load();
+    reload();
   };
 
   const saveMarkup = async (id, value, type) => {
@@ -314,8 +328,28 @@ function MappingsPage({ onSelectMapping }) {
       method: "PUT",
       body: JSON.stringify({ ...m, markup_value: parsed }),
     }).catch(console.error);
-    load();
+    reload();
   };
+
+  const handleSearchInput = (v) => {
+    setSearchInput(v);
+    clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      setSearch(v);
+      setPageNum(1);
+    }, 400);
+  };
+
+  const handleSizeChange = (v) => {
+    setPageSize(Number(v));
+    setPageNum(1);
+  };
+
+  const handlePageChange = (p) => {
+    setPageNum(p);
+  };
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   const markupLabel = (m) => {
     const sign = m.markup_type === "fixed" ? "£" : "%";
@@ -323,23 +357,7 @@ function MappingsPage({ onSelectMapping }) {
     return `+${parseFloat(m.markup_value).toFixed(2)}${sign}${tag}`;
   };
 
-  const q = search.trim().toLowerCase();
-  const filtered = q
-    ? mappings.filter(m =>
-        (m.product_name  || "").toLowerCase().includes(q) ||
-        (m.primary_asin  || "").toLowerCase().includes(q) ||
-        (m.onbuy_sku     || "").toLowerCase().includes(q) ||
-        (m.onbuy_listing_id || "").toLowerCase().includes(q)
-      )
-    : mappings;
-
-  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
-  const safePage   = Math.min(pageNum, totalPages);
-  const pageStart  = (safePage - 1) * pageSize;
-  const paginated  = filtered.slice(pageStart, pageStart + pageSize);
-
-  const onSearch = (v) => { setSearch(v); setPageNum(1); };
-  const onSizeChange = (v) => { setPageSize(Number(v)); setPageNum(1); };
+  const pageStart = (pageNum - 1) * pageSize;
 
   return (
     <div>
@@ -352,8 +370,8 @@ function MappingsPage({ onSelectMapping }) {
       <div style={{ display:"flex", gap:10, marginBottom:16, alignItems:"center" }}>
         <input
           placeholder="Search product, ASIN, SKU…"
-          value={search}
-          onChange={e => onSearch(e.target.value)}
+          value={searchInput}
+          onChange={e => handleSearchInput(e.target.value)}
           style={{
             flex:1, background:C.surface, border:`1px solid ${C.border}`,
             borderRadius:8, padding:"7px 12px", color:C.text, fontSize:13, outline:"none",
@@ -361,7 +379,7 @@ function MappingsPage({ onSelectMapping }) {
         />
         <select
           value={pageSize}
-          onChange={e => onSizeChange(e.target.value)}
+          onChange={e => handleSizeChange(e.target.value)}
           style={{
             background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
             padding:"7px 10px", color:C.text, fontSize:13, cursor:"pointer",
@@ -372,7 +390,7 @@ function MappingsPage({ onSelectMapping }) {
           ))}
         </select>
         <span style={{ color:C.muted, fontSize:12, whiteSpace:"nowrap" }}>
-          {filtered.length.toLocaleString()} record{filtered.length !== 1 ? "s" : ""}
+          {loading ? "Loading…" : `${total.toLocaleString()} record${total !== 1 ? "s" : ""}`}
         </span>
       </div>
 
@@ -387,12 +405,17 @@ function MappingsPage({ onSelectMapping }) {
             </tr>
           </thead>
           <tbody>
-            {paginated.length === 0 && (
+            {mappings.length === 0 && !loading && (
               <tr><td colSpan={9} style={{ color:C.muted, padding:"32px", textAlign:"center" }}>
                 {search ? "No results match your search." : "No mappings yet. Click \"Add Mapping\" to get started."}
               </td></tr>
             )}
-            {paginated.map(m => (
+            {loading && mappings.length === 0 && (
+              <tr><td colSpan={9} style={{ color:C.muted, padding:"32px", textAlign:"center" }}>
+                Loading…
+              </td></tr>
+            )}
+            {mappings.map(m => (
               <tr key={m.id} style={{ borderBottom:`1px solid ${C.border}20` }}>
                 <td style={{ padding:"10px 12px" }}>
                   <span style={{ color:C.text, fontWeight:500 }}>{m.product_name || "Unnamed"}</span>
@@ -468,20 +491,20 @@ function MappingsPage({ onSelectMapping }) {
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
             padding:"12px 4px 4px", marginTop:8 }}>
             <span style={{ color:C.muted, fontSize:12 }}>
-              {(pageStart + 1).toLocaleString()}–{Math.min(pageStart + pageSize, filtered.length).toLocaleString()} of {filtered.length.toLocaleString()}
+              {(pageStart + 1).toLocaleString()}–{Math.min(pageStart + pageSize, total).toLocaleString()} of {total.toLocaleString()}
             </span>
             <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-              <Btn small variant="secondary" disabled={safePage <= 1}
-                onClick={() => setPageNum(1)}>«</Btn>
-              <Btn small variant="secondary" disabled={safePage <= 1}
-                onClick={() => setPageNum(p => Math.max(1, p - 1))}>‹ Prev</Btn>
+              <Btn small variant="secondary" disabled={pageNum <= 1 || loading}
+                onClick={() => handlePageChange(1)}>«</Btn>
+              <Btn small variant="secondary" disabled={pageNum <= 1 || loading}
+                onClick={() => handlePageChange(pageNum - 1)}>‹ Prev</Btn>
               <span style={{ color:C.text, fontSize:13, padding:"0 8px" }}>
-                Page {safePage} / {totalPages}
+                Page {pageNum} / {totalPages}
               </span>
-              <Btn small variant="secondary" disabled={safePage >= totalPages}
-                onClick={() => setPageNum(p => Math.min(totalPages, p + 1))}>Next ›</Btn>
-              <Btn small variant="secondary" disabled={safePage >= totalPages}
-                onClick={() => setPageNum(totalPages)}>»</Btn>
+              <Btn small variant="secondary" disabled={pageNum >= totalPages || loading}
+                onClick={() => handlePageChange(pageNum + 1)}>Next ›</Btn>
+              <Btn small variant="secondary" disabled={pageNum >= totalPages || loading}
+                onClick={() => handlePageChange(totalPages)}>»</Btn>
             </div>
           </div>
         )}
