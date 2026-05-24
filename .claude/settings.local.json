@@ -11,7 +11,8 @@
       "PowerShell(Stop-Process -Id 14068 -Force)",
       "Bash(node --input-type=module)",
       "PowerShell(netstat -ano)",
-      "PowerShell(Stop-Process -Id 24744 -Force)"
+      "PowerShell(Stop-Process -Id 24744 -Force)",
+      "Bash(git push *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\hp\\Downloads"

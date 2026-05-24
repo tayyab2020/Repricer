@@ -274,6 +274,7 @@ function MappingsPage({ onSelectMapping }) {
   const [search, setSearch]     = useState("");
   const [searchInput, setSearchInput] = useState("");
   const searchTimer = useRef(null);
+  const [clearing, setClearing] = useState(false);
   const [form, setForm] = useState({
     product_name: "", onbuy_listing_id: "", onbuy_sku: "",
     primary_asin: "", markup_type: "percent", markup_value: 20,
@@ -331,6 +332,16 @@ function MappingsPage({ onSelectMapping }) {
     reload();
   };
 
+  const clearAll = async () => {
+    if (!confirm(`Delete ALL ${total.toLocaleString()} mappings? This cannot be undone.`)) return;
+    setClearing(true);
+    await api("/mappings", { method: "DELETE" }).catch(console.error);
+    setMappings([]);
+    setTotal(0);
+    setPageNum(1);
+    setClearing(false);
+  };
+
   const handleSearchInput = (v) => {
     setSearchInput(v);
     clearTimeout(searchTimer.current);
@@ -363,7 +374,16 @@ function MappingsPage({ onSelectMapping }) {
     <div>
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom: 16 }}>
         <h2 style={{ color: C.text, margin: 0 }}>Product Mappings</h2>
-        <Btn onClick={() => setShowForm(true)}>+ Add Mapping</Btn>
+        <div style={{ display:"flex", gap:8 }}>
+          <Btn
+            onClick={clearAll}
+            disabled={clearing || total === 0}
+            style={{ background:"#7f1d1d", opacity: (clearing || total === 0) ? 0.5 : 1 }}
+          >
+            {clearing ? "Clearing…" : "Clear All Mappings"}
+          </Btn>
+          <Btn onClick={() => setShowForm(true)}>+ Add Mapping</Btn>
+        </div>
       </div>
 
       {/* Search + page size */}

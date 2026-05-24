@@ -66,6 +66,107 @@ const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
 const wlog = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
 
 // ─────────────────────────────────────────────
+// ONBUY RATE-LIMITED BATCH UPDATER
+// OnBuy allows max 240 PUT requests/hour.
+// This class batches up to 50 listings per PUT
+// and enforces a 200/hr ceiling (20-request buffer).
+// All flushes serialize through a promise mutex so
+// the sliding-window rate limiter is never raced.
+// ─────────────────────────────────────────────
+
+class OnBuyUpdater {
+  constructor({ maxBatch = 1000, maxPerHour = 200 } = {}) {
+    this._maxBatch   = maxBatch;
+    this._maxPerHour = maxPerHour;
+    this._batches    = new Map(); // key → [{ token, siteId, identifier, isSku, price, resolve, reject }]
+    this._timers     = new Map(); // key → timer id (200 ms batching window)
+    this._rrTs       = [];        // timestamps of sent requests (sliding 1-hour window)
+    this._mutex      = Promise.resolve(); // serialises all batch flushes
+  }
+
+  enqueue(token, siteId, identifier, isSku, price) {
+    return new Promise((resolve, reject) => {
+      const key = `${token}||${siteId}||${isSku ? '1' : '0'}`;
+      if (!this._batches.has(key)) this._batches.set(key, []);
+      const batch = this._batches.get(key);
+      batch.push({ token, siteId, identifier, isSku, price, resolve, reject });
+
+      if (batch.length >= this._maxBatch) {
+        if (this._timers.has(key)) { clearTimeout(this._timers.get(key)); this._timers.delete(key); }
+        this._enqueueFlush(key);
+      } else if (!this._timers.has(key)) {
+        const t = setTimeout(() => { this._timers.delete(key); this._enqueueFlush(key); }, 200);
+        this._timers.set(key, t);
+      }
+    });
+  }
+
+  _enqueueFlush(key) {
+    this._mutex = this._mutex
+      .then(() => this._flushBatch(key))
+      .catch(err => wlog(`[OnBuyUpdater] Unhandled flush error:`, err.message));
+  }
+
+  async _flushBatch(key) {
+    const batch = this._batches.get(key);
+    if (!batch || batch.length === 0) return;
+    const items = batch.splice(0, this._maxBatch);
+
+    // ── Sliding-window rate limit ──
+    const now = Date.now();
+    this._rrTs = this._rrTs.filter(t => now - t < 3_600_000);
+    if (this._rrTs.length >= this._maxPerHour) {
+      const waitMs = 3_600_000 - (now - this._rrTs[0]) + 1000;
+      wlog(`[OnBuyUpdater] Rate limit reached (${this._rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
+      await new Promise(r => setTimeout(r, waitMs));
+      this._rrTs = this._rrTs.filter(t => Date.now() - t < 3_600_000);
+    }
+    this._rrTs.push(Date.now());
+
+    // ── Batch PUT ──
+    const { token, siteId, isSku } = items[0];
+    const endpoint   = isSku
+      ? `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`
+      : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
+    const listingKey = isSku ? 'sku' : 'uid';
+    const listings   = items.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ listings }),
+      });
+      const raw = await res.text();
+      wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status}`);
+
+      if (!res.ok) {
+        const err = new Error(`OnBuy ${res.status}: ${raw.slice(0, 200)}`);
+        items.forEach(it => it.reject(err));
+        return;
+      }
+
+      const data    = JSON.parse(raw);
+      const results = Array.isArray(data?.results) ? data.results
+                    : Array.isArray(data?.payload)  ? data.payload
+                    : [];
+      items.forEach((it, i) => {
+        const r = results[i];
+        if (r?.success === false) it.reject(new Error(r.message || 'OnBuy rejected update'));
+        else it.resolve(data);
+      });
+    } catch (err) {
+      items.forEach(it => it.reject(err));
+    }
+
+    // Flush any remaining items that arrived while this batch was in flight
+    if ((this._batches.get(key) || []).length > 0) this._enqueueFlush(key);
+  }
+}
+
+const onbuyUpdater = new OnBuyUpdater();
+
+// ─────────────────────────────────────────────
 // ONBUY API
 // ─────────────────────────────────────────────
 
@@ -267,42 +368,51 @@ async function applyResult(scraped, mapping, token, siteId) {
     return { success: true, skipped: true };
   }
 
-  // ── Push to OnBuy ──
-  try {
-    if (onbuy_sku) {
-      await updateOnBuyPriceBySku(onbuy_sku, newOnBuyPrice, token, siteId);
-    } else {
-      await updateOnBuyPrice(mapping.onbuy_listing_id || rawListingId, newOnBuyPrice, token, siteId);
-    }
+  // ── Push to OnBuy (batched + rate-limited, fire-and-forget) ──
+  // last_amazon_price is recorded immediately so hasPriceChangedSignificantly
+  // returns false on the next run even if the OnBuy call is still queued.
+  // last_onbuy_price + price_history + sync_log are written after API confirms.
+  await db.query(
+    `UPDATE product_mappings
+     SET last_amazon_price = $1, last_checked_at = NOW(), amazon_in_stock = true
+     WHERE id = $2`,
+    [amazonPrice, id]
+  );
 
-    await db.query(
-      `UPDATE product_mappings
-       SET last_amazon_price = $1, last_onbuy_price = $2,
-           last_synced_at = NOW(), last_checked_at = NOW(), amazon_in_stock = true
-       WHERE id = $3`,
-      [amazonPrice, newOnBuyPrice, id]
-    );
-    await db.query(
-      `INSERT INTO price_history (product_mapping_id, amazon_price, onbuy_price, recorded_at)
-       VALUES ($1, $2, $3, NOW())`,
-      [id, amazonPrice, newOnBuyPrice]
-    );
-    await db.query(
-      `INSERT INTO sync_logs (product_mapping_id, status, message, amazon_price, onbuy_price, created_at)
-       VALUES ($1, 'success', 'Price synced', $2, $3, NOW())`,
-      [id, amazonPrice, newOnBuyPrice]
-    );
-    return { success: true, amazonPrice, newOnBuyPrice };
+  const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
+  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice)
+    .then(async () => {
+      try {
+        await db.query(
+          `UPDATE product_mappings SET last_onbuy_price = $1, last_synced_at = NOW() WHERE id = $2`,
+          [newOnBuyPrice, id]
+        );
+        await Promise.all([
+          db.query(
+            `INSERT INTO price_history (product_mapping_id, amazon_price, onbuy_price, recorded_at)
+             VALUES ($1, $2, $3, NOW())`,
+            [id, amazonPrice, newOnBuyPrice]
+          ),
+          db.query(
+            `INSERT INTO sync_logs (product_mapping_id, status, message, amazon_price, onbuy_price, created_at)
+             VALUES ($1, 'success', 'Price synced', $2, $3, NOW())`,
+            [id, amazonPrice, newOnBuyPrice]
+          ),
+        ]);
+      } catch (dbErr) {
+        console.error(`[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
+      }
+    })
+    .catch(err => {
+      console.error(`[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
+      db.query(
+        `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
+         VALUES ($1, 'failed', $2, NOW())`,
+        [id, `OnBuy API error: ${err.message}`]
+      ).catch(() => {});
+    });
 
-  } catch (err) {
-    console.error(`[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
-    await db.query(
-      `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
-       VALUES ($1, 'failed', $2, NOW())`,
-      [id, `OnBuy API error: ${err.message}`]
-    );
-    return { success: false, error: err.message };
-  }
+  return { success: true, amazonPrice, newOnBuyPrice };
 }
 
 // ─────────────────────────────────────────────

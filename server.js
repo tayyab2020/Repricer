@@ -179,6 +179,16 @@ app.delete('/api/mappings/:id', async (req, res) => {
   }
 });
 
+// DELETE /api/mappings — truncate all mappings (cascades to price_history, sync_logs)
+app.delete('/api/mappings', async (req, res) => {
+  try {
+    await db.query('TRUNCATE product_mappings RESTART IDENTITY CASCADE');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 // MANUAL SYNC TRIGGER
 // ─────────────────────────────────────────────
