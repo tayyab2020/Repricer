@@ -118,8 +118,13 @@ export async function runRepricerJob() {
       });
     }
 
-    // Chunk into 500-job batches — a single addBulk with 43k items causes Redis
-    // pipeline timeouts and silently drops most jobs past the first ~650.
+    // Drain waiting/delayed jobs from both queues before re-adding.
+    // BullMQ deduplicates by jobId — any job already in waiting/delayed state
+    // is silently skipped by addBulk. Draining first ensures all 43k get queued.
+    // Active jobs are unaffected by drain() and will finish normally.
+    await Promise.all([fastQueue.drain(), slowQueue.drain()]);
+    console.log('[Job] Queues drained — adding fresh jobs');
+
     const CHUNK = 500;
     for (let i = 0; i < jobs.length; i += CHUNK) {
       await fastQueue.addBulk(jobs.slice(i, i + CHUNK));

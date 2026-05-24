@@ -4046,3 +4046,185 @@ We don't know when or if this item wi") {"url":"https://www.amazon.co.uk/dp/B0F5
 [2026-05-24T13:18:42.510Z] [DEBUG] [css] CSS: £22.88 | Smart: £22.88 | Final: £22.88 | Source: css+smart_agreed
 [2026-05-24T13:18:42.984Z] [DEBUG] [css] CSS: £175.49 | Smart: £175.49 | Final: £175.49 | Source: css+smart_agreed
 [2026-05-24T13:18:43.748Z] [DEBUG] [css] CSS: £55.89 | Smart: £55.89 | Final: £55.89 | Source: css+smart_agreed
+[2026-05-24T21:02:00.657Z] [WARN] Failed to load proxies from Webshare: HTTP 429
+[2026-05-24T21:02:00.664Z] [WARN] Failed to load proxies from Webshare: HTTP 429
+[2026-05-24T21:02:00.672Z] [WARN] Failed to load proxies from Webshare: HTTP 429
+[2026-05-24T21:02:00.676Z] [WARN] Failed to load proxies from Webshare: HTTP 429
+[2026-05-24T21:02:00.681Z] [WARN] Failed to load proxies from Webshare: HTTP 429
+[2026-05-24T21:02:00.852Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.959Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.963Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.968Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.971Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.974Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.977Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.980Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:00.984Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0BWN45T86"}
+[2026-05-24T21:02:01.063Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.068Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.075Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.104Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.117Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.125Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.183Z] [DEBUG] Twister OK via direct {"asin":"B0C5QDJYB3"}
+[2026-05-24T21:02:01.187Z] [INFO] Twister JSON price: £49.99 {"asin":"B0C5QDJYB3"}
+[2026-05-24T21:02:01.191Z] [DEBUG] Twister OK via direct {"asin":"B0CZ7XH985"}
+[2026-05-24T21:02:01.206Z] [DEBUG] Twister: no usable price — raw slot.price=undefined {"asin":"B0CZ7XH985"}
+[2026-05-24T21:02:01.224Z] [DEBUG] Twister OK via direct {"asin":"B0CJRC8FG6"}
+[2026-05-24T21:02:01.228Z] [DEBUG] Twister: no usable price — raw slot.price=undefined {"asin":"B0CJRC8FG6"}
+[2026-05-24T21:02:01.239Z] [DEBUG] Twister OK via direct {"asin":"B079NJQBTW"}
+[2026-05-24T21:02:01.241Z] [INFO] Twister JSON price: £241.1199951171875 {"asin":"B079NJQBTW"}
+[2026-05-24T21:02:01.487Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-24T21:02:01.976Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.198)) {"asin":"B08DHWZ4HS"}
+[2026-05-24T21:02:01.984Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B07KK8GRMJ"}
+[2026-05-24T21:02:01.989Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.96)) {"asin":"B0BQ9X22N1"}
+[2026-05-24T21:02:01.995Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.32)) {"asin":"B09SB3QYM1"}
+[2026-05-24T21:02:02.003Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.160)) {"asin":"B0DDBG32BL"}
+[2026-05-24T21:02:02.009Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.160)) {"asin":"B0D9LXSD3C"}
+[2026-05-24T21:02:02.015Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B0969CSC8K"}
+[2026-05-24T21:02:02.022Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.81.33)) {"asin":"B0BDRPYG2H"}
+[2026-05-24T21:02:02.136Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.116)) {"asin":"B0C4LPQMBY"}
+[2026-05-24T21:02:02.496Z] [DEBUG] Twister OK via proxy(87.86.25.37) {"asin":"B08HSWX1HZ"}
+[2026-05-24T21:02:02.499Z] [INFO] Twister JSON price: £31.04 {"asin":"B08HSWX1HZ"}
+[2026-05-24T21:02:02.513Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0969G39FL"}
+[2026-05-24T21:02:02.517Z] [INFO] Twister JSON price: £21.99 {"asin":"B0969G39FL"}
+[2026-05-24T21:02:02.632Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B08B16KZYF"}
+[2026-05-24T21:02:02.639Z] [DEBUG] Twister OK via proxy(87.86.24.121) {"asin":"B0CZ49C7GZ"}
+[2026-05-24T21:02:02.641Z] [INFO] Twister JSON price: £14.49 {"asin":"B08B16KZYF"}
+[2026-05-24T21:02:02.649Z] [DEBUG] Twister: no usable price — raw slot.price=undefined {"asin":"B0CZ49C7GZ"}
+[2026-05-24T21:02:02.716Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0CJRDP4PX"}
+[2026-05-24T21:02:02.720Z] [INFO] Twister JSON price: £32.99 {"asin":"B0CJRDP4PX"}
+[2026-05-24T21:02:02.777Z] [DEBUG] Twister OK via proxy(212.212.19.174) {"asin":"B0D9NLW47V"}
+[2026-05-24T21:02:02.783Z] [INFO] Twister JSON price: £10.35 {"asin":"B0D9NLW47V"}
+[2026-05-24T21:02:02.812Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B08DHWZ4HS"}
+[2026-05-24T21:02:02.834Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B07KK8GRMJ"}
+[2026-05-24T21:02:02.839Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0BJPCGLR2"}
+[2026-05-24T21:02:02.842Z] [INFO] Twister JSON price: £27.06 {"asin":"B0BJPCGLR2"}
+[2026-05-24T21:02:03.004Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B0D9LXSD3C"}
+[2026-05-24T21:02:03.010Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B0BQ9X22N1"}
+[2026-05-24T21:02:03.154Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.25.243)) {"asin":"B09SB3QYM1"}
+[2026-05-24T21:02:03.305Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0C4LPQMBY"}
+[2026-05-24T21:02:03.311Z] [DEBUG] Twister: no usable price — raw slot.price=undefined {"asin":"B0C4LPQMBY"}
+[2026-05-24T21:02:03.370Z] [DEBUG] Twister OK via proxy(212.212.19.174) {"asin":"B0DDBG32BL"}
+[2026-05-24T21:02:03.372Z] [INFO] Twister JSON price: £14.99 {"asin":"B0DDBG32BL"}
+[2026-05-24T21:02:03.502Z] [DEBUG] Twister OK via proxy(212.212.18.50) {"asin":"B0BDRPYG2H"}
+[2026-05-24T21:02:03.505Z] [INFO] Twister JSON price: £9.99 {"asin":"B0BDRPYG2H"}
+[2026-05-24T21:02:03.512Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.94)) {"asin":"B0CKR28SK4"}
+[2026-05-24T21:02:03.517Z] [DEBUG] Twister OK via proxy(87.86.24.235) {"asin":"B0969CSC8K"}
+[2026-05-24T21:02:03.519Z] [INFO] Twister JSON price: £16.99 {"asin":"B0969CSC8K"}
+[2026-05-24T21:02:03.649Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.81.33)) {"asin":"B0BQ9X22N1"}
+[2026-05-24T21:02:04.360Z] [INFO] Cheerio: product OOS — "P.when("A", "load").execute("aod-assets-loaded", function(A){
+        function logAssetsNotLoaded() {
+            if (window.ueLogError) {
+                var customError = { message: 'Failed to load AOD assets for WDG: home_improvement_display_on_website, Device: web' };
+                var additionalInfo = {
+                    logLevel : 'ERROR',
+                    attribution : 'aod_assets_not_loaded'
+                };
+                ueLogError (customError, additionalInfo);
+            }
+            if (window.ue && window.ue.count) {
+                window.ue.count("aod-assets-not-loaded", 1);
+            }
+        }
+
+        function verifyAssetsLoaded() {
+            var assetsLoadedPageState = A.state('aod:assetsLoaded');
+            var logAssetsNotLoadedState = A.state('aod:logAssetsNotLoaded');
+
+            if((assetsLoadedPageState == null || !assetsLoadedPageState.isAodAssetsLoaded)
+                && (logAssetsNotLoadedState == null || !logAssetsNotLoadedState.isAodAssetsNotLoadedLogged)) {
+                A.state('aod:logAssetsNotLoaded', {isAodAssetsNotLoadedLogged: true});
+                logAssetsNotLoaded();
+            }
+        }
+
+        setTimeout(verifyAssetsLoaded, 50000)
+    });
+                     Currently unavailable.                     We don't know when or if this item will be back in stock." {"url":"https://www.amazon.co.uk/dp/B0BWN45T86?th=1&currency=GBP"}
+[2026-05-24T21:02:04.381Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0D9LXSD3C"}
+[2026-05-24T21:02:04.384Z] [DEBUG] Twister OK via proxy(212.212.18.157) {"asin":"B08DHWZ4HS"}
+[2026-05-24T21:02:04.411Z] [DEBUG] Twister OK via direct {"asin":"B0BQ9X22N1"}
+[2026-05-24T21:02:04.413Z] [DEBUG] Twister OK via proxy(87.86.24.235) {"asin":"B07KK8GRMJ"}
+[2026-05-24T21:02:04.418Z] [DEBUG] Twister OK via proxy(87.86.25.37) {"asin":"B07338KF65"}
+[2026-05-24T21:02:04.420Z] [INFO] Twister JSON price: £13.99 {"asin":"B0D9LXSD3C"}
+[2026-05-24T21:02:04.421Z] [INFO] Twister JSON price: £22.88 {"asin":"B08DHWZ4HS"}
+[2026-05-24T21:02:04.423Z] [INFO] Twister JSON price: £56.31 {"asin":"B07KK8GRMJ"}
+[2026-05-24T21:02:04.427Z] [INFO] Twister JSON price: £12.99 {"asin":"B0BQ9X22N1"}
+[2026-05-24T21:02:04.429Z] [INFO] Twister JSON price: £23.25 {"asin":"B07338KF65"}
+[2026-05-24T21:02:04.601Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B0CKR28SK4"}
+[2026-05-24T21:02:04.651Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.25.94)) {"asin":"B09SB3QYM1"}
+[2026-05-24T21:02:04.751Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.160)) {"asin":"B09PNGXB65"}
+[2026-05-24T21:02:05.184Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B09SB3QYM1"}
+[2026-05-24T21:02:05.410Z] [DEBUG] Twister OK via proxy(87.86.24.121) {"asin":"B0BZZ432FX"}
+[2026-05-24T21:02:05.413Z] [INFO] Twister JSON price: £29.99 {"asin":"B0BZZ432FX"}
+[2026-05-24T21:02:05.417Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.32)) {"asin":"B09PNGXB65"}
+[2026-05-24T21:02:05.457Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.160)) {"asin":"B09FFCGLHK"}
+[2026-05-24T21:02:05.675Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.32)) {"asin":"B0CC26QFRN"}
+[2026-05-24T21:02:05.740Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.116)) {"asin":"B0CDLTKGTK"}
+[2026-05-24T21:02:05.856Z] [DEBUG] Twister OK via proxy(87.86.25.37) {"asin":"B0CKR28SK4"}
+[2026-05-24T21:02:05.858Z] [INFO] Twister JSON price: £13.29 {"asin":"B0CKR28SK4"}
+[2026-05-24T21:02:05.927Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B00719S168"}
+[2026-05-24T21:02:05.932Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B09RQQT8GY"}
+[2026-05-24T21:02:05.991Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B0B61TZBP7"}
+[2026-05-24T21:02:06.016Z] [DEBUG] Twister OK via proxy(87.86.25.243) {"asin":"B07Z92SB9W"}
+[2026-05-24T21:02:06.018Z] [INFO] Twister JSON price: £18.99 {"asin":"B07Z92SB9W"}
+[2026-05-24T21:02:06.116Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B09PNGXB65"}
+[2026-05-24T21:02:06.188Z] [DEBUG] Twister OK via proxy(212.212.19.174) {"asin":"B07Z937LHF"}
+[2026-05-24T21:02:06.189Z] [INFO] Twister JSON price: £16.99 {"asin":"B07Z937LHF"}
+[2026-05-24T21:02:06.313Z] [DEBUG] Twister OK via proxy(104.252.75.94) {"asin":"B07RFKCV83"}
+[2026-05-24T21:02:06.315Z] [INFO] Twister JSON price: £27.49 {"asin":"B07RFKCV83"}
+[2026-05-24T21:02:06.321Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.94)) {"asin":"B0CC26QFRN"}
+[2026-05-24T21:02:06.333Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.24.121)) {"asin":"B09X141ZTP"}
+[2026-05-24T21:02:06.346Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B0CKBTBTZP"}
+[2026-05-24T21:02:06.421Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B09PNGXB65"}
+[2026-05-24T21:02:06.463Z] [DEBUG] Twister OK via proxy(87.86.25.94) {"asin":"B0B45XQ6Q3"}
+[2026-05-24T21:02:06.466Z] [INFO] Twister JSON price: £5.98 {"asin":"B0B45XQ6Q3"}
+[2026-05-24T21:02:06.578Z] [DEBUG] Twister OK via proxy(212.212.19.174) {"asin":"B003XJ1ODM"}
+[2026-05-24T21:02:06.580Z] [INFO] Twister JSON price: £4.95 {"asin":"B003XJ1ODM"}
+[2026-05-24T21:02:06.603Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B003VN3I7K"}
+[2026-05-24T21:02:06.701Z] [DEBUG] Twister OK via proxy(87.86.25.37) {"asin":"B0BDR317W8"}
+[2026-05-24T21:02:06.703Z] [INFO] Twister JSON price: £16.99 {"asin":"B0BDR317W8"}
+[2026-05-24T21:02:06.728Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.116)) {"asin":"B0B61TZBP7"}
+[2026-05-24T21:02:06.820Z] [DEBUG] Twister OK via proxy(87.86.25.94) {"asin":"B09FFCGLHK"}
+[2026-05-24T21:02:06.823Z] [INFO] Twister JSON price: £9.99 {"asin":"B09FFCGLHK"}
+[2026-05-24T21:02:07.056Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.94)) {"asin":"B09X141ZTP"}
+[2026-05-24T21:02:07.076Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B0CKBTBTZP"}
+[2026-05-24T21:02:07.105Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0CDLTKGTK"}
+[2026-05-24T21:02:07.109Z] [INFO] Twister JSON price: £26.99 {"asin":"B0CDLTKGTK"}
+[2026-05-24T21:02:07.197Z] [DEBUG] Twister OK via proxy(87.86.25.37) {"asin":"B09VPDFF7G"}
+[2026-05-24T21:02:07.201Z] [INFO] Twister JSON price: £12.99 {"asin":"B09VPDFF7G"}
+[2026-05-24T21:02:07.301Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B00719S168"}
+[2026-05-24T21:02:07.309Z] [INFO] Twister JSON price: £19.2 {"asin":"B00719S168"}
+[2026-05-24T21:02:07.349Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.81.33)) {"asin":"B003VN3I7K"}
+[2026-05-24T21:02:07.373Z] [DEBUG] Twister OK via proxy(212.212.18.50) {"asin":"B09RQQT8GY"}
+[2026-05-24T21:02:07.376Z] [INFO] Twister JSON price: £7.96 {"asin":"B09RQQT8GY"}
+[2026-05-24T21:02:07.486Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.116)) {"asin":"B0BKLH6D8Y"}
+[2026-05-24T21:02:07.661Z] [DEBUG] Twister OK via proxy(87.86.25.243) {"asin":"B0CC26QFRN"}
+[2026-05-24T21:02:07.663Z] [INFO] Twister JSON price: £22.99 {"asin":"B0CC26QFRN"}
+[2026-05-24T21:02:07.740Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.97.163)) {"asin":"B0BKLF7FVF"}
+[2026-05-24T21:02:07.754Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.81.33)) {"asin":"B0CKBTBTZP"}
+[2026-05-24T21:02:07.767Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.198)) {"asin":"B09X141ZTP"}
+[2026-05-24T21:02:07.794Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.213)) {"asin":"B0DX8Q21H1"}
+[2026-05-24T21:02:08.065Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B09X141ZTP"}
+[2026-05-24T21:02:08.117Z] [DEBUG] Twister OK via proxy(87.86.24.235) {"asin":"B0B61TZBP7"}
+[2026-05-24T21:02:08.120Z] [INFO] Twister JSON price: £13.95 {"asin":"B0B61TZBP7"}
+[2026-05-24T21:02:08.257Z] [DEBUG] Twister OK via direct {"asin":"B0CKBTBTZP"}
+[2026-05-24T21:02:08.259Z] [INFO] Twister JSON price: £2.75 {"asin":"B0CKBTBTZP"}
+[2026-05-24T21:02:08.399Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.25.37)) {"asin":"B0BKLH6D8Y"}
+[2026-05-24T21:02:08.481Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.32)) {"asin":"B0DX8Q21H1"}
+[2026-05-24T21:02:08.643Z] [DEBUG] Twister OK via proxy(212.212.18.157) {"asin":"B003VN3I7K"}
+[2026-05-24T21:02:08.645Z] [INFO] Twister JSON price: £2.61 {"asin":"B003VN3I7K"}
+[2026-05-24T21:02:08.709Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.160)) {"asin":"B08CJ6J3BP"}
+[2026-05-24T21:02:08.798Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B0819XVK92"}
+[2026-05-24T21:02:08.939Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.32)) {"asin":"B005QO8GJC"}
+[2026-05-24T21:02:09.053Z] [DEBUG] Twister OK via proxy(87.86.24.121) {"asin":"B0BKLF7FVF"}
+[2026-05-24T21:02:09.054Z] [INFO] Twister JSON price: £11.97 {"asin":"B0BKLF7FVF"}
+[2026-05-24T21:02:09.122Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B0DX8Q21H1"}
+[2026-05-24T21:02:09.320Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.24.235)) {"asin":"B0BKLH6D8Y"}
+[2026-05-24T21:02:09.323Z] [DEBUG] Twister OK via proxy(87.86.25.243) {"asin":"B0002I9OA2"}
+[2026-05-24T21:02:09.325Z] [INFO] Twister JSON price: £12.03 {"asin":"B0002I9OA2"}
+[2026-05-24T21:02:09.392Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.75.198)) {"asin":"B07MXSL687"}
+[2026-05-24T21:02:09.406Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B08CJ6J3BP"}
+[2026-05-24T21:02:09.471Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0DX8Q21H1"}
+[2026-05-24T21:02:09.614Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0BKLH6D8Y"}
