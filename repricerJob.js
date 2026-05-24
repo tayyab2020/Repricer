@@ -452,14 +452,31 @@ function _cronPattern(minutes) {
   return `0 */${Math.round(minutes / 60)} * * *`;            // e.g. 120 → 0 */2 * * *
 }
 
+// Re-read all settings from DB and apply them in this worker process.
+// Called before every run so changes made via the Settings UI take effect
+// without requiring a worker restart.
+async function reloadSettings() {
+  try {
+    const { rows } = await db.query('SELECT key, value FROM settings');
+    const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
+    setProxyApiUrl(s.webshare_proxy_api || null);
+    if (s.onbuy_fee_percent)   setRepricerDefaults({ feeRate:    parseFloat(s.onbuy_fee_percent) });
+    if (s.default_roi_percent) setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
+    console.log(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
+  } catch (e) {
+    console.warn('[RepricerJob] Could not reload settings:', e.message);
+  }
+}
+
 function _applySchedule() {
   if (_activeCron) { _activeCron.stop(); _activeCron = null; }
   const pattern = _cronPattern(_intervalMinutes);
-  _activeCron = cron.schedule(pattern, () => {
+  _activeCron = cron.schedule(pattern, async () => {
     if (!_isAfterStartTime()) {
       console.log(`[Scheduler] Before start time ${_startTime} — skipping tick`);
       return;
     }
+    await reloadSettings();
     runRepricerJob();
   });
   console.log(`[Scheduler] ✅ Pattern: "${pattern}"  Start time: ${_startTime}  Interval: ${_intervalMinutes}min`);
@@ -468,7 +485,7 @@ function _applySchedule() {
 // Called by server.js after settings are loaded from DB, so proxy URL / fee rate
 // are already configured before the first repricer run fires.
 export function startScheduler() {
-  if (_isAfterStartTime()) runRepricerJob();
+  if (_isAfterStartTime()) reloadSettings().then(() => runRepricerJob());
   _applySchedule();
 }
 
