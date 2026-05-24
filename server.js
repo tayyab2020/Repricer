@@ -931,158 +931,161 @@ app.post('/api/import/preview', upload.single('file'), (req, res) => {
   }
 });
 
-// POST /api/import/confirm — create product_mappings from validated rows
-// For rows with action='create', calls OnBuy API to create the seller listing first.
+// POST /api/import/confirm — bulk upsert product_mappings from validated rows.
+// Uses PostgreSQL unnest for batch operations — handles 40k+ rows without timeout.
 app.post('/api/import/confirm', async (req, res) => {
   const { rows, onbuy_account_id, filename } = req.body;
   if (!Array.isArray(rows) || rows.length === 0)
     return res.status(400).json({ error: 'No rows provided' });
 
   const toImport = rows.filter(r => r.valid);
-  const results = { created: 0, updated: 0, skipped: 0, onbuy_created: 0, errors: [] };
+  const results  = { created: 0, updated: 0, skipped: 0, onbuy_created: 0, errors: [] };
 
-  // Pre-fetch OnBuy token once if any rows need listing creation
-  const needsCreate = toImport.some(r => r.action === 'create');
+  // ── 1. Handle 'create' rows individually (each needs an OnBuy API call) ──
+  const createRows = toImport.filter(r => r.action === 'create' && r.onbuy_opc);
+  const bulkRows   = toImport.filter(r => !(r.action === 'create' && r.onbuy_opc));
+
   let account = null, onbuyToken = null;
-  if (needsCreate) {
+  if (createRows.length > 0) {
     account = await getImportAccount(onbuy_account_id);
-    if (account) {
-      onbuyToken = await getOnBuyTokenForAccount(account);
-      if (!onbuyToken) {
-        console.warn('[Import] Could not get OnBuy token — listing creation will be skipped');
-      }
+    if (account) onbuyToken = await getOnBuyTokenForAccount(account);
+  }
+
+  for (const row of createRows) {
+    try {
+      if (!onbuyToken) throw new Error('No OnBuy account linked or token failed');
+      const created = await createOnBuyListing(row.onbuy_opc, row.unit_price, row.onbuy_sku || null, onbuyToken, account.site_id);
+      row.onbuy_listing_id = created.uid;
+      results.onbuy_created++;
+      bulkRows.push(row); // now has a UID — process via bulk path
+    } catch (err) {
+      results.errors.push({ row: row._row, product: row.product_name || '?', error: err.message });
+      results.skipped++;
     }
   }
 
-  // Auto-fetch missing product titles from Amazon (parallel, best-effort)
-  const titleFetchRows = toImport.filter(r => r.needs_title_fetch && r.primary_asin);
-  if (titleFetchRows.length > 0) {
-    console.log(`[Import] Fetching ${titleFetchRows.length} product title(s) from Amazon...`);
-    await Promise.all(titleFetchRows.map(async row => {
-      const title = await fetchAmazonTitle(row.primary_asin);
-      if (title) {
-        row.product_name = title;
-        console.log(`[Import] Title fetched for ${row.primary_asin}: "${title.slice(0, 60)}..."`);
-      }
+  // ── 2. Auto-fetch missing titles (parallel, best-effort) ──
+  const titleRows = bulkRows.filter(r => r.needs_title_fetch && r.primary_asin);
+  if (titleRows.length > 0) {
+    console.log(`[Import] Fetching ${titleRows.length} title(s) from Amazon…`);
+    await Promise.all(titleRows.map(async row => {
+      const t = await fetchAmazonTitle(row.primary_asin);
+      if (t) row.product_name = t;
     }));
   }
 
-  for (const row of toImport) {
-    try {
-      let listingId = row.onbuy_listing_id || null;
+  // ── 3. One query to find ALL existing records by sku or listing_id ──
+  const allSkus = [...new Set(bulkRows.map(r => r.onbuy_sku).filter(Boolean))];
+  const allUids = [...new Set(bulkRows.map(r => r.onbuy_listing_id).filter(Boolean))];
 
-      // ── Create listing on OnBuy if only OPC is available ──
-      if (row.action === 'create' && row.onbuy_opc) {
-        if (!onbuyToken) {
-          throw new Error(
-            'No OnBuy account linked (or token failed) — link an account to auto-create listings'
-          );
-        }
-        console.log(`[Import] Creating OnBuy listing for OPC ${row.onbuy_opc} (row ${row._row})`);
-        const created = await createOnBuyListing(
-          row.onbuy_opc,
-          row.unit_price,
-          row.onbuy_sku || null,
-          onbuyToken,
-          account.site_id
-        );
-        listingId = created.uid;
-        results.onbuy_created++;
-        console.log(`[Import] ✅ OnBuy listing created: UID=${listingId}`);
-      }
+  const { rows: existing } = await db.query(
+    `SELECT id, onbuy_sku, onbuy_listing_id
+     FROM product_mappings
+     WHERE onbuy_sku = ANY($1::text[]) OR onbuy_listing_id = ANY($2::text[])`,
+    [allSkus.length ? allSkus : ['__none__'], allUids.length ? allUids : ['__none__']]
+  );
+  const bySkuMap = new Map(existing.filter(r => r.onbuy_sku).map(r => [r.onbuy_sku, r.id]));
+  const byUidMap = new Map(existing.filter(r => r.onbuy_listing_id).map(r => [r.onbuy_listing_id, r.id]));
 
-      // ── Deduplicate: find existing record by onbuy_sku, or (primary_asin + OPC/listing_id) ──
-      let existing = null;
-      if (row.onbuy_sku) {
-        const r = await db.query(
-          'SELECT id FROM product_mappings WHERE onbuy_sku = $1 LIMIT 1',
-          [row.onbuy_sku]
-        );
-        if (r.rows.length) existing = r.rows[0];
-      }
-      if (!existing && row.primary_asin) {
-        const identifier = row.onbuy_opc || listingId;
-        if (identifier) {
-          const r = await db.query(
-            `SELECT id FROM product_mappings
-             WHERE primary_asin = $1 AND (onbuy_opc = $2 OR onbuy_listing_id = $2) LIMIT 1`,
-            [row.primary_asin, identifier]
-          );
-          if (r.rows.length) existing = r.rows[0];
-        }
-      }
+  const toUpdate = [];
+  const toInsert = [];
+  for (const row of bulkRows) {
+    const existId = (row.onbuy_sku && bySkuMap.get(row.onbuy_sku))
+                 || (row.onbuy_listing_id && byUidMap.get(row.onbuy_listing_id));
+    if (existId) toUpdate.push({ ...row, _id: existId });
+    else         toInsert.push(row);
+  }
 
-      if (existing) {
-        await db.query(
-          `UPDATE product_mappings SET
-            product_name     = COALESCE($1, product_name),
-            onbuy_listing_id = COALESCE($2, onbuy_listing_id),
-            onbuy_opc        = COALESCE($3, onbuy_opc),
-            onbuy_sku        = COALESCE($4, onbuy_sku),
-            markup_type      = $5,
-            markup_value     = $6,
-            onbuy_fee        = $7,
-            target_price     = COALESCE($8, target_price),
-            min_price        = COALESCE($9, min_price),
-            notes            = COALESCE($10, notes),
-            updated_at       = NOW()
-           WHERE id = $11`,
-          [
-            row.product_name  || null,
-            listingId,
-            row.onbuy_opc     || null,
-            row.onbuy_sku     || null,
-            row.markup_type,
-            row.markup_value,
-            row.onbuy_fee     || 0,
-            row.target_price  || null,
-            row.min_price     || null,
-            row.notes         || null,
-            existing.id,
-          ]
-        );
-        results.updated++;
-      } else {
-        await db.query(
-          `INSERT INTO product_mappings
-            (product_name, onbuy_listing_id, onbuy_opc, onbuy_sku, primary_asin,
-             markup_type, markup_value, onbuy_fee, target_price, min_price, notes, onbuy_account_id, is_active)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true)`,
-          [
-            row.product_name     || null,
-            listingId,
-            row.onbuy_opc        || null,
-            row.onbuy_sku        || null,
-            row.primary_asin,
-            row.markup_type,
-            row.markup_value,
-            row.onbuy_fee        || 0,
-            row.target_price     || null,
-            row.min_price        || null,
-            row.notes            || null,
-            onbuy_account_id     || null,
-          ]
-        );
-        results.created++;
-      }
-    } catch (err) {
-      console.error(`[Import] Row ${row._row} failed:`, err.message);
-      results.errors.push({
-        row:     row._row,
-        product: row.product_name || row.onbuy_listing_id || row.onbuy_opc || '?',
-        error:   err.message,
-      });
-      results.skipped++;
-    }
+  // ── 4. Batch UPDATE via unnest — one query per 5000 rows ──
+  const CHUNK = 5000;
+  for (let i = 0; i < toUpdate.length; i += CHUNK) {
+    const c = toUpdate.slice(i, i + CHUNK);
+    await db.query(`
+      UPDATE product_mappings pm SET
+        product_name     = COALESCE(NULLIF(v.product_name,''),  pm.product_name),
+        onbuy_listing_id = COALESCE(NULLIF(v.listing_id,''),    pm.onbuy_listing_id),
+        onbuy_opc        = COALESCE(NULLIF(v.opc,''),           pm.onbuy_opc),
+        onbuy_sku        = COALESCE(NULLIF(v.sku,''),           pm.onbuy_sku),
+        markup_type      = v.markup_type,
+        markup_value     = v.markup_value::decimal,
+        onbuy_fee        = v.onbuy_fee::decimal,
+        target_price     = COALESCE(NULLIF(v.target_price,'')::decimal, pm.target_price),
+        min_price        = COALESCE(NULLIF(v.min_price,'')::decimal,    pm.min_price),
+        notes            = COALESCE(NULLIF(v.notes,''),         pm.notes),
+        updated_at       = NOW()
+      FROM (SELECT * FROM unnest(
+        $1::int[], $2::text[], $3::text[], $4::text[], $5::text[],
+        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]
+      ) AS v(id, product_name, listing_id, opc, sku,
+             markup_type, markup_value, onbuy_fee, target_price, min_price, notes)) v
+      WHERE pm.id = v.id`,
+    [
+      c.map(r => r._id),
+      c.map(r => r.product_name     || ''),
+      c.map(r => r.onbuy_listing_id || ''),
+      c.map(r => r.onbuy_opc        || ''),
+      c.map(r => r.onbuy_sku        || ''),
+      c.map(r => r.markup_type      || 'roi'),
+      c.map(r => String(r.markup_value ?? 0)),
+      c.map(r => String(r.onbuy_fee  ?? 0)),
+      c.map(r => r.target_price != null ? String(r.target_price) : ''),
+      c.map(r => r.min_price    != null ? String(r.min_price)    : ''),
+      c.map(r => r.notes        || ''),
+    ]);
+    results.updated += c.length;
+  }
+
+  // ── 5. Batch INSERT via unnest — one query per 5000 rows ──
+  for (let i = 0; i < toInsert.length; i += CHUNK) {
+    const c = toInsert.slice(i, i + CHUNK);
+    await db.query(`
+      INSERT INTO product_mappings
+        (product_name, onbuy_listing_id, onbuy_opc, onbuy_sku, primary_asin,
+         markup_type, markup_value, onbuy_fee, target_price, min_price, notes,
+         onbuy_account_id, is_active)
+      SELECT
+        NULLIF(v.product_name,''),
+        NULLIF(v.listing_id,''),
+        NULLIF(v.opc,''),
+        NULLIF(v.sku,''),
+        v.asin,
+        v.markup_type,
+        v.markup_value::decimal,
+        v.onbuy_fee::decimal,
+        NULLIF(v.target_price,'')::decimal,
+        NULLIF(v.min_price,'')::decimal,
+        NULLIF(v.notes,''),
+        NULLIF(v.account_id,'')::int,
+        true
+      FROM unnest(
+        $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[]
+      ) AS v(product_name, listing_id, opc, sku, asin,
+             markup_type, markup_value, onbuy_fee, target_price, min_price, notes, account_id)`,
+    [
+      c.map(r => r.product_name     || ''),
+      c.map(r => r.onbuy_listing_id || ''),
+      c.map(r => r.onbuy_opc        || ''),
+      c.map(r => r.onbuy_sku        || ''),
+      c.map(r => r.primary_asin),
+      c.map(r => r.markup_type      || 'roi'),
+      c.map(r => String(r.markup_value ?? 0)),
+      c.map(r => String(r.onbuy_fee  ?? 0)),
+      c.map(r => r.target_price != null ? String(r.target_price) : ''),
+      c.map(r => r.min_price    != null ? String(r.min_price)    : ''),
+      c.map(r => r.notes        || ''),
+      c.map(() => onbuy_account_id != null ? String(onbuy_account_id) : ''),
+    ]);
+    results.created += c.length;
   }
 
   // Audit log (best-effort)
   db.query(
     `INSERT INTO import_logs (filename, total_rows, imported, skipped, row_errors)
      VALUES ($1, $2, $3, $4, $5)`,
-    [filename || 'unknown', toImport.length, results.created + results.updated, results.skipped,
-     JSON.stringify(results.errors)]
-  ).catch(e => console.warn('[Import] Could not write import_log:', e.message));
+    [filename || 'unknown', toImport.length, results.created + results.updated,
+     results.skipped, JSON.stringify(results.errors)]
+  ).catch(() => {});
 
   res.json(results);
 });
