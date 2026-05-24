@@ -5,7 +5,7 @@ import {
 } from "recharts";
 
 // ── Config ──────────────────────────────────
-const API = "http://localhost:4000/api";
+const API = import.meta.env.VITE_API_URL ?? "http://localhost:4000/api";
 
 // ── Colour palette ───────────────────────────
 const C = {
@@ -755,7 +755,7 @@ function CurrentPricesPage() {
             <Btn small variant="secondary" onClick={() => setShowLogs(v => !v)}>
               {showLogs ? "Hide" : "Show"}
             </Btn>
-            <a href="http://localhost:4000/api/scraper-logs/file"
+            <a href={`${API}/scraper-logs/file`}
               style={{ color: C.textDim, fontSize: 12, display: "flex",
                 alignItems: "center", textDecoration: "none" }}>
               Download ↓
