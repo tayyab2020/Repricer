@@ -470,19 +470,35 @@ app.get('/api/history/:mappingId', async (req, res) => {
 // SYNC LOGS
 // ─────────────────────────────────────────────
 
-// GET /api/logs — recent sync logs
+// GET /api/logs — paginated sync logs
+// Query params: page (default 1), limit (default 50, max 500), status (success|failed|skipped)
 app.get('/api/logs', async (req, res) => {
-  const limit = parseInt(req.query.limit) || 50;
   try {
-    const { rows } = await db.query(
-      `SELECT sl.*, pm.product_name, pm.primary_asin
-       FROM sync_logs sl
-       LEFT JOIN product_mappings pm ON pm.id = sl.product_mapping_id
-       ORDER BY sl.created_at DESC
-       LIMIT $1`,
-      [limit]
-    );
-    res.json(rows);
+    const limit  = Math.min(500, Math.max(1, parseInt(req.query.limit) || 50));
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const status = req.query.status || '';
+    const offset = (page - 1) * limit;
+
+    const where  = status ? `WHERE sl.status = $3` : '';
+    const params = status ? [limit, offset, status] : [limit, offset];
+
+    const [{ rows }, countResult] = await Promise.all([
+      db.query(
+        `SELECT sl.*, pm.product_name, pm.primary_asin
+         FROM sync_logs sl
+         LEFT JOIN product_mappings pm ON pm.id = sl.product_mapping_id
+         ${where}
+         ORDER BY sl.created_at DESC
+         LIMIT $1 OFFSET $2`,
+        params
+      ),
+      db.query(
+        `SELECT COUNT(*) FROM sync_logs sl ${where}`,
+        status ? [status] : []
+      ),
+    ]);
+
+    res.json({ rows, total: parseInt(countResult.rows[0].count), page, limit });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

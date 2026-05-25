@@ -30,7 +30,7 @@ import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, getTokenForAccount } from './jobProducer.js';
 
 dotenv.config();
 
@@ -79,17 +79,22 @@ class OnBuyUpdater {
     this._maxBatch   = maxBatch;
     this._maxPerHour = maxPerHour;
     this._batches    = new Map(); // key → [{ token, siteId, identifier, isSku, price, resolve, reject }]
-    this._timers     = new Map(); // key → timer id (200 ms batching window)
+    this._timers     = new Map(); // key → timer id
     this._rrTs       = [];        // timestamps of sent requests (sliding 1-hour window)
     this._mutex      = Promise.resolve(); // serialises all batch flushes
+    this._creds      = new Map(); // token → { consumerKey, secretKey } for refresh on 401
   }
 
-  enqueue(token, siteId, identifier, isSku, price) {
+  enqueue(token, siteId, identifier, isSku, price, { consumerKey, secretKey } = {}) {
     return new Promise((resolve, reject) => {
       const key = `${token}||${siteId}||${isSku ? '1' : '0'}`;
       if (!this._batches.has(key)) this._batches.set(key, []);
       const batch = this._batches.get(key);
       batch.push({ token, siteId, identifier, isSku, price, resolve, reject });
+      // Store credentials so we can refresh this token if OnBuy returns 401
+      if (consumerKey && secretKey && !this._creds.has(token)) {
+        this._creds.set(token, { consumerKey, secretKey });
+      }
 
       if (batch.length >= this._maxBatch) {
         // Batch is full — flush immediately without waiting for the timer
@@ -135,14 +140,37 @@ class OnBuyUpdater {
     const listingKey = isSku ? 'sku' : 'uid';
     const listings   = items.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
 
+    const doRequest = (authToken) => fetch(endpoint, {
+      method: 'PUT',
+      headers: { Authorization: authToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ listings }),
+    });
+
     try {
-      const res = await fetch(endpoint, {
-        method: 'PUT',
-        headers: { Authorization: token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ listings }),
-      });
-      const raw = await res.text();
+      let res = await doRequest(token);
+      let raw = await res.text();
       wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status}`);
+
+      // Token expired mid-run — refresh once and retry the batch
+      if (res.status === 401) {
+        const creds = this._creds.get(token);
+        if (creds) {
+          wlog(`[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
+          try {
+            const newToken = await getTokenForAccount({ consumer_key: creds.consumerKey, secret_key: creds.secretKey });
+            if (newToken) {
+              this._creds.set(newToken, creds);
+              // Swap the token on any items still waiting in the queue for this key
+              (this._batches.get(key) || []).forEach(it => { it.token = newToken; });
+              res = await doRequest(newToken);
+              raw = await res.text();
+              wlog(`[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status}`);
+            }
+          } catch (refreshErr) {
+            wlog(`[OnBuyUpdater] Token refresh failed:`, refreshErr.message);
+          }
+        }
+      }
 
       if (!res.ok) {
         const err = new Error(`OnBuy ${res.status}: ${raw.slice(0, 200)}`);
@@ -291,7 +319,7 @@ function extractOpcFromValue(val) {
 // Called by both workers after scraping completes
 // ─────────────────────────────────────────────
 
-async function applyResult(scraped, mapping, token, siteId) {
+async function applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey } = {}) {
   const {
     id,
     onbuy_sku,
@@ -384,7 +412,7 @@ async function applyResult(scraped, mapping, token, siteId) {
   );
 
   const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
-  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice)
+  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice, { consumerKey, secretKey })
     .then(async () => {
       try {
         await db.query(
@@ -426,7 +454,7 @@ async function applyResult(scraped, mapping, token, siteId) {
 // ─────────────────────────────────────────────
 
 async function processFastJob(job) {
-  let { mapping, token, siteId } = job.data;
+  let { mapping, token, siteId, consumerKey, secretKey } = job.data;
 
   // Resolve listing UID from OPC if we only have a raw URL/OPC
   if (!mapping.onbuy_sku && !isValidListingUid(mapping.onbuy_listing_id)) {
@@ -481,7 +509,7 @@ async function processFastJob(job) {
     return { escalated: true };
   }
 
-  return applyResult(scraped, mapping, token, siteId);
+  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey });
 }
 
 // ─────────────────────────────────────────────
@@ -491,9 +519,9 @@ async function processFastJob(job) {
 // ─────────────────────────────────────────────
 
 async function processSlowJob(job) {
-  const { mapping, token, siteId } = job.data;
+  const { mapping, token, siteId, consumerKey, secretKey } = job.data;
   const scraped = await scrapeProductSlow(mapping.primary_asin);
-  return applyResult(scraped, mapping, token, siteId);
+  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey });
 }
 
 // ─────────────────────────────────────────────

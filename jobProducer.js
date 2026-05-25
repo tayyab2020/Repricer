@@ -26,7 +26,7 @@ const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
 export const fastQueue = new Queue('repricer-fast', { connection: redis });
 export const slowQueue  = new Queue('repricer-slow', { connection: redis });
 
-async function getTokenForAccount(account) {
+export async function getTokenForAccount(account) {
   try {
     const res = await fetch('https://api.onbuy.com/v2/auth/request-token', {
       method: 'POST',
@@ -68,11 +68,12 @@ export async function runRepricerJob() {
     }
     console.log(`[Job] ${mappings.length} active mapping(s) to enqueue`);
 
-    const tokenCache = {}, siteCache = {};
+    const tokenCache = {}, siteCache = {}, credCache = {};
     for (const m of mappings) {
       const aid = m.onbuy_account_id;
       if (aid && !(aid in tokenCache)) {
         console.log(`[Job] Fetching token for "${m.acct_name}" (id=${aid})…`);
+        credCache[aid]  = { consumerKey: m.acct_consumer_key, secretKey: m.acct_secret_key };
         tokenCache[aid] = await getTokenForAccount({
           account_name: m.acct_name,
           consumer_key: m.acct_consumer_key,
@@ -83,12 +84,13 @@ export async function runRepricerJob() {
       }
     }
 
-    let fallbackToken = null, fallbackSiteId = '2000';
+    let fallbackToken = null, fallbackSiteId = '2000', fallbackCreds = null;
     if (mappings.some(m => !m.onbuy_account_id)) {
       const { rows } = await db.query(
         `SELECT * FROM onbuy_accounts WHERE is_active = true ORDER BY id ASC LIMIT 1`
       );
       if (rows[0]) {
+        fallbackCreds  = { consumerKey: rows[0].consumer_key, secretKey: rows[0].secret_key };
         fallbackToken  = await getTokenForAccount(rows[0]);
         fallbackSiteId = rows[0].site_id || '2000';
         console.log(`[Job] Fallback token: ${fallbackToken ? '✅' : '❌'}`);
@@ -102,12 +104,13 @@ export async function runRepricerJob() {
       const aid    = mapping.onbuy_account_id;
       const token  = aid ? tokenCache[aid] : fallbackToken;
       const siteId = aid ? siteCache[aid]  : fallbackSiteId;
+      const creds  = aid ? credCache[aid]  : fallbackCreds;
 
       if (!token) { skippedNoToken++; continue; }
 
       jobs.push({
         name: 'scrape',
-        data: { mapping, token, siteId },
+        data: { mapping, token, siteId, consumerKey: creds?.consumerKey, secretKey: creds?.secretKey },
         opts: {
           jobId:            `fast-${mapping.id}`,
           removeOnComplete: true,

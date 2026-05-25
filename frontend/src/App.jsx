@@ -216,7 +216,35 @@ function PriceChart({ mappingId }) {
 // ════════════════════════════════════════════
 
 // ── Dashboard Page ────────────────────────────
-function DashboardPage({ stats, logs }) {
+const LOG_PAGE_SIZE = 50;
+
+function DashboardPage({ stats }) {
+  const [logs, setLogs]         = useState([]);
+  const [logsTotal, setLogsTotal] = useState(0);
+  const [logsPage, setLogsPage] = useState(1);
+  const [logsStatus, setLogsStatus] = useState("");
+  const [logsLoading, setLogsLoading] = useState(false);
+
+  const loadLogs = useCallback((pg = 1, status = "") => {
+    setLogsLoading(true);
+    const params = new URLSearchParams({ page: pg, limit: LOG_PAGE_SIZE, ...(status ? { status } : {}) });
+    api(`/logs?${params}`)
+      .then(data => { setLogs(data.rows); setLogsTotal(data.total); })
+      .catch(console.error)
+      .finally(() => setLogsLoading(false));
+  }, []);
+
+  useEffect(() => { loadLogs(logsPage, logsStatus); }, [loadLogs, logsPage, logsStatus]);
+
+  const totalPages = Math.max(1, Math.ceil(logsTotal / LOG_PAGE_SIZE));
+
+  const filterBtns = [
+    { label: "All",     value: "" },
+    { label: "Success", value: "success" },
+    { label: "Failed",  value: "failed" },
+    { label: "Skipped", value: "skipped" },
+  ];
+
   return (
     <div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 32 }}>
@@ -226,6 +254,21 @@ function DashboardPage({ stats, logs }) {
       </div>
 
       <Section title="Recent Sync Activity">
+        {/* Filter + record count row */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          {filterBtns.map(b => (
+            <button key={b.value} onClick={() => { setLogsStatus(b.value); setLogsPage(1); }} style={{
+              padding: "4px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+              border: `1px solid ${logsStatus === b.value ? C.accent : C.border}`,
+              background: logsStatus === b.value ? C.accentDim : "none",
+              color: logsStatus === b.value ? C.accent : C.muted,
+            }}>{b.label}</button>
+          ))}
+          <span style={{ marginLeft: "auto", color: C.muted, fontSize: 12 }}>
+            {logsTotal.toLocaleString()} record{logsTotal !== 1 ? "s" : ""}
+          </span>
+        </div>
+
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
           <thead>
             <tr style={{ borderBottom: `1px solid ${C.border}` }}>
@@ -237,12 +280,17 @@ function DashboardPage({ stats, logs }) {
             </tr>
           </thead>
           <tbody>
-            {logs.length === 0 && (
+            {logsLoading && (
+              <tr><td colSpan={6} style={{ color: C.muted, padding: "24px 12px", textAlign: "center" }}>
+                Loading…
+              </td></tr>
+            )}
+            {!logsLoading && logs.length === 0 && (
               <tr><td colSpan={6} style={{ color: C.muted, padding: "24px 12px", textAlign: "center" }}>
                 No sync activity yet. Run a sync to get started.
               </td></tr>
             )}
-            {logs.map(l => (
+            {!logsLoading && logs.map(l => (
               <tr key={l.id} style={{ borderBottom: `1px solid ${C.border}10` }}>
                 <td style={{ padding: "10px 12px", color: C.text }}>{l.product_name || "—"}</td>
                 <td style={{ padding: "10px 12px", color: C.muted, fontFamily: "monospace" }}>{l.primary_asin}</td>
@@ -254,6 +302,20 @@ function DashboardPage({ stats, logs }) {
             ))}
           </tbody>
         </table>
+
+        {/* Pagination controls */}
+        {totalPages > 1 && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+            marginTop: 14, gap: 8 }}>
+            <Btn variant="secondary" small disabled={logsPage <= 1}
+              onClick={() => setLogsPage(p => p - 1)}>← Prev</Btn>
+            <span style={{ color: C.muted, fontSize: 12 }}>
+              Page {logsPage} / {totalPages}
+            </span>
+            <Btn variant="secondary" small disabled={logsPage >= totalPages}
+              onClick={() => setLogsPage(p => p + 1)}>Next →</Btn>
+          </div>
+        )}
       </Section>
     </div>
   );
@@ -1171,7 +1233,6 @@ function SettingsPage({ onIntervalChange }) {
 export default function App() {
   const [page, setPage]       = useState("dashboard");
   const [stats, setStats]     = useState(null);
-  const [logs, setLogs]       = useState([]);
   const [syncing, setSyncing]       = useState(false);
   const [queueBusy, setQueueBusy]   = useState(false);
   const [queueCounts, setQueueCounts] = useState(null);
@@ -1180,7 +1241,6 @@ export default function App() {
 
   const loadDashboard = useCallback(() => {
     api("/stats").then(setStats).catch(console.error);
-    api("/logs?limit=20").then(setLogs).catch(console.error);
   }, []);
 
   const pollQueue = useCallback(() => {
@@ -1318,7 +1378,7 @@ export default function App() {
         </div>
 
         {/* Pages */}
-        {page === "dashboard"      && <DashboardPage stats={stats} logs={logs} />}
+        {page === "dashboard"      && <DashboardPage stats={stats} />}
         {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} />}
         {page === "compare"        && <ComparePage />}
         {page === "current-prices" && <CurrentPricesPage />}
