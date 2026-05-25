@@ -1078,7 +1078,15 @@ export async function scrapeProductFast(asin) {
   // network errors). Fall through to Cheerio, then escalate only if Cheerio also fails.
 
   // Step 1: Cheerio HTML
-  const cheerioResult = await cheerioScrape(url);
+  // Wrap in try/catch — TLS disconnects and proxy network errors throw here.
+  // Treat as a transient failure and escalate to Puppeteer rather than crashing the job.
+  let cheerioResult;
+  try {
+    cheerioResult = await cheerioScrape(url);
+  } catch (err) {
+    log('warn', `Cheerio network error — escalating to Puppeteer: ${err.message}`, { asin });
+    return { asin, url, needsBrowser: true };
+  }
   if (!cheerioResult.blocked && !cheerioResult.needsBrowser && cheerioResult.price)
     return { asin, url, ...cheerioResult, method: 'cheerio' };
   if (cheerioResult.inStock === false)

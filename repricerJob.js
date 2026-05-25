@@ -232,7 +232,7 @@ async function resolveUidFromOpc(opc, token, siteId) {
     const data = await res.json();
     return (Array.isArray(data?.results) ? data.results[0] : null)?.uid || null;
   } catch (err) {
-    console.warn(`[Resolve] OPC ${opc} failed:`, err.message);
+    wlog(`[Resolve] OPC ${opc} failed:`, err.message);
     return null;
   }
 }
@@ -352,7 +352,7 @@ async function applyResult(scraped, mapping, token, siteId) {
 
   // ── No price ──
   if (!scraped.price) {
-    console.warn(`[Worker] ⚠️  ${label} — no price (${scraped.error || 'unknown'})`);
+    wlog(`[Worker] ⚠️  ${label} — no price (${scraped.error || 'unknown'})`);
     await db.query(
       `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
        VALUES ($1, 'failed', $2, NOW())`,
@@ -404,11 +404,11 @@ async function applyResult(scraped, mapping, token, siteId) {
           ),
         ]);
       } catch (dbErr) {
-        console.error(`[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
+        wlog(`[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
       }
     })
     .catch(err => {
-      console.error(`[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
+      wlog(`[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
       db.query(
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`,
@@ -433,7 +433,7 @@ async function processFastJob(job) {
     const opc = mapping.onbuy_opc || extractOpcFromValue(mapping.onbuy_listing_id);
     if (!opc) {
       const msg = 'No SKU or valid UID — re-import with Seller SKU filled in';
-      console.warn(`[FastWorker] mapping #${mapping.id}: ${msg}`);
+      wlog(`[FastWorker] mapping #${mapping.id}: ${msg}`);
       await db.query(
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`, [mapping.id, msg]
@@ -525,7 +525,7 @@ try {
   }
   wlog(`[RepricerJob] Settings pre-loaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}  fee: ${s.onbuy_fee_percent || 15}%  interval: ${s.job_interval_minutes || 30}min  start: ${s.job_start_time || '00:00'}`);
 } catch (e) {
-  console.warn('[RepricerJob] Could not pre-load settings from DB:', e.message);
+  wlog('[RepricerJob] Could not pre-load settings from DB:', e.message);
 }
 
 // ─────────────────────────────────────────────
@@ -545,10 +545,10 @@ const slowWorker = new Worker('repricer-slow', processSlowJob, {
 });
 
 fastWorker.on('failed', (job, err) =>
-  console.error(`[FastWorker] ❌ job ${job?.id} failed: ${err.message}`)
+  wlog(`[FastWorker] ❌ job ${job?.id} failed: ${err.message}`)
 );
 slowWorker.on('failed', (job, err) =>
-  console.error(`[SlowWorker] ❌ job ${job?.id} failed: ${err.message}`)
+  wlog(`[SlowWorker] ❌ job ${job?.id} failed: ${err.message}`)
 );
 
 wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
@@ -587,7 +587,7 @@ async function reloadSettings({ log = false } = {}) {
     if (s.default_roi_percent) setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
     if (log) wlog(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
   } catch (e) {
-    console.warn('[RepricerJob] Could not reload settings:', e.message);
+    wlog('[RepricerJob] Could not reload settings:', e.message);
   }
 }
 
@@ -620,7 +620,7 @@ startScheduler();
 // Subscribe to settings-change events published by the API server.
 // Changes from the Settings UI take effect immediately without a PM2 restart.
 redisSub.subscribe('repricer:settings-updated', (err) => {
-  if (err) console.warn('[RepricerJob] Could not subscribe to settings channel:', err.message);
+  if (err) wlog('[RepricerJob] Could not subscribe to settings channel:', err.message);
   else     wlog('[RepricerJob] Subscribed to repricer:settings-updated');
 });
 redisSub.on('message', (channel) => {
