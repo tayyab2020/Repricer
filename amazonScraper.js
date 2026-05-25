@@ -567,9 +567,15 @@ async function extractAODPrice(page, url) {
 //  - OOS detection, AOD fallback
 // ─────────────────────────────────────────────
 
-async function puppeteerScrape(url, { forceProxy = true } = {}) {
-  const ua    = getUKUserAgent();
-  const proxy = forceProxy && USE_PROXIES ? await getUKProxy() : null;
+// proxy param: pre-resolved { server, username, password } object, or null for direct.
+// forceProxy is kept for callers that want random proxy selection (getProductDetails).
+async function puppeteerScrape(url, { forceProxy = true, proxy: explicitProxy = undefined } = {}) {
+  const ua = getUKUserAgent();
+  // explicitProxy=undefined means "caller didn't specify" → use forceProxy logic
+  // explicitProxy=null means "caller explicitly wants no proxy"
+  const proxy = explicitProxy !== undefined
+    ? explicitProxy
+    : (forceProxy && USE_PROXIES ? await getUKProxy() : null);
 
   const launchArgs = [
     '--no-sandbox',
@@ -579,6 +585,11 @@ async function puppeteerScrape(url, { forceProxy = true } = {}) {
     '--disable-dev-shm-usage',
     '--window-size=1440,900',
     '--lang=en-GB',
+    '--disable-notifications',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--password-store=basic',
+    '--use-mock-keychain',
   ];
 
   if (proxy) {
@@ -599,10 +610,19 @@ async function puppeteerScrape(url, { forceProxy = true } = {}) {
   try {
     const page = await browser.newPage();
 
-    // Proper proxy auth with username/password (your fix)
     if (proxy) {
       await page.authenticate({ username: proxy.username, password: proxy.password });
     }
+
+    // Block images, fonts, media — reduces fingerprint surface and speeds up page load
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
 
     await page.setUserAgent(ua);
     await page.setViewport({ width: 1440, height: 900 });
@@ -611,13 +631,26 @@ async function puppeteerScrape(url, { forceProxy = true } = {}) {
       'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     });
 
-    // Mask all automation signals
+    // Comprehensive automation signal masking
     await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver',  { get: () => false });
-      Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages',  { get: () => ['en-GB', 'en'] });
-      Object.defineProperty(navigator, 'platform',   { get: () => 'Win32' });
-      window.chrome = { runtime: {} };
+      // webdriver: undefined (not false) — real Chrome doesn't define this at all
+      Object.defineProperty(navigator, 'webdriver',           { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins',             { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages',           { get: () => ['en-GB', 'en'] });
+      Object.defineProperty(navigator, 'platform',            { get: () => 'Win32' });
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
+      Object.defineProperty(navigator, 'maxTouchPoints',      { get: () => 0 });
+      // Real Chrome chrome object (not just { runtime: {} })
+      window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} };
+      // Permissions API — headless Chrome returns 'denied'; spoof to 'default'
+      const origQuery = window.navigator.permissions?.query?.bind(window.navigator.permissions);
+      if (origQuery) {
+        window.navigator.permissions.query = (params) =>
+          params.name === 'notifications'
+            ? Promise.resolve({ state: 'default' })
+            : origQuery(params);
+      }
     });
 
     // ── Session warm-up ──────────────────────────
@@ -1058,16 +1091,28 @@ export async function scrapeProductFast(asin) {
 export async function scrapeProductSlow(asin) {
   const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
 
-  // Step 2: Puppeteer + proxy
-  const proxyResult = await puppeteerScrape(url, { forceProxy: true });
-  if (!proxyResult.blocked && proxyResult.price)
-    return { asin, url, ...proxyResult, method: 'puppeteer_proxy' };
-  if (proxyResult.inStock === false)
-    return { asin, url, price: null, inStock: false, method: 'puppeteer_proxy' };
+  // Rotate through up to 3 random proxies on CAPTCHA instead of giving up immediately.
+  // Each attempt uses a fresh browser + different IP, giving Amazon a new session to evaluate.
+  const pool = await getProxies();
+  const proxiesToTry = pool.length > 0
+    ? [...pool].sort(() => Math.random() - 0.5).slice(0, 3).map(parseProxy)
+    : [];
 
-  // Step 3: Puppeteer direct
+  for (let i = 0; i < proxiesToTry.length; i++) {
+    const result = await puppeteerScrape(url, { proxy: proxiesToTry[i] });
+    if (!result.blocked && result.price)
+      return { asin, url, ...result, method: 'puppeteer_proxy' };
+    if (result.inStock === false)
+      return { asin, url, price: null, inStock: false, method: 'puppeteer_proxy' };
+    // Only retry with a different proxy if the failure was CAPTCHA/block.
+    // Navigation errors or missing prices don't benefit from an IP swap.
+    if (result.reason !== 'captcha' && result.reason !== 'blocked') break;
+    log('warn', `Puppeteer CAPTCHA on proxy ${i + 1}/3 — rotating to next proxy`, { asin });
+  }
+
+  // Final fallback: VPS direct IP (no proxy)
   await new Promise(r => setTimeout(r, 3000));
-  const directResult = await puppeteerScrape(url, { forceProxy: false });
+  const directResult = await puppeteerScrape(url, { proxy: null });
   if (!directResult.blocked && directResult.price)
     return { asin, url, ...directResult, method: 'puppeteer_direct' };
   if (directResult.inStock === false)

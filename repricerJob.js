@@ -92,10 +92,14 @@ class OnBuyUpdater {
       batch.push({ token, siteId, identifier, isSku, price, resolve, reject });
 
       if (batch.length >= this._maxBatch) {
+        // Batch is full — flush immediately without waiting for the timer
         if (this._timers.has(key)) { clearTimeout(this._timers.get(key)); this._timers.delete(key); }
         this._enqueueFlush(key);
       } else if (!this._timers.has(key)) {
-        const t = setTimeout(() => { this._timers.delete(key); this._enqueueFlush(key); }, 200);
+        // Wait up to 5 minutes for more items to arrive so the batch fills to ~1000.
+        // At ~4 items/sec (20 workers × 5 s/job) this window collects ~1200 items —
+        // enough for a full 1000-item flush with a small tail batch.
+        const t = setTimeout(() => { this._timers.delete(key); this._enqueueFlush(key); }, 5 * 60_000);
         this._timers.set(key, t);
       }
     });
