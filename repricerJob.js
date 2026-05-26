@@ -83,17 +83,29 @@ class OnBuyUpdater {
     this._rrTs       = [];        // timestamps of sent requests (sliding 1-hour window)
     this._mutex      = Promise.resolve(); // serialises all batch flushes
     this._creds      = new Map(); // token → { consumerKey, secretKey } for refresh on 401
+    this._tokenMap   = new Map(); // oldToken → newToken (redirect after 401 refresh)
   }
 
-  enqueue(token, siteId, identifier, isSku, price, { consumerKey, secretKey } = {}) {
+  // Follow the redirect chain so stale tokens from job.data are silently
+  // upgraded to the current token without hitting a 401 on every batch.
+  _resolveToken(token) {
+    let t = token;
+    const seen = new Set();
+    while (this._tokenMap.has(t) && !seen.has(t)) { seen.add(t); t = this._tokenMap.get(t); }
+    return t;
+  }
+
+  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey } = {}) {
     return new Promise((resolve, reject) => {
-      const key = `${token}||${siteId}||${isSku ? '1' : '0'}`;
+      const token = this._resolveToken(rawToken);
+      const key   = `${token}||${siteId}||${isSku ? '1' : '0'}`;
       if (!this._batches.has(key)) this._batches.set(key, []);
       const batch = this._batches.get(key);
       batch.push({ token, siteId, identifier, isSku, price, resolve, reject });
-      // Store credentials so we can refresh this token if OnBuy returns 401
-      if (consumerKey && secretKey && !this._creds.has(token)) {
-        this._creds.set(token, { consumerKey, secretKey });
+      // Store credentials under the resolved token (and under rawToken as fallback)
+      if (consumerKey && secretKey) {
+        if (!this._creds.has(token))    this._creds.set(token,    { consumerKey, secretKey });
+        if (!this._creds.has(rawToken)) this._creds.set(rawToken, { consumerKey, secretKey });
       }
 
       if (batch.length >= this._maxBatch) {
@@ -153,15 +165,30 @@ class OnBuyUpdater {
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
-        const creds = this._creds.get(token);
+        const creds = this._creds.get(token) || this._creds.get(items[0].token);
         if (creds) {
           wlog(`[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
           try {
             const newToken = await getTokenForAccount({ consumer_key: creds.consumerKey, secret_key: creds.secretKey });
             if (newToken) {
               this._creds.set(newToken, creds);
-              // Swap the token on any items still waiting in the queue for this key
-              (this._batches.get(key) || []).forEach(it => { it.token = newToken; });
+              // Record redirect so future enqueue(oldToken) calls use newToken directly
+              this._tokenMap.set(token, newToken);
+              // Move any items waiting in the old-key bucket into the new-key bucket
+              const newKey     = `${newToken}||${siteId}||${isSku ? '1' : '0'}`;
+              const waiting    = this._batches.get(key) || [];
+              if (!this._batches.has(newKey)) this._batches.set(newKey, []);
+              waiting.forEach(it => { it.token = newToken; this._batches.get(newKey).push(it); });
+              this._batches.set(key, []);
+              // Transfer timer from old key to new key if present
+              if (this._timers.has(key)) {
+                clearTimeout(this._timers.get(key));
+                this._timers.delete(key);
+                if (this._batches.get(newKey).length > 0 && !this._timers.has(newKey)) {
+                  const t = setTimeout(() => { this._timers.delete(newKey); this._enqueueFlush(newKey); }, 5 * 60_000);
+                  this._timers.set(newKey, t);
+                }
+              }
               res = await doRequest(newToken);
               raw = await res.text();
               wlog(`[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status}`);
@@ -280,9 +307,9 @@ export function setRepricerDefaults({ feeRate, defaultRoi } = {}) {
 function computeOnBuyPrice(amazonPrice, markupType, markupValue, minPrice = null) {
   let price;
   if (markupType === 'roi') {
-    // OnBuy fee is % of the final price (circular dependency solved algebraically):
-    // P = amazon × (1 + roi/100) + fee% × P  →  P = amazon × (1 + roi/100) / (1 - fee%)
-    price = (amazonPrice * (1 + markupValue / 100)) / (1 - _onbuyFeeRate);
+    // P = amazon × (1 + roi/100) × (1 + fee%)
+    // e.g. amazon=70, roi=20%, fee=15%: 70 × 1.20 × 1.15 = 96.60
+    price = amazonPrice * (1 + markupValue / 100) * (1 + _onbuyFeeRate);
   } else if (markupType === 'percent') {
     price = amazonPrice * (1 + markupValue / 100);
   } else if (markupType === 'fixed') {
@@ -331,20 +358,9 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     amazon_in_stock,
     primary_asin,
     product_name,
-    target_price,
   } = mapping;
 
-  // Calibrate ROI% from target_price on first run (markup_value stored as 0 when no ROI in sheet)
-  let markup_value = parseFloat(mapping.markup_value);
-  if (markup_type === 'roi' && markup_value === 0 && target_price && scraped.price) {
-    markup_value = ((parseFloat(target_price) * (1 - _onbuyFeeRate) / scraped.price) - 1) * 100;
-    markup_value = parseFloat(markup_value.toFixed(4));
-    await db.query(
-      `UPDATE product_mappings SET markup_value = $1 WHERE id = $2`,
-      [markup_value, id]
-    );
-    wlog(`[Worker] Calibrated ROI for #${id}: ${markup_value.toFixed(2)}% (target £${target_price})`);
-  }
+  const markup_value = parseFloat(mapping.markup_value) || _defaultRoi;
 
   const label = `${product_name || primary_asin} (#${id})`;
 
@@ -587,7 +603,7 @@ wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_C
 // ─────────────────────────────────────────────
 
 export function setSchedule({ intervalMinutes, startTime } = {}) {
-  if (intervalMinutes != null) _intervalMinutes = Math.max(1, parseInt(intervalMinutes) || 30);
+  if (intervalMinutes != null) _intervalMinutes = Math.max(0, parseInt(intervalMinutes) ?? 30);
   if (startTime       != null && /^\d{1,2}:\d{2}$/.test(startTime)) _startTime = startTime;
   _applySchedule();
 }
@@ -621,16 +637,30 @@ async function reloadSettings({ log = false } = {}) {
 
 function _applySchedule() {
   if (_activeCron) { _activeCron.stop(); _activeCron = null; }
-  const pattern = _cronPattern(_intervalMinutes);
+
+  let pattern;
+  if (_intervalMinutes === 0) {
+    // "No interval" — fire exactly once daily at the configured start time
+    const [h, m] = _startTime.split(':').map(Number);
+    pattern = `${m} ${h} * * *`;
+  } else {
+    pattern = _cronPattern(_intervalMinutes);
+  }
+
   _activeCron = cron.schedule(pattern, async () => {
-    if (!_isAfterStartTime()) {
+    // For interval mode, skip ticks that fall before the daily start time
+    if (_intervalMinutes > 0 && !_isAfterStartTime()) {
       wlog(`[Scheduler] Before start time ${_startTime} — skipping tick`);
       return;
     }
     await reloadSettings({ log: true });
     runRepricerJob();
   });
-  wlog(`[Scheduler] ✅ Pattern: "${pattern}"  Start time: ${_startTime}  Interval: ${_intervalMinutes}min`);
+
+  const desc = _intervalMinutes === 0
+    ? `once daily at ${_startTime}`
+    : `every ${_intervalMinutes}min from ${_startTime}`;
+  wlog(`[Scheduler] ✅ Pattern: "${pattern}"  Schedule: ${desc}`);
 }
 
 // Called by server.js after settings are loaded from DB, so proxy URL / fee rate

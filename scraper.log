@@ -4228,3 +4228,42 @@ We don't know when or if this item wi") {"url":"https://www.amazon.co.uk/dp/B0F5
 [2026-05-24T21:02:09.406Z] [DEBUG] Twister endpoint HTTP 503 (proxy(104.252.62.79)) {"asin":"B08CJ6J3BP"}
 [2026-05-24T21:02:09.471Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0DX8Q21H1"}
 [2026-05-24T21:02:09.614Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0BKLH6D8Y"}
+[2026-05-26T06:52:59.499Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-26T06:52:59.881Z] [INFO] Loaded 20 proxies from Webshare
+[2026-05-26T06:53:01.303Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.25.94)) {"asin":"B0F5K2H4NQ"}
+[2026-05-26T06:53:01.316Z] [DEBUG] Twister endpoint HTTP 503 (proxy(87.86.25.243)) {"asin":"B0CW9BC1XF"}
+[2026-05-26T06:53:02.735Z] [DEBUG] Twister endpoint HTTP 503 (proxy(212.212.19.174)) {"asin":"B0CW9BC1XF"}
+[2026-05-26T06:53:02.745Z] [DEBUG] Twister endpoint HTTP 503 (proxy(212.212.18.50)) {"asin":"B0F5K2H4NQ"}
+[2026-05-26T06:53:03.770Z] [DEBUG] Twister endpoint HTTP 503 (proxy(212.212.19.174)) {"asin":"B0F5K2H4NQ"}
+[2026-05-26T06:53:04.087Z] [DEBUG] Twister endpoint HTTP 503 (direct) {"asin":"B0F5K2H4NQ"}
+[2026-05-26T06:53:04.336Z] [DEBUG] Twister OK via proxy(212.212.18.4) {"asin":"B0CW9BC1XF"}
+[2026-05-26T06:53:04.346Z] [INFO] Twister JSON price: £12.73 {"asin":"B0CW9BC1XF"}
+[2026-05-26T06:53:07.041Z] [INFO] Cheerio: product OOS — "P.when("A", "load").execute("aod-assets-loaded", function(A){
+        function logAssetsNotLoaded() {
+            if (window.ueLogError) {
+                var customError = { message: 'Failed to load AOD assets for WDG: photo_display_on_website, Device: web' };
+                var additionalInfo = {
+                    logLevel : 'ERROR',
+                    attribution : 'aod_assets_not_loaded'
+                };
+                ueLogError (customError, additionalInfo);
+            }
+            if (window.ue && window.ue.count) {
+                window.ue.count("aod-assets-not-loaded", 1);
+            }
+        }
+
+        function verifyAssetsLoaded() {
+            var assetsLoadedPageState = A.state('aod:assetsLoaded');
+            var logAssetsNotLoadedState = A.state('aod:logAssetsNotLoaded');
+
+            if((assetsLoadedPageState == null || !assetsLoadedPageState.isAodAssetsLoaded)
+                && (logAssetsNotLoadedState == null || !logAssetsNotLoadedState.isAodAssetsNotLoadedLogged)) {
+                A.state('aod:logAssetsNotLoaded', {isAodAssetsNotLoadedLogged: true});
+                logAssetsNotLoaded();
+            }
+        }
+
+        setTimeout(verifyAssetsLoaded, 50000)
+    });
+                     Currently unavailable.                     We don't know when or if this item will be back in stock." {"url":"https://www.amazon.co.uk/dp/B0F5K2H4NQ?th=1&currency=GBP"}

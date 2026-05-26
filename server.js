@@ -20,6 +20,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import XLSX from 'xlsx';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,22 +49,167 @@ app.use(express.json({ limit: '50mb' }));
 const _globalSettings = { feeRate: 0.15, defaultRoi: 20 };
 
 // ─────────────────────────────────────────────
+// AUTH MIDDLEWARE
+// ─────────────────────────────────────────────
+
+const JWT_SECRET = process.env.JWT_SECRET || 'repricer-jwt-secret-change-in-production';
+const JWT_EXPIRY  = '7d';
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Login required' });
+  try {
+    const payload        = jwt.verify(header.slice(7), JWT_SECRET);
+    req.user             = payload;
+    req.effectiveUserId  = payload.impersonatedUserId ?? payload.userId;
+    req.isImpersonating  = payload.impersonatedUserId != null;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Session expired — please log in again' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'super_admin') return res.status(403).json({ error: 'Admin access required' });
+  next();
+}
+
+// ─────────────────────────────────────────────
+// AUTH ROUTES (public — no requireAuth)
+// ─────────────────────────────────────────────
+
+// POST /api/admin/login — super admin only entry point (separate URL as requested)
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM users WHERE username = $1 AND role = 'super_admin' AND is_active = true`, [username]
+    );
+    if (!rows[0] || !await bcrypt.compare(password, rows[0].password_hash))
+      return res.status(401).json({ error: 'Invalid credentials' });
+    const u = rows[0];
+    const token = jwt.sign({ userId: u.id, username: u.username, role: u.role }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/auth/login — all users
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM users WHERE username = $1 AND is_active = true`, [username]
+    );
+    if (!rows[0] || !await bcrypt.compare(password, rows[0].password_hash))
+      return res.status(401).json({ error: 'Invalid credentials' });
+    const u = rows[0];
+    const token = jwt.sign({ userId: u.id, username: u.username, role: u.role }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/auth/me — validate token + return current user info
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({
+    userId: req.user.userId, username: req.user.username, role: req.user.role,
+    impersonatedUserId:   req.user.impersonatedUserId   ?? null,
+    impersonatedUsername: req.user.impersonatedUsername ?? null,
+  });
+});
+
+// ─────────────────────────────────────────────
+// ADMIN — USER MANAGEMENT
+// ─────────────────────────────────────────────
+
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at,
+             (SELECT COUNT(*) FROM product_mappings WHERE user_id = u.id)::int AS mapping_count,
+             (SELECT COUNT(*) FROM onbuy_accounts   WHERE user_id = u.id)::int AS account_count
+      FROM users u ORDER BY u.created_at DESC
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  const { username, email, password, role = 'user' } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const { rows } = await db.query(
+      `INSERT INTO users (username, email, password_hash, role)
+       VALUES ($1, $2, $3, $4) RETURNING id, username, email, role, is_active, created_at`,
+      [username, email || null, hash, role === 'super_admin' ? 'super_admin' : 'user']
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Username already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { username, email, password, is_active, role } = req.body;
+  try {
+    const hash = password ? await bcrypt.hash(password, 10) : null;
+    const { rows } = await db.query(
+      `UPDATE users SET
+         username      = COALESCE($1, username),
+         email         = COALESCE($2, email),
+         password_hash = COALESCE($3, password_hash),
+         is_active     = COALESCE($4, is_active),
+         role          = COALESCE($5, role),
+         updated_at    = NOW()
+       WHERE id = $6 RETURNING id, username, email, role, is_active`,
+      [username || null, email || null, hash, is_active ?? null, role || null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (parseInt(req.params.id) === req.user.userId)
+    return res.status(400).json({ error: 'Cannot delete your own account' });
+  try {
+    await db.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/users/:id/impersonate', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, username, role, is_active FROM users WHERE id = $1`, [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    if (!rows[0].is_active) return res.status(400).json({ error: 'Cannot impersonate inactive user' });
+    const t = rows[0];
+    const token = jwt.sign({
+      userId: req.user.userId, username: req.user.username, role: req.user.role,
+      impersonatedUserId: t.id, impersonatedUsername: t.username,
+    }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    res.json({ token, impersonatedUser: { id: t.id, username: t.username } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────
 // DASHBOARD STATS
 // ─────────────────────────────────────────────
 
 // GET /api/stats — overview numbers for dashboard cards
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
   try {
     const [mappings, recentLogs, priceChanges] = await Promise.all([
-      db.query('SELECT COUNT(*) FROM product_mappings WHERE is_active = true'),
-      db.query(`SELECT COUNT(*) FROM sync_logs WHERE created_at > NOW() - INTERVAL '24 hours'`),
-      db.query(`
-        SELECT COUNT(*) FROM sync_logs
-        WHERE status = 'success'
-        AND created_at > NOW() - INTERVAL '24 hours'
-      `),
+      db.query('SELECT COUNT(*) FROM product_mappings WHERE is_active = true AND user_id = $1', [uid]),
+      db.query(`SELECT COUNT(*) FROM sync_logs sl JOIN product_mappings pm ON pm.id = sl.product_mapping_id WHERE pm.user_id = $1 AND sl.created_at > NOW() - INTERVAL '24 hours'`, [uid]),
+      db.query(`SELECT COUNT(*) FROM sync_logs sl JOIN product_mappings pm ON pm.id = sl.product_mapping_id WHERE pm.user_id = $1 AND sl.status = 'success' AND sl.created_at > NOW() - INTERVAL '24 hours'`, [uid]),
     ]);
-
     res.json({
       activeListings: parseInt(mappings.rows[0].count),
       syncedLast24h: parseInt(recentLogs.rows[0].count),
@@ -79,16 +226,22 @@ app.get('/api/stats', async (req, res) => {
 
 // GET /api/mappings — paginated product mappings
 // Query params: page (default 1), limit (default 100, max 1000), search
-app.get('/api/mappings', async (req, res) => {
+app.get('/api/mappings', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
   try {
     const limit  = Math.min(1000, Math.max(1, parseInt(req.query.limit)  || 100));
     const page   = Math.max(1,                parseInt(req.query.page)   || 1);
     const search = (req.query.search || '').trim();
     const offset = (page - 1) * limit;
 
-    const where  = search ? `WHERE (pm.product_name ILIKE $3 OR pm.primary_asin ILIKE $3
-                               OR pm.onbuy_sku ILIKE $3 OR pm.onbuy_listing_id ILIKE $3)` : '';
-    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+    const listWhere  = search
+      ? `WHERE pm.user_id = $3 AND (pm.product_name ILIKE $4 OR pm.primary_asin ILIKE $4 OR pm.onbuy_sku ILIKE $4 OR pm.onbuy_listing_id ILIKE $4)`
+      : `WHERE pm.user_id = $3`;
+    const countWhere = search
+      ? `WHERE user_id = $1 AND (product_name ILIKE $2 OR primary_asin ILIKE $2 OR onbuy_sku ILIKE $2 OR onbuy_listing_id ILIKE $2)`
+      : `WHERE user_id = $1`;
+    const listParams  = search ? [limit, offset, uid, `%${search}%`] : [limit, offset, uid];
+    const countParams = search ? [uid, `%${search}%`] : [uid];
 
     const [{ rows }, countResult] = await Promise.all([
       db.query(`
@@ -97,14 +250,11 @@ app.get('/api/mappings', async (req, res) => {
           (SELECT COUNT(*) FROM supplier_asins sa WHERE sa.product_mapping_id = pm.id) AS supplier_count,
           (SELECT status FROM sync_logs sl WHERE sl.product_mapping_id = pm.id ORDER BY created_at DESC LIMIT 1) AS last_sync_status
         FROM product_mappings pm
-        ${where}
+        ${listWhere}
         ORDER BY pm.created_at DESC
         LIMIT $1 OFFSET $2
-      `, params),
-      db.query(
-        `SELECT COUNT(*) FROM product_mappings pm ${where}`,
-        search ? [`%${search}%`] : []
-      ),
+      `, listParams),
+      db.query(`SELECT COUNT(*) FROM product_mappings ${countWhere}`, countParams),
     ]);
 
     res.json({ rows, total: parseInt(countResult.rows[0].count), page, limit });
@@ -114,11 +264,11 @@ app.get('/api/mappings', async (req, res) => {
 });
 
 // GET /api/mappings/:id — single mapping detail
-app.get('/api/mappings/:id', async (req, res) => {
+app.get('/api/mappings/:id', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      'SELECT * FROM product_mappings WHERE id = $1',
-      [req.params.id]
+      'SELECT * FROM product_mappings WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.effectiveUserId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
@@ -128,7 +278,7 @@ app.get('/api/mappings/:id', async (req, res) => {
 });
 
 // POST /api/mappings — create new mapping
-app.post('/api/mappings', async (req, res) => {
+app.post('/api/mappings', requireAuth, async (req, res) => {
   const {
     product_name, onbuy_listing_id, onbuy_sku,
     primary_asin, markup_type, markup_value, min_price, notes
@@ -137,10 +287,10 @@ app.post('/api/mappings', async (req, res) => {
   try {
     const { rows } = await db.query(
       `INSERT INTO product_mappings
-        (product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        (product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, notes, user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, notes]
+      [product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, notes, req.effectiveUserId]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -149,7 +299,7 @@ app.post('/api/mappings', async (req, res) => {
 });
 
 // PUT /api/mappings/:id — update mapping
-app.put('/api/mappings/:id', async (req, res) => {
+app.put('/api/mappings/:id', requireAuth, async (req, res) => {
   const {
     product_name, onbuy_listing_id, onbuy_sku,
     primary_asin, markup_type, markup_value, min_price, is_active, notes
@@ -160,9 +310,10 @@ app.put('/api/mappings/:id', async (req, res) => {
       `UPDATE product_mappings
        SET product_name=$1, onbuy_listing_id=$2, onbuy_sku=$3, primary_asin=$4,
            markup_type=$5, markup_value=$6, min_price=$7, is_active=$8, notes=$9, updated_at=NOW()
-       WHERE id=$10 RETURNING *`,
-      [product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, is_active, notes, req.params.id]
+       WHERE id=$10 AND user_id=$11 RETURNING *`,
+      [product_name, onbuy_listing_id, onbuy_sku, primary_asin, markup_type, markup_value, min_price, is_active, notes, req.params.id, req.effectiveUserId]
     );
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -170,19 +321,19 @@ app.put('/api/mappings/:id', async (req, res) => {
 });
 
 // DELETE /api/mappings/:id
-app.delete('/api/mappings/:id', async (req, res) => {
+app.delete('/api/mappings/:id', requireAuth, async (req, res) => {
   try {
-    await db.query('DELETE FROM product_mappings WHERE id = $1', [req.params.id]);
+    await db.query('DELETE FROM product_mappings WHERE id = $1 AND user_id = $2', [req.params.id, req.effectiveUserId]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// DELETE /api/mappings — truncate all mappings (cascades to price_history, sync_logs)
-app.delete('/api/mappings', async (req, res) => {
+// DELETE /api/mappings — clear all of this user's mappings
+app.delete('/api/mappings', requireAuth, async (req, res) => {
   try {
-    await db.query('TRUNCATE product_mappings RESTART IDENTITY CASCADE');
+    await db.query('DELETE FROM product_mappings WHERE user_id = $1', [req.effectiveUserId]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -194,10 +345,11 @@ app.delete('/api/mappings', async (req, res) => {
 // ─────────────────────────────────────────────
 
 // POST /api/sync — trigger full sync manually
-app.post('/api/sync', async (req, res) => {
+// Super admin (not impersonating) syncs all users; everyone else is scoped to their own account.
+app.post('/api/sync', requireAuth, async (req, res) => {
   try {
-    // Run async — don't wait for it to finish
-    runRepricerJob().catch(console.error);
+    const globalSync = req.user.role === 'super_admin' && !req.isImpersonating;
+    runRepricerJob({ userId: globalSync ? null : req.effectiveUserId }).catch(console.error);
     res.json({ message: 'Sync job started successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -205,7 +357,7 @@ app.post('/api/sync', async (req, res) => {
 });
 
 // GET /api/queue-status — live job counts across both queues
-app.get('/api/queue-status', async (req, res) => {
+app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
     const [fast, slow] = await Promise.all([
       fastQueue.getJobCounts('waiting', 'active', 'delayed'),
@@ -220,14 +372,14 @@ app.get('/api/queue-status', async (req, res) => {
 });
 
 // GET /api/scraper-logs — last 200 scraper log entries (in-memory)
-app.get('/api/scraper-logs', (req, res) => {
+app.get('/api/scraper-logs', requireAuth, (req, res) => {
   res.json(scraperLogs);
 });
 
 // GET /api/pm2-logs?process=worker|api|all — SSE stream of live log output
 // Dev:  tails scraper.log via Node.js fsWatch (Windows-compatible, no PM2 needed)
 // Prod: tails PM2 log files via `tail -f`
-app.get('/api/pm2-logs', (req, res) => {
+app.get('/api/pm2-logs', requireAuth, (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
@@ -343,7 +495,7 @@ app.get('/api/pm2-logs', (req, res) => {
 });
 
 // GET /api/scraper-logs/file — download the full scraper.log file
-app.get('/api/scraper-logs/file', (req, res) => {
+app.get('/api/scraper-logs/file', requireAuth, (req, res) => {
   const logPath = join(__dirname, 'scraper.log');
   if (!existsSync(logPath)) return res.status(404).json({ error: 'No log file yet' });
   res.setHeader('Content-Type', 'text/plain');
@@ -352,7 +504,7 @@ app.get('/api/scraper-logs/file', (req, res) => {
 });
 
 // POST /api/price-check — fetch real-time price for any ASIN
-app.post('/api/price-check', async (req, res) => {
+app.post('/api/price-check', requireAuth, async (req, res) => {
   const { asin } = req.body;
   if (!asin || typeof asin !== 'string' || !/^[A-Z0-9]{10}$/i.test(asin.trim())) {
     return res.status(400).json({ error: 'A valid 10-character ASIN is required' });
@@ -366,11 +518,11 @@ app.post('/api/price-check', async (req, res) => {
 });
 
 // POST /api/sync/:id — sync a single product manually
-app.post('/api/sync/:id', async (req, res) => {
+app.post('/api/sync/:id', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      'SELECT * FROM product_mappings WHERE id = $1',
-      [req.params.id]
+      'SELECT * FROM product_mappings WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.effectiveUserId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Mapping not found' });
 
@@ -386,11 +538,11 @@ app.post('/api/sync/:id', async (req, res) => {
 // ─────────────────────────────────────────────
 
 // GET /api/compare/:mappingId — get all supplier ASINs + scrape prices
-app.get('/api/compare/:mappingId', async (req, res) => {
+app.get('/api/compare/:mappingId', requireAuth, async (req, res) => {
   try {
     const { rows: suppliers } = await db.query(
-      'SELECT * FROM supplier_asins WHERE product_mapping_id = $1',
-      [req.params.mappingId]
+      'SELECT sa.* FROM supplier_asins sa JOIN product_mappings pm ON pm.id = sa.product_mapping_id WHERE sa.product_mapping_id = $1 AND pm.user_id = $2',
+      [req.params.mappingId, req.effectiveUserId]
     );
 
     // Return cached data immediately
@@ -401,11 +553,11 @@ app.get('/api/compare/:mappingId', async (req, res) => {
 });
 
 // POST /api/compare/:mappingId/refresh — live scrape all sellers for a product
-app.post('/api/compare/:mappingId/refresh', async (req, res) => {
+app.post('/api/compare/:mappingId/refresh', requireAuth, async (req, res) => {
   try {
     const { rows: mapping } = await db.query(
-      'SELECT * FROM product_mappings WHERE id = $1',
-      [req.params.mappingId]
+      'SELECT * FROM product_mappings WHERE id = $1 AND user_id = $2',
+      [req.params.mappingId, req.effectiveUserId]
     );
 
     if (mapping.length === 0) return res.status(404).json({ error: 'Mapping not found' });
@@ -431,7 +583,7 @@ app.post('/api/compare/:mappingId/refresh', async (req, res) => {
 });
 
 // POST /api/suppliers — add a competitor ASIN
-app.post('/api/suppliers', async (req, res) => {
+app.post('/api/suppliers', requireAuth, async (req, res) => {
   const { product_mapping_id, asin, supplier_name, notes } = req.body;
   try {
     const { rows } = await db.query(
@@ -450,15 +602,16 @@ app.post('/api/suppliers', async (req, res) => {
 // ─────────────────────────────────────────────
 
 // GET /api/history/:mappingId — price history for charts
-app.get('/api/history/:mappingId', async (req, res) => {
+app.get('/api/history/:mappingId', requireAuth, async (req, res) => {
   const days = parseInt(req.query.days) || 30;
   try {
     const { rows } = await db.query(
-      `SELECT * FROM price_history
-       WHERE product_mapping_id = $1
-       AND recorded_at > NOW() - INTERVAL '${days} days'
-       ORDER BY recorded_at ASC`,
-      [req.params.mappingId]
+      `SELECT ph.* FROM price_history ph
+       JOIN product_mappings pm ON pm.id = ph.product_mapping_id
+       WHERE ph.product_mapping_id = $1 AND pm.user_id = $2
+       AND ph.recorded_at > NOW() - INTERVAL '${days} days'
+       ORDER BY ph.recorded_at ASC`,
+      [req.params.mappingId, req.effectiveUserId]
     );
     res.json(rows);
   } catch (err) {
@@ -472,29 +625,34 @@ app.get('/api/history/:mappingId', async (req, res) => {
 
 // GET /api/logs — paginated sync logs
 // Query params: page (default 1), limit (default 50, max 500), status (success|failed|skipped)
-app.get('/api/logs', async (req, res) => {
+app.get('/api/logs', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
   try {
     const limit  = Math.min(500, Math.max(1, parseInt(req.query.limit) || 50));
     const page   = Math.max(1, parseInt(req.query.page) || 1);
     const status = req.query.status || '';
     const offset = (page - 1) * limit;
 
-    const where  = status ? `WHERE sl.status = $3` : '';
-    const params = status ? [limit, offset, status] : [limit, offset];
+    const where  = status
+      ? `WHERE pm.user_id = $3 AND sl.status = $4`
+      : `WHERE pm.user_id = $3`;
+    const listParams  = status ? [limit, offset, uid, status] : [limit, offset, uid];
+    const countParams = status ? [uid, status] : [uid];
+    const countWhere  = status ? `WHERE pm.user_id = $1 AND sl.status = $2` : `WHERE pm.user_id = $1`;
 
     const [{ rows }, countResult] = await Promise.all([
       db.query(
         `SELECT sl.*, pm.product_name, pm.primary_asin
          FROM sync_logs sl
-         LEFT JOIN product_mappings pm ON pm.id = sl.product_mapping_id
+         JOIN product_mappings pm ON pm.id = sl.product_mapping_id
          ${where}
          ORDER BY sl.created_at DESC
          LIMIT $1 OFFSET $2`,
-        params
+        listParams
       ),
       db.query(
-        `SELECT COUNT(*) FROM sync_logs sl ${where}`,
-        status ? [status] : []
+        `SELECT COUNT(*) FROM sync_logs sl JOIN product_mappings pm ON pm.id = sl.product_mapping_id ${countWhere}`,
+        countParams
       ),
     ]);
 
@@ -518,34 +676,35 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 // ─────────────────────────────────────────────
 
 // GET /api/accounts — list all accounts (secrets redacted)
-app.get('/api/accounts', async (req, res) => {
+app.get('/api/accounts', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, account_name, site_id, is_active, last_tested_at, last_test_ok, created_at,
               LEFT(consumer_key, 6) || '••••••' AS consumer_key_hint
-       FROM onbuy_accounts ORDER BY created_at DESC`
+       FROM onbuy_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
+      [req.effectiveUserId]
     );
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // POST /api/accounts — create account
-app.post('/api/accounts', async (req, res) => {
+app.post('/api/accounts', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id = '2000' } = req.body;
   if (!account_name || !consumer_key || !secret_key)
     return res.status(400).json({ error: 'account_name, consumer_key and secret_key are required' });
   try {
     const { rows } = await db.query(
-      `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id)
-       VALUES ($1, $2, $3, $4) RETURNING id, account_name, site_id, is_active, created_at`,
-      [account_name, consumer_key, secret_key, site_id]
+      `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id, account_name, site_id, is_active, created_at`,
+      [account_name, consumer_key, secret_key, site_id, req.effectiveUserId]
     );
     res.status(201).json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // PUT /api/accounts/:id — update account
-app.put('/api/accounts/:id', async (req, res) => {
+app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active } = req.body;
   try {
     const { rows } = await db.query(
@@ -556,8 +715,8 @@ app.put('/api/accounts/:id', async (req, res) => {
          site_id      = COALESCE($4, site_id),
          is_active    = COALESCE($5, is_active),
          updated_at   = NOW()
-       WHERE id = $6 RETURNING id, account_name, site_id, is_active`,
-      [account_name, consumer_key, secret_key, site_id, is_active, req.params.id]
+       WHERE id = $6 AND user_id = $7 RETURNING id, account_name, site_id, is_active`,
+      [account_name, consumer_key, secret_key, site_id, is_active, req.params.id, req.effectiveUserId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
@@ -565,17 +724,17 @@ app.put('/api/accounts/:id', async (req, res) => {
 });
 
 // DELETE /api/accounts/:id
-app.delete('/api/accounts/:id', async (req, res) => {
+app.delete('/api/accounts/:id', requireAuth, async (req, res) => {
   try {
-    await db.query('DELETE FROM onbuy_accounts WHERE id = $1', [req.params.id]);
+    await db.query('DELETE FROM onbuy_accounts WHERE id = $1 AND user_id = $2', [req.params.id, req.effectiveUserId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // POST /api/accounts/:id/test — test OnBuy credentials
-app.post('/api/accounts/:id/test', async (req, res) => {
+app.post('/api/accounts/:id/test', requireAuth, async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT * FROM onbuy_accounts WHERE id = $1', [req.params.id]);
+    const { rows } = await db.query('SELECT * FROM onbuy_accounts WHERE id = $1 AND user_id = $2', [req.params.id, req.effectiveUserId]);
     if (rows.length === 0) return res.status(404).json({ error: 'Account not found' });
 
     const { consumer_key, secret_key } = rows[0];
@@ -818,7 +977,7 @@ async function createOnBuyListing(opc, price, sku, token, siteId) {
 }
 
 // GET /api/import/template — download the import template
-app.get('/api/import/template', (req, res) => {
+app.get('/api/import/template', requireAuth, (req, res) => {
   // Columns: No# | Product Name | Sourcing Link | Onbuy Link | Source Price | Selling Price |
   //          Onbuy Fee | Total Cost | Net Profit | ROI % | Seller SKU | OPC
   //
@@ -848,7 +1007,7 @@ app.get('/api/import/template', (req, res) => {
 
 // POST /api/import/preview — parse uploaded Excel, return rows for user review
 // Auto-detects 1-row header (new template) or 2-row header (old template with section headings)
-app.post('/api/import/preview', upload.single('file'), (req, res) => {
+app.post('/api/import/preview', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -923,13 +1082,12 @@ app.post('/api/import/preview', upload.single('file'), (req, res) => {
 
       const sellingPrice = parseFloat(mapped.unit_price) || null;
 
-      // ROI%: use sheet value if present; when blank but Selling Price exists, set to 0 —
-      // repricer will calibrate it on the first run using target_price and Amazon price
+      // ROI%: use sheet value if present; otherwise always use settings default ROI.
       const sheetRoi    = parseFloat(mapped.markup_value);
       const hasRoiCol   = !isNaN(sheetRoi) && String(mapped.markup_value || '').trim() !== '';
       const markupType  = (hasRoiCol || sellingPrice) ? 'roi'
                         : String(mapped.markup_type || 'percent').toLowerCase().trim();
-      const markupValue = hasRoiCol ? sheetRoi : (sellingPrice ? 0 : _globalSettings.defaultRoi);
+      const markupValue = hasRoiCol ? sheetRoi : _globalSettings.defaultRoi;
 
       // OnBuy Fee: use sheet value if present, otherwise auto-calculate as fee% of selling price
       const sheetFee    = parseFloat(mapped.onbuy_fee);
@@ -978,7 +1136,7 @@ app.post('/api/import/preview', upload.single('file'), (req, res) => {
 
 // POST /api/import/confirm — bulk upsert product_mappings from validated rows.
 // Uses PostgreSQL unnest for batch operations — handles 40k+ rows without timeout.
-app.post('/api/import/confirm', async (req, res) => {
+app.post('/api/import/confirm', requireAuth, async (req, res) => {
   const { rows, onbuy_account_id, filename } = req.body;
   if (!Array.isArray(rows) || rows.length === 0)
     return res.status(400).json({ error: 'No rows provided' });
@@ -1087,7 +1245,7 @@ app.post('/api/import/confirm', async (req, res) => {
       INSERT INTO product_mappings
         (product_name, onbuy_listing_id, onbuy_opc, onbuy_sku, primary_asin,
          markup_type, markup_value, onbuy_fee, target_price, min_price, notes,
-         onbuy_account_id, is_active)
+         onbuy_account_id, user_id, is_active)
       SELECT
         NULLIF(v.product_name,''),
         NULLIF(v.listing_id,''),
@@ -1101,12 +1259,13 @@ app.post('/api/import/confirm', async (req, res) => {
         NULLIF(v.min_price,'')::decimal,
         NULLIF(v.notes,''),
         NULLIF(v.account_id,'')::int,
+        v.user_id::int,
         true
       FROM unnest(
         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[]
+        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[]
       ) AS v(product_name, listing_id, opc, sku, asin,
-             markup_type, markup_value, onbuy_fee, target_price, min_price, notes, account_id)`,
+             markup_type, markup_value, onbuy_fee, target_price, min_price, notes, account_id, user_id)`,
     [
       c.map(r => r.product_name     || ''),
       c.map(r => r.onbuy_listing_id || ''),
@@ -1120,16 +1279,17 @@ app.post('/api/import/confirm', async (req, res) => {
       c.map(r => r.min_price    != null ? String(r.min_price)    : ''),
       c.map(r => r.notes        || ''),
       c.map(() => onbuy_account_id != null ? String(onbuy_account_id) : ''),
+      c.map(() => String(req.effectiveUserId)),
     ]);
     results.created += c.length;
   }
 
   // Audit log (best-effort)
   db.query(
-    `INSERT INTO import_logs (filename, total_rows, imported, skipped, row_errors)
-     VALUES ($1, $2, $3, $4, $5)`,
+    `INSERT INTO import_logs (filename, total_rows, imported, skipped, row_errors, user_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [filename || 'unknown', toImport.length, results.created + results.updated,
-     results.skipped, JSON.stringify(results.errors)]
+     results.skipped, JSON.stringify(results.errors), req.effectiveUserId]
   ).catch(() => {});
 
   res.json(results);
@@ -1171,6 +1331,27 @@ async function runMigrations() {
        row_errors   JSONB DEFAULT '[]'::jsonb,
        created_at   TIMESTAMP DEFAULT NOW()
      )`,
+    // Fix listings imported with markup_value=0 — use default_roi_percent from settings (or 20 as fallback)
+    `UPDATE product_mappings
+     SET markup_value = COALESCE(
+       (SELECT value::decimal FROM settings WHERE key = 'default_roi_percent'),
+       20
+     )
+     WHERE markup_type = 'roi' AND markup_value = 0`,
+    // ── Auth / multi-user ──────────────────────────────────────
+    `CREATE TABLE IF NOT EXISTS users (
+       id            SERIAL PRIMARY KEY,
+       username      TEXT NOT NULL UNIQUE,
+       email         TEXT,
+       password_hash TEXT NOT NULL,
+       role          TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'super_admin')),
+       is_active     BOOLEAN NOT NULL DEFAULT true,
+       created_at    TIMESTAMP DEFAULT NOW(),
+       updated_at    TIMESTAMP DEFAULT NOW()
+     )`,
+    `ALTER TABLE onbuy_accounts   ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE`,
+    `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE`,
+    `ALTER TABLE import_logs      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE SET NULL`,
   ];
   for (const sql of steps) {
     try {
@@ -1182,6 +1363,32 @@ async function runMigrations() {
       }
     }
   }
+
+  // Create super admin + assign orphaned rows (runs after DDL loop so users table exists)
+  try {
+    const { rows: admins } = await db.query(
+      `SELECT id FROM users WHERE role = 'super_admin' LIMIT 1`
+    );
+    let adminId;
+    if (admins.length === 0) {
+      const hash = await bcrypt.hash('Admin@Repricer#2026', 10);
+      const { rows: [admin] } = await db.query(
+        `INSERT INTO users (username, email, password_hash, role)
+         VALUES ('superadmin', 'admin@repricer.local', $1, 'super_admin')
+         RETURNING id`,
+        [hash]
+      );
+      adminId = admin.id;
+      console.log('[Migration] ✅ Super admin created — username: superadmin  password: Admin@Repricer#2026');
+    } else {
+      adminId = admins[0].id;
+    }
+    await db.query(`UPDATE onbuy_accounts   SET user_id = $1 WHERE user_id IS NULL`, [adminId]);
+    await db.query(`UPDATE product_mappings SET user_id = $1 WHERE user_id IS NULL`, [adminId]);
+  } catch (e) {
+    console.warn('[Migration] Super admin setup:', e.message);
+  }
+
   console.log('[Migration] ✅ Schema up to date');
 }
 
@@ -1202,7 +1409,7 @@ async function loadSettingsFromDb() {
   }
 }
 
-app.get('/api/settings', async (req, res) => {
+app.get('/api/settings', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query('SELECT key, value FROM settings');
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
@@ -1210,7 +1417,7 @@ app.get('/api/settings', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/settings', async (req, res) => {
+app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'job_interval_minutes', 'job_start_time'];
   try {
     for (const key of allowed) {
@@ -1243,12 +1450,13 @@ app.put('/api/settings', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/import/logs — import history
-app.get('/api/import/logs', async (req, res) => {
+// GET /api/import/logs — import history (scoped to current user; super admin sees all)
+app.get('/api/import/logs', requireAuth, async (req, res) => {
   try {
-    const { rows } = await db.query(
-      `SELECT * FROM import_logs ORDER BY created_at DESC LIMIT 50`
-    );
+    const isSuperAdmin = req.user.role === 'super_admin' && !req.isImpersonating;
+    const { rows } = isSuperAdmin
+      ? await db.query(`SELECT * FROM import_logs ORDER BY created_at DESC LIMIT 50`)
+      : await db.query(`SELECT * FROM import_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`, [req.effectiveUserId]);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

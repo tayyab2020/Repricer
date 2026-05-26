@@ -43,12 +43,15 @@ export async function getTokenForAccount(account) {
   }
 }
 
-export async function runRepricerJob() {
+export async function runRepricerJob({ userId = null } = {}) {
   console.log('\n' + '═'.repeat(60));
-  console.log(`[Job] 🚀 Producer started at ${new Date().toISOString()}`);
+  console.log(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}`);
   console.log('═'.repeat(60));
 
   try {
+    const userClause  = userId ? `AND pm.user_id = $1` : '';
+    const queryParams = userId ? [userId] : [];
+
     const { rows: mappings } = await db.query(`
       SELECT pm.*,
              oa.consumer_key  AS acct_consumer_key,
@@ -58,9 +61,9 @@ export async function runRepricerJob() {
       FROM product_mappings pm
       LEFT JOIN onbuy_accounts oa
              ON pm.onbuy_account_id = oa.id AND oa.is_active = true
-      WHERE pm.is_active = true
+      WHERE pm.is_active = true ${userClause}
       ORDER BY pm.last_synced_at ASC NULLS FIRST
-    `);
+    `, queryParams);
 
     if (!mappings.length) {
       console.log('[Job] No active mappings. Exiting.');
@@ -121,11 +124,14 @@ export async function runRepricerJob() {
       });
     }
 
-    // Drain waiting/delayed jobs from both queues before re-adding.
-    // BullMQ deduplicates by jobId — any job already in waiting/delayed state
-    // is silently skipped by addBulk. Draining first ensures all 43k get queued.
-    // Active jobs are unaffected by drain() and will finish normally.
-    await Promise.all([fastQueue.drain(), slowQueue.drain()]);
+    // Per-user sync: remove only this user's jobs so other users' jobs keep running.
+    // Full sync (userId=null): drain all waiting/delayed jobs from both queues.
+    // Active jobs are unaffected by remove/drain and will finish normally.
+    if (userId) {
+      await Promise.all(jobs.map(j => fastQueue.remove(j.opts.jobId).catch(() => {})));
+    } else {
+      await Promise.all([fastQueue.drain(), slowQueue.drain()]);
+    }
     console.log('[Job] Queues drained — adding fresh jobs');
 
     const CHUNK = 500;

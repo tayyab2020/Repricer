@@ -6,8 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev":   "node --watch server.js",
-    "job":   "node repricerJob.js",
+    "dev": "node --watch server.js",
+    "job": "node repricerJob.js",
     "dev:job": "node --watch repricerJob.js",
     "db:setup": "psql $DATABASE_URL -f database/schema.sql"
   },
@@ -15,6 +15,7 @@
     "undici": "5"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "bullmq": "^5.76.10",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
@@ -22,6 +23,7 @@
     "express": "^4.19.2",
     "https-proxy-agent": "^7.0.6",
     "ioredis": "^5.10.1",
+    "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",

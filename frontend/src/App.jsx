@@ -36,10 +36,20 @@ const ago  = ts => {
 
 // ── Fetch helper ─────────────────────────────
 async function api(path, opts = {}) {
+  const token = localStorage.getItem("repricer_token");
   const r = await fetch(API + path, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     ...opts,
   });
+  if (r.status === 401) {
+    localStorage.removeItem("repricer_token");
+    localStorage.removeItem("repricer_user");
+    window.location.reload();
+    return null;
+  }
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -324,7 +334,7 @@ function DashboardPage({ stats }) {
 // ── Mappings Page ─────────────────────────────
 const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
 
-function MappingsPage({ onSelectMapping }) {
+function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   const [mappings, setMappings] = useState([]);
   const [total, setTotal]       = useState(0);
   const [loading, setLoading]   = useState(false);
@@ -427,7 +437,8 @@ function MappingsPage({ onSelectMapping }) {
   const markupLabel = (m) => {
     const sign = m.markup_type === "fixed" ? "£" : "%";
     const tag  = m.markup_type === "roi" ? " ROI" : "";
-    return `+${parseFloat(m.markup_value).toFixed(2)}${sign}${tag}`;
+    const val  = parseFloat(m.markup_value) || (m.markup_type === "roi" ? defaultRoi : 0);
+    return `+${val.toFixed(2)}${sign}${tag}`;
   };
 
   const pageStart = (pageNum - 1) * pageSize;
@@ -636,7 +647,7 @@ function ComparePage() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    api("/mappings").then(setMappings).catch(console.error);
+    api("/mappings").then(d => setMappings(d?.rows ?? [])).catch(console.error);
   }, []);
 
   const loadSellers = async (mappingId) => {
@@ -977,6 +988,332 @@ function CurrentPricesPage() {
   );
 }
 
+// ── Login Page ────────────────────────────────
+function LoginPage({ onLogin }) {
+  const [username,  setUsername]  = useState("");
+  const [password,  setPassword]  = useState("");
+  const [isAdmin,   setIsAdmin]   = useState(false);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!username || !password) return;
+    setLoading(true); setError("");
+    try {
+      const endpoint = isAdmin ? "/admin/login" : "/auth/login";
+      const data = await fetch(API + endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      }).then(async r => {
+        if (!r.ok) throw new Error((await r.json()).error || "Login failed");
+        return r.json();
+      });
+      onLogin(data.token, data.user);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: C.bg, display: "flex",
+      alignItems: "center", justifyContent: "center", padding: 24,
+      fontFamily: "'DM Sans', system-ui, sans-serif",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        input { outline: none; }
+        input:focus { border-color: ${C.accent} !important; }
+      `}</style>
+      <div style={{
+        background: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: 16, padding: "40px 36px", width: "100%", maxWidth: 400,
+      }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <div style={{
+            width: 52, height: 52, borderRadius: 12, margin: "0 auto 16px",
+            background: `linear-gradient(135deg, ${C.accent}, #0090ff)`,
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22,
+          }}>⚡</div>
+          <h1 style={{ color: C.text, fontSize: 22, fontWeight: 700 }}>OnBuy Re-Pricer</h1>
+          <p style={{ color: C.muted, fontSize: 13, marginTop: 6 }}>
+            {isAdmin ? "Admin login" : "Sign in to your account"}
+          </p>
+        </div>
+
+        <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div>
+            <label style={{ display: "block", color: C.textDim, fontSize: 12,
+              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+              Username
+            </label>
+            <input
+              value={username} onChange={e => setUsername(e.target.value)}
+              autoFocus placeholder="Enter username"
+              style={{ width: "100%", background: C.bg, border: `1px solid ${C.border}`,
+                color: C.text, borderRadius: 8, padding: "11px 14px", fontSize: 14 }}
+            />
+          </div>
+          <div>
+            <label style={{ display: "block", color: C.textDim, fontSize: 12,
+              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+              Password
+            </label>
+            <input
+              type="password" value={password} onChange={e => setPassword(e.target.value)}
+              placeholder="Enter password"
+              style={{ width: "100%", background: C.bg, border: `1px solid ${C.border}`,
+                color: C.text, borderRadius: 8, padding: "11px 14px", fontSize: 14 }}
+            />
+          </div>
+
+          {error && (
+            <div style={{ background: "#ef444418", border: `1px solid ${C.red}44`,
+              borderRadius: 8, padding: "10px 14px", color: C.red, fontSize: 13 }}>
+              {error}
+            </div>
+          )}
+
+          <button type="submit" disabled={loading || !username || !password} style={{
+            background: C.accent, color: "#000", border: "none", borderRadius: 8,
+            padding: "12px", fontSize: 15, fontWeight: 700, cursor: "pointer",
+            opacity: (loading || !username || !password) ? 0.6 : 1, marginTop: 4,
+          }}>
+            {loading ? "Signing in…" : "Sign In"}
+          </button>
+        </form>
+
+        <div style={{ marginTop: 20, textAlign: "center" }}>
+          <button onClick={() => { setIsAdmin(v => !v); setError(""); }} style={{
+            background: "none", border: "none", color: C.muted, fontSize: 12,
+            cursor: "pointer", textDecoration: "underline",
+          }}>
+            {isAdmin ? "Switch to user login" : "Admin login"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Users Page (admin panel) ──────────────────
+function UsersPage({ currentUser }) {
+  const [users,    setUsers]    = useState([]);
+  const [loading,  setLoading]  = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [editUser, setEditUser] = useState(null);
+  const [form,     setForm]     = useState({ username: "", email: "", password: "", role: "user" });
+  const [err,      setErr]      = useState("");
+  const [msg,      setMsg]      = useState("");
+  const [resetting, setResetting] = useState(null);
+  const [resetPwd, setResetPwd]   = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setUsers(await api("/admin/users")); } catch (e) { setErr(e.message); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const openCreate = () => {
+    setEditUser(null);
+    setForm({ username: "", email: "", password: "", role: "user" });
+    setErr(""); setMsg("");
+    setShowForm(true);
+  };
+
+  const openEdit = (u) => {
+    setEditUser(u);
+    setForm({ username: u.username, email: u.email || "", password: "", role: u.role });
+    setErr(""); setMsg("");
+    setShowForm(true);
+  };
+
+  const save = async () => {
+    setErr("");
+    try {
+      if (editUser) {
+        const body = { username: form.username, email: form.email, role: form.role };
+        if (form.password) body.password = form.password;
+        await api(`/admin/users/${editUser.id}`, { method: "PUT", body: JSON.stringify(body) });
+        setMsg("User updated.");
+      } else {
+        if (!form.username || !form.password) return setErr("Username and password required.");
+        await api("/admin/users", { method: "POST", body: JSON.stringify(form) });
+        setMsg("User created.");
+      }
+      setShowForm(false);
+      load();
+    } catch (e) { setErr(e.message); }
+  };
+
+  const toggleActive = async (u) => {
+    await api(`/admin/users/${u.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_active: !u.is_active }),
+    }).catch(e => setErr(e.message));
+    load();
+  };
+
+  const del = async (u) => {
+    if (!confirm(`Delete user "${u.username}"? All their data will be removed.`)) return;
+    await api(`/admin/users/${u.id}`, { method: "DELETE" }).catch(e => setErr(e.message));
+    load();
+  };
+
+  const impersonate = async (u) => {
+    try {
+      const data = await api(`/admin/users/${u.id}/impersonate`, { method: "POST" });
+      // Save admin token so we can restore it on exit
+      const adminToken = localStorage.getItem("repricer_token");
+      const adminUser  = localStorage.getItem("repricer_user");
+      localStorage.setItem("repricer_admin_token", adminToken);
+      localStorage.setItem("repricer_admin_user",  adminUser);
+      localStorage.setItem("repricer_token", data.token);
+      localStorage.setItem("repricer_user",  JSON.stringify({ ...JSON.parse(adminUser || "{}"),
+        impersonatedUserId: data.impersonatedUser.id,
+        impersonatedUsername: data.impersonatedUser.username,
+      }));
+      window.location.reload();
+    } catch (e) { setErr(e.message); }
+  };
+
+  const saveResetPwd = async (uid) => {
+    if (!resetPwd.trim()) return;
+    await api(`/admin/users/${uid}`, { method: "PUT", body: JSON.stringify({ password: resetPwd }) })
+      .catch(e => setErr(e.message));
+    setResetting(null); setResetPwd(""); load();
+  };
+
+  return (
+    <div>
+      {err && (
+        <div style={{ background: "#ef444418", border: `1px solid ${C.red}44`, borderRadius: 8,
+          padding: "10px 14px", color: C.red, fontSize: 13, marginBottom: 16 }}>{err}</div>
+      )}
+      {msg && (
+        <div style={{ background: "#00d4aa18", border: `1px solid ${C.accent}44`, borderRadius: 8,
+          padding: "10px 14px", color: C.accent, fontSize: 13, marginBottom: 16 }}>{msg}</div>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <h2 style={{ color: C.text, margin: 0 }}>User Management</h2>
+        <Btn onClick={openCreate}>+ Create User</Btn>
+      </div>
+
+      <Section>
+        {loading && <p style={{ color: C.muted, padding: 24, textAlign: "center" }}>Loading…</p>}
+        {!loading && (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                {["Username", "Email", "Role", "Mappings", "Accounts", "Status", "Created", "Actions"].map(h => (
+                  <th key={h} style={{ color: C.muted, textAlign: "left", padding: "8px 12px",
+                    fontWeight: 500, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {users.map(u => (
+                <tr key={u.id} style={{ borderBottom: `1px solid ${C.border}20` }}>
+                  <td style={{ padding: "10px 12px", color: C.text, fontWeight: 600 }}>
+                    {u.username}
+                    {u.id === currentUser?.userId && (
+                      <span style={{ color: C.muted, fontSize: 10, marginLeft: 6 }}>(you)</span>
+                    )}
+                  </td>
+                  <td style={{ padding: "10px 12px", color: C.muted }}>{u.email || "—"}</td>
+                  <td style={{ padding: "10px 12px" }}>
+                    <span style={{
+                      background: u.role === "super_admin" ? "#f59e0b22" : "#3b82f622",
+                      color: u.role === "super_admin" ? C.amber : C.blue,
+                      borderRadius: 6, padding: "2px 8px", fontSize: 11, fontWeight: 600,
+                    }}>{u.role === "super_admin" ? "Admin" : "User"}</span>
+                  </td>
+                  <td style={{ padding: "10px 12px", color: C.textDim }}>{u.mapping_count}</td>
+                  <td style={{ padding: "10px 12px", color: C.textDim }}>{u.account_count}</td>
+                  <td style={{ padding: "10px 12px" }}>
+                    <span style={{
+                      color: u.is_active ? C.accent : C.red,
+                      fontSize: 12, fontWeight: 600,
+                    }}>{u.is_active ? "Active" : "Inactive"}</span>
+                  </td>
+                  <td style={{ padding: "10px 12px", color: C.muted, fontSize: 12 }}>
+                    {new Date(u.created_at).toLocaleDateString("en-GB")}
+                  </td>
+                  <td style={{ padding: "10px 12px" }}>
+                    {resetting === u.id ? (
+                      <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                        <input
+                          autoFocus type="password" placeholder="New password"
+                          value={resetPwd} onChange={e => setResetPwd(e.target.value)}
+                          onKeyDown={e => { if (e.key === "Enter") saveResetPwd(u.id); if (e.key === "Escape") setResetting(null); }}
+                          style={{ background: C.bg, border: `1px solid ${C.accent}`, borderRadius: 6,
+                            color: C.text, padding: "4px 8px", fontSize: 12, width: 120 }}
+                        />
+                        <button onClick={() => saveResetPwd(u.id)} style={{
+                          background: C.accent, border: "none", borderRadius: 4, color: "#000",
+                          padding: "4px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>✓</button>
+                        <button onClick={() => setResetting(null)} style={{
+                          background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 14 }}>✕</button>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                        <Btn small variant="secondary" onClick={() => openEdit(u)}>Edit</Btn>
+                        <Btn small variant="secondary" onClick={() => { setResetting(u.id); setResetPwd(""); }}>Reset Pwd</Btn>
+                        <Btn small variant="secondary" onClick={() => toggleActive(u)}>
+                          {u.is_active ? "Disable" : "Enable"}
+                        </Btn>
+                        {u.id !== currentUser?.userId && u.role !== "super_admin" && (
+                          <Btn small variant="ghost" onClick={() => impersonate(u)}>Impersonate</Btn>
+                        )}
+                        {u.id !== currentUser?.userId && (
+                          <Btn small variant="danger" onClick={() => del(u)}>Del</Btn>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Section>
+
+      {showForm && (
+        <Modal title={editUser ? `Edit ${editUser.username}` : "Create User"} onClose={() => setShowForm(false)}>
+          {err && (
+            <div style={{ background: "#ef444418", border: `1px solid ${C.red}44`, borderRadius: 8,
+              padding: "10px 14px", color: C.red, fontSize: 13, marginBottom: 16 }}>{err}</div>
+          )}
+          <Field label="Username" value={form.username}
+            onChange={e => setForm(f => ({ ...f, username: e.target.value }))} />
+          <Field label="Email (optional)" value={form.email}
+            onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+          <Field label={editUser ? "New Password (leave blank to keep)" : "Password"}
+            type="password" value={form.password}
+            onChange={e => setForm(f => ({ ...f, password: e.target.value }))} />
+          <Field label="Role" as="select" value={form.role}
+            onChange={e => setForm(f => ({ ...f, role: e.target.value }))}>
+            <option value="user">User</option>
+            <option value="super_admin">Super Admin</option>
+          </Field>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <Btn variant="secondary" onClick={() => setShowForm(false)}>Cancel</Btn>
+            <Btn onClick={save}>{editUser ? "Update" : "Create"}</Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 // ── Section wrapper ───────────────────────────
 function Section({ title, action, children }) {
   return (
@@ -1000,6 +1337,7 @@ function Section({ title, action, children }) {
 
 // ── Settings Page ────────────────────────────
 const INTERVAL_OPTIONS = [
+  { value: "0",   label: "No interval (once daily at start time)" },
   { value: "5",   label: "Every 5 minutes" },
   { value: "15",  label: "Every 15 minutes" },
   { value: "30",  label: "Every 30 minutes" },
@@ -1059,8 +1397,9 @@ function SettingsPage({ onIntervalChange }) {
   const numInp = { ...inp, width: 100 };
 
   // Compute a human-readable schedule summary
+  const noInterval    = String(interval) === "0";
   const intervalLabel = INTERVAL_OPTIONS.find(o => o.value === String(interval))?.label || `Every ${interval} min`;
-  const startLabel    = startTime === "00:00" ? "midnight (runs all day)" : startTime;
+  const startLabel    = startTime === "00:00" ? "midnight" : startTime;
 
   return (
     <div style={{ maxWidth: 660, display: "flex", flexDirection: "column", gap: 20 }}>
@@ -1104,12 +1443,22 @@ function SettingsPage({ onIntervalChange }) {
 
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
             padding: "10px 14px", fontSize: 12, color: C.textDim, lineHeight: 1.6 }}>
-            <span style={{ color: C.accent }}>Schedule: </span>{intervalLabel},
-            starting from <span style={{ color: C.accent }}>{startLabel}</span>
-            {startTime !== "00:00" && (
-              <span style={{ color: C.muted }}>
-                {" "}— cron ticks before {startTime} are silently skipped
-              </span>
+            {noInterval ? (
+              <>
+                <span style={{ color: C.accent }}>Schedule: </span>
+                Once daily at <span style={{ color: C.accent }}>{startLabel}</span>
+                <span style={{ color: C.muted }}> — job fires exactly at this time, no repeat</span>
+              </>
+            ) : (
+              <>
+                <span style={{ color: C.accent }}>Schedule: </span>{intervalLabel},
+                starting from <span style={{ color: C.accent }}>{startLabel}</span>
+                {startTime !== "00:00" && (
+                  <span style={{ color: C.muted }}>
+                    {" "}— ticks before {startTime} are silently skipped
+                  </span>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -1238,6 +1587,44 @@ export default function App() {
   const [queueCounts, setQueueCounts] = useState(null);
   const [chartMapping, setChartMapping] = useState(null);
   const [jobInterval, setJobInterval] = useState(null);
+  const [defaultRoi, setDefaultRoi]   = useState(20);
+
+  // ── Auth state ──────────────────────────────
+  const [authToken,    setAuthToken]    = useState(() => localStorage.getItem("repricer_token"));
+  const [currentUser,  setCurrentUser]  = useState(() => {
+    try { return JSON.parse(localStorage.getItem("repricer_user")); } catch { return null; }
+  });
+
+  const login = (token, user) => {
+    localStorage.setItem("repricer_token", token);
+    localStorage.setItem("repricer_user",  JSON.stringify(user));
+    setAuthToken(token);
+    setCurrentUser(user);
+    setPage("dashboard");
+  };
+
+  const logout = () => {
+    localStorage.removeItem("repricer_token");
+    localStorage.removeItem("repricer_user");
+    localStorage.removeItem("repricer_admin_token");
+    localStorage.removeItem("repricer_admin_user");
+    setAuthToken(null);
+    setCurrentUser(null);
+  };
+
+  const exitImpersonation = () => {
+    const adminToken = localStorage.getItem("repricer_admin_token");
+    const adminUser  = localStorage.getItem("repricer_admin_user");
+    if (!adminToken) return logout();
+    localStorage.setItem("repricer_token", adminToken);
+    localStorage.setItem("repricer_user",  adminUser);
+    localStorage.removeItem("repricer_admin_token");
+    localStorage.removeItem("repricer_admin_user");
+    window.location.reload();
+  };
+
+  const isImpersonating = !!(currentUser?.impersonatedUserId);
+  const isAdmin = currentUser?.role === "super_admin";
 
   const loadDashboard = useCallback(() => {
     api("/stats").then(setStats).catch(console.error);
@@ -1245,29 +1632,37 @@ export default function App() {
 
   const pollQueue = useCallback(() => {
     api("/queue-status").then(s => {
+      if (!s) return;
       setQueueBusy(s.busy);
       setQueueCounts(s);
     }).catch(() => {});
   }, []);
 
   useEffect(() => {
+    if (!authToken) return;
     loadDashboard();
     api("/settings").then(s => {
-      if (s.job_interval_minutes) setJobInterval(parseInt(s.job_interval_minutes));
+      if (!s) return;
+      if (s.job_interval_minutes)  setJobInterval(parseInt(s.job_interval_minutes));
+      if (s.default_roi_percent)   setDefaultRoi(parseFloat(s.default_roi_percent));
     }).catch(() => {});
-  }, [loadDashboard]);
+  }, [authToken, loadDashboard]);
 
-  // Poll queue every 5 s so the button reflects live state
   useEffect(() => {
+    if (!authToken) return;
     pollQueue();
     const iv = setInterval(pollQueue, 5000);
     return () => clearInterval(iv);
-  }, [pollQueue]);
+  }, [authToken, pollQueue]);
+
+  // ── Gate behind login ───────────────────────
+  if (!authToken || !currentUser) {
+    return <LoginPage onLogin={login} />;
+  }
 
   const syncAll = async () => {
     setSyncing(true);
     await api("/sync", { method:"POST" }).catch(console.error);
-    // Re-poll immediately after triggering so button disables right away
     pollQueue();
     setTimeout(() => { loadDashboard(); setSyncing(false); pollQueue(); }, 3000);
   };
@@ -1275,12 +1670,12 @@ export default function App() {
   const nav = [
     { id:"dashboard",      label:"📊 Dashboard" },
     { id:"mappings",       label:"🔗 Mappings" },
-    // { id:"compare",        label:"⚖️ Compare" },
     { id:"current-prices", label:"💷 Current Prices" },
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
+    ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
   ];
 
   return (
@@ -1299,9 +1694,29 @@ export default function App() {
         input:focus, select:focus { border-color: ${C.accent} !important; }
       `}</style>
 
+      {/* Impersonation banner */}
+      {isImpersonating && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, zIndex: 200,
+          background: "#f59e0b", color: "#000", padding: "8px 24px",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          fontSize: 13, fontWeight: 600,
+        }}>
+          <span>
+            Viewing as <strong>{currentUser.impersonatedUsername}</strong> — you are impersonating this user
+          </span>
+          <button onClick={exitImpersonation} style={{
+            background: "#0006", border: "none", borderRadius: 6, color: "#fff",
+            padding: "4px 14px", cursor: "pointer", fontWeight: 700, fontSize: 12,
+          }}>
+            Exit Impersonation
+          </button>
+        </div>
+      )}
+
       {/* Sidebar */}
       <div style={{
-        position:"fixed", left:0, top:0, bottom:0, width:220,
+        position:"fixed", left:0, top: isImpersonating ? 38 : 0, bottom:0, width:220,
         background:C.surface, borderRight:`1px solid ${C.border}`,
         display:"flex", flexDirection:"column", padding:"24px 0",
         zIndex:50,
@@ -1336,7 +1751,7 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Sync button */}
+        {/* Sync + user info */}
         <div style={{ padding:"16px 20px", borderTop:`1px solid ${C.border}` }}>
           <Btn
             onClick={syncAll}
@@ -1355,11 +1770,28 @@ export default function App() {
                 ? `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`
                 : "Auto-runs every 30 min"}
           </p>
+
+          {/* User info + logout */}
+          <div style={{ marginTop: 14, borderTop: `1px solid ${C.border}`, paddingTop: 12,
+            display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div>
+              <p style={{ color: C.text, fontSize: 12, fontWeight: 600 }}>
+                {isImpersonating ? currentUser.impersonatedUsername : currentUser.username}
+              </p>
+              <p style={{ color: C.muted, fontSize: 10 }}>
+                {isImpersonating ? "Impersonation" : currentUser.role === "super_admin" ? "Super Admin" : "User"}
+              </p>
+            </div>
+            <button onClick={logout} title="Logout" style={{
+              background: "none", border: `1px solid ${C.border}`, borderRadius: 6,
+              color: C.muted, padding: "4px 8px", cursor: "pointer", fontSize: 11,
+            }}>Logout</button>
+          </div>
         </div>
       </div>
 
       {/* Main */}
-      <div style={{ marginLeft:220, padding:"32px 32px 32px" }}>
+      <div style={{ marginLeft:220, padding:`${isImpersonating ? 70 : 32}px 32px 32px` }}>
         {/* Header */}
         <div style={{ marginBottom:28 }}>
           <h1 style={{ color:C.text, fontSize:22, fontWeight:700 }}>
@@ -1374,18 +1806,20 @@ export default function App() {
             {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
             {page === "settings"       && "Configure proxies and global repricer options"}
             {page === "logs"           && "Real-time output from API server and job worker"}
+            {page === "users"          && "Manage user accounts and impersonate users"}
           </p>
         </div>
 
         {/* Pages */}
         {page === "dashboard"      && <DashboardPage stats={stats} />}
-        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} />}
+        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} defaultRoi={defaultRoi} />}
         {page === "compare"        && <ComparePage />}
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} />}
         {page === "logs"           && <LiveLogsPage />}
+        {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
         {page === "chart"          && chartMapping && (
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:24 }}>
@@ -1447,6 +1881,11 @@ function AccountsPage() {
       setResult(prev => ({ ...prev, [id]: { ok: false, message: e.message } }));
     }
     setTesting(t => ({ ...t, [id]: false }));
+    load();
+  }
+
+  async function toggleActive(a) {
+    await api(`/accounts/${a.id}`, { method:"PUT", body: JSON.stringify({ is_active: !a.is_active }) });
     load();
   }
 
@@ -1538,13 +1977,20 @@ function AccountsPage() {
                         </div>
                       )}
                     </div>
-                    <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                    <div style={{ display:"flex", gap:6, flexShrink:0, alignItems:"center" }}>
                       <Btn small variant="secondary" loading={testing[a.id]}
                         onClick={() => testAccount(a.id)}>Test</Btn>
                       <Btn small variant="secondary" onClick={() => {
                         setEditId(a.id);
                         setForm({ account_name:a.account_name, consumer_key:"", secret_key:"", site_id:a.site_id });
                       }}>Edit</Btn>
+                      <button onClick={() => toggleActive(a)} title={a.is_active ? "Disable account" : "Enable account"} style={{
+                        background: a.is_active ? "#00d4aa18" : "#ef444418",
+                        border: `1px solid ${a.is_active ? C.accent + "44" : C.red + "44"}`,
+                        color: a.is_active ? C.accent : C.red,
+                        borderRadius: 8, padding: "4px 10px", fontSize: 11,
+                        fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+                      }}>{a.is_active ? "Enabled" : "Disabled"}</button>
                       <Btn small variant="danger" onClick={() => del(a.id)}>Del</Btn>
                     </div>
                   </div>
@@ -1746,7 +2192,13 @@ function ImportPage() {
     const fd = new FormData();
     fd.append("file", f);
     try {
-      const r = await fetch(`${API}/import/preview`, { method:"POST", body: fd });
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/import/preview`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       setPreview(data); setStep(2);
