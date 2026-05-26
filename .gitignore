@@ -7,3 +7,4 @@ frontend/dist/
 frontend/.env
 dist/
 .DS_Store
+.claude/
