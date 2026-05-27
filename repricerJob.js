@@ -30,10 +30,18 @@ import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import https from 'https';
+import { appendFileSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue, getTokenForAccount } from './jobProducer.js';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+export const LOGS_DIR = join(__dirname, 'logs');
+try { mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
 
 const { Pool } = pg;
 
@@ -66,6 +74,21 @@ const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
 // that don't come from amazonScraper.js (which adds its own timestamps).
 const wlog = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
 
+// Write a timestamped line to the per-user log file so each user's Live Logs
+// page only shows their own jobs.  Silently swallowed on I/O error.
+function logToUser(userId, ...args) {
+  if (!userId) return;
+  const msg  = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try { appendFileSync(join(LOGS_DIR, `user-${userId}.log`), line, 'utf8'); } catch {}
+}
+
+// Log to stdout AND the user file at once.
+function ulog(userId, ...args) {
+  wlog(...args);
+  logToUser(userId, ...args);
+}
+
 // ─────────────────────────────────────────────
 // ONBUY RATE-LIMITED BATCH UPDATER
 // OnBuy allows max 240 PUT requests/hour.
@@ -96,13 +119,13 @@ class OnBuyUpdater {
     return t;
   }
 
-  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey, amazonPrice = null, mappingId = null, minPrice = null, feeRate = null, minRoiPercent = null } = {}) {
+  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey, amazonPrice = null, mappingId = null, minPrice = null, feeRate = null, minRoiPercent = null, userId = null } = {}) {
     return new Promise((resolve, reject) => {
       const token = this._resolveToken(rawToken);
       const key   = `${token}||${siteId}||${isSku ? '1' : '0'}`;
       if (!this._batches.has(key)) this._batches.set(key, []);
       const batch = this._batches.get(key);
-      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, resolve, reject });
+      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, userId, resolve, reject });
       // Store credentials under the resolved token (and under rawToken as fallback)
       if (consumerKey && secretKey) {
         if (!this._creds.has(token))    this._creds.set(token,    { consumerKey, secretKey });
@@ -201,6 +224,8 @@ class OnBuyUpdater {
     this._rrTs.push(Date.now());
 
     const { token, siteId, isSku } = items[0];
+    // All items in a batch share the same account/token, so one userId covers the batch.
+    const batchUserId = items[0].userId ?? null;
 
     // ── Check-winning: adjust prices for non-winning SKU listings ──
     if (isSku) {
@@ -236,7 +261,7 @@ class OnBuyUpdater {
             const roiAtPrice  = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
             if (roiAtPrice < effMinRoi) {
               const minRoiPrice = parseFloat((item.amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2));
-              wlog(`[CheckWinning] ${item.identifier}: ROI at £${newPrice} = ${roiAtPrice.toFixed(1)}% < min ${effMinRoi}% → floor £${minRoiPrice}`);
+              ulog(item.userId, `[CheckWinning] ${item.identifier}: ROI at £${newPrice} = ${roiAtPrice.toFixed(1)}% < min ${effMinRoi}% → floor £${minRoiPrice}`);
               newPrice = minRoiPrice;
             }
           }
@@ -247,7 +272,7 @@ class OnBuyUpdater {
           // Skip if nothing changed
           if (newPrice === item.price) continue;
 
-          wlog(`[CheckWinning] ${item.identifier}: £${item.price} → £${newPrice} (lead: £${leadPrice}, winning: ${winning})`);
+          ulog(item.userId, `[CheckWinning] ${item.identifier}: £${item.price} → £${newPrice} (lead: £${leadPrice}, winning: ${winning})`);
           item.price = newPrice;
           adjusted++;
 
@@ -261,7 +286,7 @@ class OnBuyUpdater {
             ).catch(() => {});
           }
         }
-        if (adjusted > 0) wlog(`[CheckWinning] Adjusted ${adjusted}/${items.length} prices in this batch`);
+        if (adjusted > 0) ulog(batchUserId, `[CheckWinning] Adjusted ${adjusted}/${items.length} prices in this batch`);
       }
     }
 
@@ -278,18 +303,18 @@ class OnBuyUpdater {
       body: JSON.stringify({ listings }),
     });
 
-    wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} payload:`, JSON.stringify({ listings }));
+    ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} payload:`, JSON.stringify({ listings }));
 
     try {
       let res = await doRequest(token);
       let raw = await res.text();
-      wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status} response:`, raw.slice(0, 2000));
+      ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status} response:`, raw.slice(0, 2000));
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
         const creds = this._creds.get(token) || this._creds.get(items[0].token);
         if (creds) {
-          wlog(`[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
+          ulog(batchUserId, `[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
           try {
             const newToken = await getTokenForAccount({ consumer_key: creds.consumerKey, secret_key: creds.secretKey });
             if (newToken) {
@@ -313,10 +338,10 @@ class OnBuyUpdater {
               }
               res = await doRequest(newToken);
               raw = await res.text();
-              wlog(`[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status} response:`, raw.slice(0, 2000));
+              ulog(batchUserId, `[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status} response:`, raw.slice(0, 2000));
             }
           } catch (refreshErr) {
-            wlog(`[OnBuyUpdater] Token refresh failed:`, refreshErr.message);
+            ulog(batchUserId, `[OnBuyUpdater] Token refresh failed:`, refreshErr.message);
           }
         }
       }
@@ -482,6 +507,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     amazon_in_stock,
     primary_asin,
     product_name,
+    user_id: userId,
   } = mapping;
 
   const effFeeRate  = userSettings.feeRate      ?? _onbuyFeeRate;
@@ -495,10 +521,10 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     const wasAlreadyOos = amazon_in_stock === false;
     const identifier    = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
     if (!wasAlreadyOos) {
-      wlog(`[Worker] ⚠️  ${label} — OOS, setting stock=0`);
+      ulog(userId, `[Worker] ⚠️  ${label} — OOS, setting stock=0`);
       await setOnBuyStock(identifier, 0, token, siteId, !!onbuy_sku);
     } else {
-      wlog(`[Worker] ⏭  ${label} — still OOS, no change`);
+      ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
     }
     await db.query(
       `UPDATE product_mappings SET amazon_in_stock = false, last_checked_at = NOW() WHERE id = $1`, [id]
@@ -515,14 +541,14 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // not that the item is back in stock. Never restore from a failed scrape.
   if (amazon_in_stock === false && scraped.price) {
     const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
-    wlog(`[Worker] ✅ ${label} — back in stock, restoring stock=2`);
+    ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=2`);
     await setOnBuyStock(identifier, 2, token, siteId, !!onbuy_sku);
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
 
   // ── No price ──
   if (!scraped.price) {
-    wlog(`[Worker] ⚠️  ${label} — no price (${scraped.error || 'unknown'})`);
+    ulog(userId, `[Worker] ⚠️  ${label} — no price (${scraped.error || 'unknown'})`);
     await db.query(
       `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
        VALUES ($1, 'failed', $2, NOW())`,
@@ -533,7 +559,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 
   const amazonPrice   = scraped.price;
   const newOnBuyPrice = computeOnBuyPrice(amazonPrice, markup_type, markup_value, min_price, effFeeRate);
-  wlog(`[Worker] ${label} — Amazon £${amazonPrice} → OnBuy £${newOnBuyPrice} (${scraped.method})`);
+  ulog(userId, `[Worker] ${label} — Amazon £${amazonPrice} → OnBuy £${newOnBuyPrice} (${scraped.method})`);
 
   // ── Skip if unchanged ──
   // Don't skip when the stored price violates the current min-ROI floor — the
@@ -548,7 +574,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     : false;
   const alreadyCorrect = !storedBelowFloor && last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
   if (!hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect) {
-    wlog(`[Worker] ⏭  ${label} — price unchanged (Amazon £${amazonPrice}, OnBuy £${newOnBuyPrice}), skipping`);
+    ulog(userId, `[Worker] ⏭  ${label} — price unchanged (Amazon £${amazonPrice}, OnBuy £${newOnBuyPrice}), skipping`);
     await db.query(`UPDATE product_mappings SET last_checked_at = NOW() WHERE id = $1`, [id]);
     return { success: true, skipped: true };
   }
@@ -572,6 +598,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     minPrice:     min_price ? parseFloat(min_price) : null,
     feeRate:      effFeeRate !== _onbuyFeeRate  ? effFeeRate  : null,
     minRoiPercent: effMinRoi !== _minRoiPercent ? effMinRoi   : null,
+    userId,
   })
     .then(async (result) => {
       const finalPrice = result?._finalPrice ?? newOnBuyPrice;
@@ -593,11 +620,11 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
           ),
         ]);
       } catch (dbErr) {
-        wlog(`[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
+        ulog(userId, `[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
       }
     })
     .catch(err => {
-      wlog(`[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
+      ulog(userId, `[Worker] ❌ ${label} — OnBuy update failed:`, err.message);
       db.query(
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`,
@@ -616,13 +643,14 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 
 async function processFastJob(job) {
   let { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
+  const userId = mapping.user_id;
 
   // Resolve listing UID from OPC if we only have a raw URL/OPC
   if (!mapping.onbuy_sku && !isValidListingUid(mapping.onbuy_listing_id)) {
     const opc = mapping.onbuy_opc || extractOpcFromValue(mapping.onbuy_listing_id);
     if (!opc) {
       const msg = 'No SKU or valid UID — re-import with Seller SKU filled in';
-      wlog(`[FastWorker] mapping #${mapping.id}: ${msg}`);
+      ulog(userId, `[FastWorker] mapping #${mapping.id}: ${msg}`);
       await db.query(
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`, [mapping.id, msg]
@@ -658,7 +686,7 @@ async function processFastJob(job) {
     const drainMs    = batches * 12000 + 10000;
     const delay      = Math.max(5000, Math.min(drainMs, 300000)); // 5 s – 5 min cap
 
-    wlog(`[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
+    ulog(userId, `[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
     await slowQueue.add('scrape', { mapping, token, siteId, userSettings }, {
       jobId:             `slow-${mapping.id}`,
       delay,
@@ -811,18 +839,18 @@ async function refreshSchedules() {
         if (intervalMinutes > 0) {
           const now = new Date();
           if (now.getHours() * 60 + now.getMinutes() < h * 60 + m) {
-            wlog(`[Scheduler] User #${uid}: before start time ${startTime} — skipping`);
+            ulog(uid, `[Scheduler] User #${uid}: before start time ${startTime} — skipping`);
             return;
           }
         }
-        runRepricerJob({ userId: uid });
+        runRepricerJob({ userId: uid, log: (...args) => ulog(uid, ...args) });
       });
 
       _userCrons.set(uid, { task, intervalMinutes, startTime });
       const desc = intervalMinutes === 0
         ? `once daily at ${startTime}`
         : `every ${intervalMinutes}min from ${startTime}`;
-      wlog(`[Scheduler] User #${uid}: "${pattern}" — ${desc}`);
+      ulog(uid, `[Scheduler] User #${uid}: "${pattern}" — ${desc}`);
     }
 
     // Stop crons for users that have been deactivated or deleted
@@ -842,7 +870,7 @@ export async function startScheduler() {
       const [h, m] = startTime.split(':').map(Number);
       const now = new Date();
       if (now.getHours() * 60 + now.getMinutes() >= h * 60 + m) {
-        runRepricerJob({ userId: uid });
+        runRepricerJob({ userId: uid, log: (...args) => ulog(uid, ...args) });
       }
     }
   }

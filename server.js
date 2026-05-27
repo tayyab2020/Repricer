@@ -15,7 +15,7 @@ import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
 import IORedis from 'ioredis';
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
@@ -24,6 +24,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+try { mkdirSync(join(__dirname, 'logs'), { recursive: true }); } catch {}
 
 dotenv.config();
 
@@ -377,8 +378,8 @@ app.get('/api/scraper-logs', requireAuth, (req, res) => {
 });
 
 // GET /api/pm2-logs?process=worker|api|all — SSE stream of live log output
-// Dev:  tails scraper.log via Node.js fsWatch (Windows-compatible, no PM2 needed)
-// Prod: tails PM2 log files via `tail -f`
+// "worker" target: streams logs/user-{id}.log (per-user, written by repricerJob.js)
+// "api"/"all" targets (production): streams PM2 log files via tail -f
 app.get('/api/pm2-logs', (req, res, next) => {
   // EventSource cannot send headers — accept token as query param for this SSE route
   if (req.query.token && !req.headers.authorization) {
@@ -396,18 +397,19 @@ app.get('/api/pm2-logs', (req, res, next) => {
     const match = line.match(/\[(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\]/);
     const ts = match ? match[1] : new Date().toISOString();
     res.write(`data: ${JSON.stringify({ ts, line, source })}\n\n`);
-    if (typeof res.flush === 'function') res.flush(); // flush if compression middleware present
+    if (typeof res.flush === 'function') res.flush();
   };
 
-  // Windows = local dev (no PM2/tail); Linux = production VPS
-  const isProduction = process.platform !== 'win32';
+  const target = req.query.process || 'worker';
 
-  if (!isProduction) {
-    // ── Local dev: stream scraper.log using Node.js fs (Windows-compatible) ──
-    const logPath = join(__dirname, 'scraper.log');
+  // ── Worker tab: stream per-user log file (dev + production) ──
+  if (target === 'worker' || process.platform === 'win32') {
+    const userId  = req.effectiveUserId;
+    const logsDir = join(__dirname, 'logs');
+    const logPath = join(logsDir, `user-${userId}.log`);
 
     if (!existsSync(logPath)) {
-      send('scraper.log not found — run `npm run job` to generate logs', 'worker');
+      send(`No log file yet for your account — logs will appear here once the repricer runs`, 'worker');
     } else {
       const content = readFileSync(logPath, 'utf8');
       content.split('\n').filter(Boolean).slice(-80).forEach(line => send(line, 'worker'));
@@ -417,9 +419,9 @@ app.get('/api/pm2-logs', (req, res, next) => {
     let watcher  = null;
 
     try {
-      // Watch the directory so we also detect file creation
-      watcher = fsWatch(__dirname, { persistent: false }, (event, filename) => {
-        if (filename && filename !== 'scraper.log') return;
+      // Watch the logs directory so we detect both file creation and appends
+      watcher = fsWatch(logsDir, { persistent: false }, (event, filename) => {
+        if (filename && filename !== `user-${userId}.log`) return;
         if (!existsSync(logPath)) return;
         try {
           const newSize = statSync(logPath).size;
@@ -438,20 +440,13 @@ app.get('/api/pm2-logs', (req, res, next) => {
     }
 
     const hb = setInterval(() => res.write(': heartbeat\n\n'), 20000);
-
-    req.on('close', () => {
-      clearInterval(hb);
-      if (watcher) watcher.close();
-    });
-
+    req.on('close', () => { clearInterval(hb); if (watcher) watcher.close(); });
     return;
   }
 
-  // ── Production: stream PM2 log files via tail -f ──
-  const target = req.query.process || 'all';
+  // ── API / All tabs: stream PM2 log files via tail -f (production Linux only) ──
   const pm2Dir = `${process.env.HOME || '/root'}/.pm2/logs`;
 
-  // Discover log files dynamically — handles any PM2 process names
   let allPm2Logs = [];
   try {
     allPm2Logs = readdirSync(pm2Dir)
@@ -465,9 +460,8 @@ app.get('/api/pm2-logs', (req, res, next) => {
   const apiFiles    = allPm2Logs.filter(f => /\bapi\b/i.test(f) && !/worker/i.test(f));
 
   const fileMap = {
-    worker: workerFiles.length ? workerFiles : allPm2Logs,
-    api:    apiFiles.length    ? apiFiles    : allPm2Logs,
-    all:    allPm2Logs,
+    api: apiFiles.length ? apiFiles : allPm2Logs,
+    all: allPm2Logs,
   };
 
   if (allPm2Logs.length === 0) {
@@ -479,10 +473,7 @@ app.get('/api/pm2-logs', (req, res, next) => {
   const procs = files.flatMap(file => {
     const source = file.includes('worker') ? (file.includes('error') ? 'worker-err' : 'worker') :
                    file.includes('error') ? 'api-err' : 'api';
-    if (!existsSync(file)) {
-      send(`Log file not found: ${file}`, source);
-      return [];
-    }
+    if (!existsSync(file)) { send(`Log file not found: ${file}`, source); return []; }
     const tail = spawn('tail', ['-n', '80', '-f', file], { stdio: ['ignore', 'pipe', 'ignore'] });
     tail.stdout.setEncoding('utf8');
     tail.stdout.on('data', chunk => {
@@ -493,11 +484,7 @@ app.get('/api/pm2-logs', (req, res, next) => {
   });
 
   const hb = setInterval(() => res.write(': heartbeat\n\n'), 20000);
-
-  req.on('close', () => {
-    clearInterval(hb);
-    procs.forEach(p => p.kill());
-  });
+  req.on('close', () => { clearInterval(hb); procs.forEach(p => p.kill()); });
 });
 
 // GET /api/scraper-logs/file — download the full scraper.log file

@@ -43,10 +43,11 @@ export async function getTokenForAccount(account) {
   }
 }
 
-export async function runRepricerJob({ userId = null } = {}) {
-  console.log('\n' + '═'.repeat(60));
-  console.log(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}`);
-  console.log('═'.repeat(60));
+export async function runRepricerJob({ userId = null, log = null } = {}) {
+  const jlog = log ?? ((...a) => console.log(`[${new Date().toISOString()}]`, ...a));
+  jlog('\n' + '═'.repeat(60));
+  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}`);
+  jlog('═'.repeat(60));
 
   try {
     const userClause  = userId ? `AND pm.user_id = $1` : '';
@@ -66,10 +67,10 @@ export async function runRepricerJob({ userId = null } = {}) {
     `, queryParams);
 
     if (!mappings.length) {
-      console.log('[Job] No active mappings. Exiting.');
+      jlog('[Job] No active mappings. Exiting.');
       return;
     }
-    console.log(`[Job] ${mappings.length} active mapping(s) to enqueue`);
+    jlog(`[Job] ${mappings.length} active mapping(s) to enqueue`);
 
     // Load settings for each user so workers can apply the correct fee/ROI/proxy per job
     const userIds = [...new Set(mappings.map(m => m.user_id).filter(Boolean))];
@@ -89,7 +90,7 @@ export async function runRepricerJob({ userId = null } = {}) {
     for (const m of mappings) {
       const aid = m.onbuy_account_id;
       if (aid && !(aid in tokenCache)) {
-        console.log(`[Job] Fetching token for "${m.acct_name}" (id=${aid})…`);
+        jlog(`[Job] Fetching token for "${m.acct_name}" (id=${aid})…`);
         credCache[aid]  = { consumerKey: m.acct_consumer_key, secretKey: m.acct_secret_key };
         tokenCache[aid] = await getTokenForAccount({
           account_name: m.acct_name,
@@ -97,7 +98,7 @@ export async function runRepricerJob({ userId = null } = {}) {
           secret_key:   m.acct_secret_key,
         });
         siteCache[aid] = m.acct_site_id || '2000';
-        console.log(`[Job] Token for "${m.acct_name}": ${tokenCache[aid] ? '✅' : '❌'}`);
+        jlog(`[Job] Token for "${m.acct_name}": ${tokenCache[aid] ? '✅' : '❌'}`);
       }
     }
 
@@ -110,7 +111,7 @@ export async function runRepricerJob({ userId = null } = {}) {
         fallbackCreds  = { consumerKey: rows[0].consumer_key, secretKey: rows[0].secret_key };
         fallbackToken  = await getTokenForAccount(rows[0]);
         fallbackSiteId = rows[0].site_id || '2000';
-        console.log(`[Job] Fallback token: ${fallbackToken ? '✅' : '❌'}`);
+        jlog(`[Job] Fallback token: ${fallbackToken ? '✅' : '❌'}`);
       }
     }
 
@@ -154,7 +155,7 @@ export async function runRepricerJob({ userId = null } = {}) {
     } else {
       await Promise.all([fastQueue.drain(), slowQueue.drain()]);
     }
-    console.log('[Job] Queues drained — adding fresh jobs');
+    jlog('[Job] Queues drained — adding fresh jobs');
 
     const CHUNK = 500;
     for (let i = 0; i < jobs.length; i += CHUNK) {
@@ -166,10 +167,10 @@ export async function runRepricerJob({ userId = null } = {}) {
       slowQueue.getJobCounts('waiting', 'active', 'delayed'),
     ]);
 
-    console.log(`[Job] ✅ ${jobs.length} jobs enqueued${skippedNoToken ? ` (${skippedNoToken} skipped — no token)` : ''}`);
-    console.log(`[Queue] fast → waiting:${fastCounts.waiting} active:${fastCounts.active} | slow → waiting:${slowCounts.waiting} active:${slowCounts.active}`);
+    jlog(`[Job] ✅ ${jobs.length} jobs enqueued${skippedNoToken ? ` (${skippedNoToken} skipped — no token)` : ''}`);
+    jlog(`[Queue] fast → waiting:${fastCounts.waiting} active:${fastCounts.active} | slow → waiting:${slowCounts.waiting} active:${slowCounts.active}`);
 
   } catch (err) {
-    console.error('[Job] 💀 Fatal error:', err);
+    jlog('[Job] 💀 Fatal error:', String(err));
   }
 }
