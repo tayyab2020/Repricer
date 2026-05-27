@@ -24,12 +24,19 @@ import UserAgent from 'user-agents';
 import fs from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { AsyncLocalStorage } from 'async_hooks';
 import { smartExtractPrice } from './priceExtractor.js';
 
 puppeteer.use(StealthPlugin());
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LOG_FILE = join(__dirname, 'scraper.log');
+const LOG_FILE  = join(__dirname, 'scraper.log');
+const LOGS_DIR  = join(__dirname, 'logs');
+try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
+
+// Propagates the current job's userId through the entire async scrape call chain
+// so the log() function below can write to the correct per-user log file.
+export const jobContext = new AsyncLocalStorage();
 
 // ─────────────────────────────────────────────
 // LOGGING — in-memory ring buffer (last 200)
@@ -45,6 +52,10 @@ function log(level, message, meta = {}) {
   const line = `[${entry.ts}] [${level.toUpperCase()}] ${message}${metaStr}`;
   console.log(line);
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
+  const ctx = jobContext.getStore();
+  if (ctx?.userId) {
+    try { fs.appendFileSync(join(LOGS_DIR, `user-${ctx.userId}.log`), line + '\n'); } catch {}
+  }
 }
 
 // ─────────────────────────────────────────────

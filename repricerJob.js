@@ -33,7 +33,7 @@ import https from 'https';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl } from './amazonScraper.js';
+import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue, getTokenForAccount } from './jobProducer.js';
 
 dotenv.config();
@@ -154,7 +154,7 @@ class OnBuyUpdater {
 
   // Called when all queue jobs are done — flushes every pending batch immediately
   // rather than waiting for the 5-minute collection window to expire.
-  flushAll() {
+  flushAll(runUserIds = new Set()) {
     let pending = 0;
     for (const [key, batch] of this._batches) {
       if (batch.length === 0) continue;
@@ -162,8 +162,11 @@ class OnBuyUpdater {
       if (this._timers.has(key)) { clearTimeout(this._timers.get(key)); this._timers.delete(key); }
       this._enqueueFlush(key);
     }
-    if (pending === 0) wlog('[OnBuyUpdater] flushAll: no pending updates (all prices unchanged or skipped)');
-    else wlog(`[OnBuyUpdater] flushAll: ${pending} item(s) queued for immediate dispatch`);
+    const msg = pending === 0
+      ? '[OnBuyUpdater] flushAll: no pending updates (all prices unchanged or skipped)'
+      : `[OnBuyUpdater] flushAll: ${pending} item(s) queued for immediate dispatch`;
+    wlog(msg);
+    for (const uid of runUserIds) logToUser(uid, msg);
   }
 
   // GET /v2/listings/check-winning — returns lead price + winning status per SKU
@@ -644,6 +647,10 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 async function processFastJob(job) {
   let { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
   const userId = mapping.user_id;
+  return jobContext.run({ userId }, () => _processFastJob(job, mapping, token, siteId, consumerKey, secretKey, userSettings, userId));
+}
+
+async function _processFastJob(job, mapping, token, siteId, consumerKey, secretKey, userSettings, userId) {
 
   // Resolve listing UID from OPC if we only have a raw URL/OPC
   if (!mapping.onbuy_sku && !isValidListingUid(mapping.onbuy_listing_id)) {
@@ -709,8 +716,11 @@ async function processFastJob(job) {
 
 async function processSlowJob(job) {
   const { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
-  const scraped = await scrapeProductSlow(mapping.primary_asin);
-  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
+  const userId = mapping.user_id;
+  return jobContext.run({ userId }, async () => {
+    const scraped = await scrapeProductSlow(mapping.primary_asin);
+    return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
+  });
 }
 
 // ─────────────────────────────────────────────
@@ -761,6 +771,9 @@ slowWorker.on('failed', (job, err) =>
 // jobs but ignores *delayed* ones — escalated Puppeteer jobs land in the
 // slow queue with a delay, so the slow queue looks empty too early.
 let _fastActive = 0, _slowActive = 0;
+// Tracks which users had jobs in the current run so system-level "all done"
+// messages can be written to each of their log files.
+const _runUserIds = new Set();
 
 async function _checkAllDone() {
   // Cheap early-exit: workers are still processing
@@ -774,19 +787,21 @@ async function _checkAllDone() {
   if (fc.waiting + fc.delayed + fc.active === 0 &&
       sc.waiting + sc.delayed + sc.active === 0) {
     wlog('[Workers] All jobs done — flushing pending OnBuy batches immediately');
-    onbuyUpdater.flushAll();
+    for (const uid of _runUserIds) logToUser(uid, '[Workers] All jobs done — flushing pending OnBuy batches immediately');
+    onbuyUpdater.flushAll(_runUserIds);
+    _runUserIds.clear();
   }
 }
 
-fastWorker.on('active',    () => { _fastActive++; });
-fastWorker.on('drained',   () => { _checkAllDone(); });
-fastWorker.on('completed', () => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
-fastWorker.on('failed',    () => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
+fastWorker.on('active',    (job) => { _fastActive++; if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
+fastWorker.on('drained',   ()    => { _checkAllDone(); });
+fastWorker.on('completed', ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
+fastWorker.on('failed',    ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
 
-slowWorker.on('active',    () => { _slowActive++; });
-slowWorker.on('drained',   () => { _checkAllDone(); });
-slowWorker.on('completed', () => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
-slowWorker.on('failed',    () => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
+slowWorker.on('active',    (job) => { _slowActive++; if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
+slowWorker.on('drained',   ()    => { _checkAllDone(); });
+slowWorker.on('completed', ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
+slowWorker.on('failed',    ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
 
 wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
 
