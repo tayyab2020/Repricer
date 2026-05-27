@@ -2079,7 +2079,8 @@ function LiveLogsPage() {
     if (esRef.current) esRef.current.close();
     setLines([]);
     setConnected(false);
-    const es = new EventSource(`${API}/pm2-logs?process=${proc}`);
+    const token = localStorage.getItem("repricer_token") || "";
+    const es = new EventSource(`${API}/pm2-logs?process=${proc}&token=${encodeURIComponent(token)}`);
     es.onopen = () => setConnected(true);
     es.onmessage = e => {
       if (pausedRef.current) return;

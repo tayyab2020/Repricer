@@ -379,7 +379,13 @@ app.get('/api/scraper-logs', requireAuth, (req, res) => {
 // GET /api/pm2-logs?process=worker|api|all — SSE stream of live log output
 // Dev:  tails scraper.log via Node.js fsWatch (Windows-compatible, no PM2 needed)
 // Prod: tails PM2 log files via `tail -f`
-app.get('/api/pm2-logs', requireAuth, (req, res) => {
+app.get('/api/pm2-logs', (req, res, next) => {
+  // EventSource cannot send headers — accept token as query param for this SSE route
+  if (req.query.token && !req.headers.authorization) {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  next();
+}, requireAuth, (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection',    'keep-alive');
