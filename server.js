@@ -386,17 +386,17 @@ app.get('/api/pm2-logs', (req, res, next) => {
   }
   next();
 }, requireAuth, (req, res) => {
-  res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('Content-Type',        'text/event-stream');
+  res.setHeader('Cache-Control',       'no-cache');
+  res.setHeader('Connection',          'keep-alive');
+  res.setHeader('X-Accel-Buffering',   'no');  // disable nginx proxy buffering for SSE
   res.flushHeaders();
 
   const send = (line, source) => {
-    // Use timestamp embedded in log line (e.g. [2026-05-24T12:54:10.037Z]) so the
-    // UI shows when the event actually happened, not when it was streamed.
     const match = line.match(/\[(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\]/);
     const ts = match ? match[1] : new Date().toISOString();
     res.write(`data: ${JSON.stringify({ ts, line, source })}\n\n`);
+    if (typeof res.flush === 'function') res.flush(); // flush if compression middleware present
   };
 
   // Windows = local dev (no PM2/tail); Linux = production VPS
