@@ -71,6 +71,20 @@ export async function runRepricerJob({ userId = null } = {}) {
     }
     console.log(`[Job] ${mappings.length} active mapping(s) to enqueue`);
 
+    // Load settings for each user so workers can apply the correct fee/ROI/proxy per job
+    const userIds = [...new Set(mappings.map(m => m.user_id).filter(Boolean))];
+    const userSettingsMap = {};
+    if (userIds.length) {
+      const { rows: sRows } = await db.query(
+        `SELECT user_id, key, value FROM settings WHERE user_id = ANY($1)`,
+        [userIds]
+      );
+      for (const r of sRows) {
+        if (!userSettingsMap[r.user_id]) userSettingsMap[r.user_id] = {};
+        userSettingsMap[r.user_id][r.key] = r.value;
+      }
+    }
+
     const tokenCache = {}, siteCache = {}, credCache = {};
     for (const m of mappings) {
       const aid = m.onbuy_account_id;
@@ -111,9 +125,17 @@ export async function runRepricerJob({ userId = null } = {}) {
 
       if (!token) { skippedNoToken++; continue; }
 
+      const us = userSettingsMap[mapping.user_id] || {};
+      const userSettings = {
+        feeRate:       us.onbuy_fee_percent   ? parseFloat(us.onbuy_fee_percent)   / 100 : null,
+        defaultRoi:    us.default_roi_percent ? parseFloat(us.default_roi_percent)        : null,
+        minRoiPercent: us.min_roi_percent     ? parseFloat(us.min_roi_percent)            : null,
+        proxyApiUrl:   us.webshare_proxy_api  || null,
+      };
+
       jobs.push({
         name: 'scrape',
-        data: { mapping, token, siteId, consumerKey: creds?.consumerKey, secretKey: creds?.secretKey },
+        data: { mapping, token, siteId, consumerKey: creds?.consumerKey, secretKey: creds?.secretKey, userSettings },
         opts: {
           jobId:            `fast-${mapping.id}`,
           removeOnComplete: true,

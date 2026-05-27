@@ -1349,10 +1349,11 @@ const INTERVAL_OPTIONS = [
   { value: "720", label: "Every 12 hours" },
 ];
 
-function SettingsPage({ onIntervalChange }) {
+function SettingsPage({ onIntervalChange, onStartTimeChange }) {
   const [proxyUrl,   setProxyUrl]   = useState("");
   const [feePercent, setFeePercent] = useState("15");
   const [defaultRoi, setDefaultRoi] = useState("20");
+  const [minRoi,     setMinRoi]     = useState("0");
   const [interval,   setInterval]   = useState("30");
   const [startTime,  setStartTime]  = useState("00:00");
   const [status,     setStatus]     = useState(null);
@@ -1364,6 +1365,7 @@ function SettingsPage({ onIntervalChange }) {
       setProxyUrl(s.webshare_proxy_api      || "");
       setFeePercent(s.onbuy_fee_percent     || "15");
       setDefaultRoi(s.default_roi_percent   || "20");
+      setMinRoi(s.min_roi_percent           || "0");
       setInterval(s.job_interval_minutes    || "30");
       setStartTime(s.job_start_time         || "00:00");
       setStatus(s._proxy_status);
@@ -1379,6 +1381,7 @@ function SettingsPage({ onIntervalChange }) {
           webshare_proxy_api:  proxyUrl,
           onbuy_fee_percent:   feePercent,
           default_roi_percent: defaultRoi,
+          min_roi_percent:     minRoi,
           job_interval_minutes: interval,
           job_start_time:      startTime,
         }),
@@ -1386,7 +1389,8 @@ function SettingsPage({ onIntervalChange }) {
       setStatus(s._proxy_status);
       const proxyMsg = s._proxy_status?.count > 0 ? ` · ${s._proxy_status.count} proxies loaded` : "";
       setMsg({ ok: true, text: `Settings saved${proxyMsg}` });
-      if (onIntervalChange) onIntervalChange(parseInt(interval));
+      if (onIntervalChange)   onIntervalChange(parseInt(interval));
+      if (onStartTimeChange)  onStartTimeChange(startTime || "00:00");
     } catch (e) {
       setMsg({ ok: false, text: e.message });
     } finally { setSaving(false); }
@@ -1510,6 +1514,27 @@ function SettingsPage({ onIntervalChange }) {
             </div>
           </div>
 
+          <div>
+            <p style={{ color: C.textDim, fontSize: 12, marginBottom: 6 }}>
+              Minimum ROI % <span style={{ color: C.muted }}>(winning-price floor)</span>
+            </p>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input
+                style={numInp}
+                type="number"
+                min="0"
+                max="9999"
+                step="0.1"
+                value={minRoi}
+                onChange={e => setMinRoi(e.target.value)}
+              />
+              <span style={{ color: C.textDim, fontSize: 14 }}>%</span>
+            </div>
+            <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>
+              If the winning price yields ROI below this, use the min-ROI price instead. 0 = disabled.
+            </p>
+          </div>
+
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
             padding: "10px 14px", fontSize: 12, color: C.textDim }}>
             Example: Amazon £10.00 · ROI {defaultRoi || 20}% · Fee {feePercent || 15}%
@@ -1586,8 +1611,9 @@ export default function App() {
   const [queueBusy, setQueueBusy]   = useState(false);
   const [queueCounts, setQueueCounts] = useState(null);
   const [chartMapping, setChartMapping] = useState(null);
-  const [jobInterval, setJobInterval] = useState(null);
-  const [defaultRoi, setDefaultRoi]   = useState(20);
+  const [jobInterval, setJobInterval]     = useState(null);
+  const [jobStartTime, setJobStartTime]   = useState("00:00");
+  const [defaultRoi, setDefaultRoi]       = useState(20);
 
   // ── Auth state ──────────────────────────────
   const [authToken,    setAuthToken]    = useState(() => localStorage.getItem("repricer_token"));
@@ -1643,8 +1669,9 @@ export default function App() {
     loadDashboard();
     api("/settings").then(s => {
       if (!s) return;
-      if (s.job_interval_minutes)  setJobInterval(parseInt(s.job_interval_minutes));
-      if (s.default_roi_percent)   setDefaultRoi(parseFloat(s.default_roi_percent));
+      if (s.job_interval_minutes !== undefined) setJobInterval(parseInt(s.job_interval_minutes));
+      if (s.job_start_time       !== undefined) setJobStartTime(s.job_start_time || "00:00");
+      if (s.default_roi_percent)                setDefaultRoi(parseFloat(s.default_roi_percent));
     }).catch(() => {});
   }, [authToken, loadDashboard]);
 
@@ -1766,9 +1793,11 @@ export default function App() {
           <p style={{ color: queueBusy ? C.amber : C.muted, fontSize:10, textAlign:"center", marginTop:8 }}>
             {queueBusy
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
-              : jobInterval
-                ? `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`
-                : "Auto-runs every 30 min"}
+              : jobInterval === null
+                ? "Schedule not set"
+                : jobInterval === 0
+                  ? `Once daily at ${jobStartTime || "00:00"}`
+                  : `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`}
           </p>
 
           {/* User info + logout */}
@@ -1817,7 +1846,7 @@ export default function App() {
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
-        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} />}
+        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
         {page === "chart"          && chartMapping && (

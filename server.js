@@ -1317,10 +1317,13 @@ async function runMigrations() {
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS target_price DECIMAL(10,2) DEFAULT NULL`,
     // settings: generic key-value store for user-configurable options
     `CREATE TABLE IF NOT EXISTS settings (
-       key        TEXT PRIMARY KEY,
+       key        TEXT,
        value      TEXT,
        updated_at TIMESTAMP DEFAULT NOW()
      )`,
+    // per-user settings: drop old single-key PK, add user_id FK
+    `ALTER TABLE settings DROP CONSTRAINT IF EXISTS settings_pkey`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE`,
     // import audit log
     `CREATE TABLE IF NOT EXISTS import_logs (
        id           SERIAL PRIMARY KEY,
@@ -1385,6 +1388,8 @@ async function runMigrations() {
     }
     await db.query(`UPDATE onbuy_accounts   SET user_id = $1 WHERE user_id IS NULL`, [adminId]);
     await db.query(`UPDATE product_mappings SET user_id = $1 WHERE user_id IS NULL`, [adminId]);
+    await db.query(`UPDATE settings         SET user_id = $1 WHERE user_id IS NULL`, [adminId]);
+    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS settings_user_key_idx ON settings (key, user_id)`);
   } catch (e) {
     console.warn('[Migration] Super admin setup:', e.message);
   }
@@ -1398,12 +1403,16 @@ async function runMigrations() {
 
 async function loadSettingsFromDb() {
   try {
-    const { rows } = await db.query('SELECT key, value FROM settings');
-    const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-    if (s.webshare_proxy_api)   setProxyApiUrl(s.webshare_proxy_api);
-    if (s.onbuy_fee_percent)    _globalSettings.feeRate    = parseFloat(s.onbuy_fee_percent) / 100;
-    if (s.default_roi_percent)  _globalSettings.defaultRoi = parseFloat(s.default_roi_percent);
-    console.log(`[Settings] Fee: ${(_globalSettings.feeRate * 100).toFixed(1)}%  ROI: ${_globalSettings.defaultRoi}%`);
+    // Load super admin's proxy URL so the server process can show proxy status
+    const { rows } = await db.query(`
+      SELECT s.key, s.value FROM settings s
+      JOIN users u ON u.id = s.user_id AND u.role = 'super_admin'
+      WHERE s.key = 'webshare_proxy_api'
+      LIMIT 1
+    `);
+    const proxyUrl = rows[0]?.value;
+    if (proxyUrl) setProxyApiUrl(proxyUrl);
+    console.log(`[Settings] Proxy: ${proxyUrl ? 'set' : 'not set'}`);
   } catch (e) {
     console.warn('[Settings] Could not load from DB:', e.message);
   }
@@ -1411,40 +1420,38 @@ async function loadSettingsFromDb() {
 
 app.get('/api/settings', requireAuth, async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT key, value FROM settings');
+    const { rows } = await db.query(
+      'SELECT key, value FROM settings WHERE user_id = $1',
+      [req.effectiveUserId]
+    );
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
+    // Load proxy for status display if this user has one configured
+    if (s.webshare_proxy_api) setProxyApiUrl(s.webshare_proxy_api);
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
-  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'job_interval_minutes', 'job_start_time'];
+app.put('/api/settings', requireAuth, async (req, res) => {
+  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time'];
+  const uid = req.effectiveUserId;
   try {
     for (const key of allowed) {
       if (!(key in req.body)) continue;
       const value = req.body[key] != null && req.body[key] !== '' ? String(req.body[key]) : null;
       if (value) {
         await db.query(
-          `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
-           ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
-          [key, value]
+          `INSERT INTO settings (key, value, user_id, updated_at) VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (key, user_id) DO UPDATE SET value = $2, updated_at = NOW()`,
+          [key, value, uid]
         );
       } else {
-        await db.query('DELETE FROM settings WHERE key = $1', [key]);
+        await db.query('DELETE FROM settings WHERE key = $1 AND user_id = $2', [key, uid]);
       }
-      if (key === 'webshare_proxy_api') {
-        setProxyApiUrl(value);
-      } else if (key === 'onbuy_fee_percent') {
-        _globalSettings.feeRate = (value ? parseFloat(value) : 15) / 100;
-      } else if (key === 'default_roi_percent') {
-        _globalSettings.defaultRoi = value ? parseFloat(value) : 20;
-      }
-      // job_interval_minutes and job_start_time are saved to DB;
-      // the worker process (repricerJob.js) reads them on its next startup.
+      if (key === 'webshare_proxy_api') setProxyApiUrl(value);
     }
-    const { rows } = await db.query('SELECT key, value FROM settings');
+    const { rows } = await db.query('SELECT key, value FROM settings WHERE user_id = $1', [uid]);
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-    // Notify worker process to reload settings immediately (no PM2 restart needed)
+    // Notify worker process to reload schedules/settings immediately
     redisPub.publish('repricer:settings-updated', '1').catch(() => {});
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }

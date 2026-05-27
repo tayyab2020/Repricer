@@ -29,6 +29,7 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
+import https from 'https';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue, getTokenForAccount } from './jobProducer.js';
 
@@ -95,13 +96,13 @@ class OnBuyUpdater {
     return t;
   }
 
-  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey } = {}) {
+  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey, amazonPrice = null, mappingId = null, minPrice = null, feeRate = null, minRoiPercent = null } = {}) {
     return new Promise((resolve, reject) => {
       const token = this._resolveToken(rawToken);
       const key   = `${token}||${siteId}||${isSku ? '1' : '0'}`;
       if (!this._batches.has(key)) this._batches.set(key, []);
       const batch = this._batches.get(key);
-      batch.push({ token, siteId, identifier, isSku, price, resolve, reject });
+      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, resolve, reject });
       // Store credentials under the resolved token (and under rawToken as fallback)
       if (consumerKey && secretKey) {
         if (!this._creds.has(token))    this._creds.set(token,    { consumerKey, secretKey });
@@ -128,6 +129,61 @@ class OnBuyUpdater {
       .catch(err => wlog(`[OnBuyUpdater] Unhandled flush error:`, err.message));
   }
 
+  // Called when all queue jobs are done — flushes every pending batch immediately
+  // rather than waiting for the 5-minute collection window to expire.
+  flushAll() {
+    let pending = 0;
+    for (const [key, batch] of this._batches) {
+      if (batch.length === 0) continue;
+      pending += batch.length;
+      if (this._timers.has(key)) { clearTimeout(this._timers.get(key)); this._timers.delete(key); }
+      this._enqueueFlush(key);
+    }
+    if (pending === 0) wlog('[OnBuyUpdater] flushAll: no pending updates (all prices unchanged or skipped)');
+    else wlog(`[OnBuyUpdater] flushAll: ${pending} item(s) queued for immediate dispatch`);
+  }
+
+  // GET /v2/listings/check-winning — returns lead price + winning status per SKU
+  // Uses https.request() (Node built-in) because fetch / node-fetch / undici.fetch
+  // all follow the WHATWG spec and throw for GET requests that carry a body.
+  _checkWinning(token, siteId, skus) {
+    return new Promise((resolve) => {
+      const bodyBuf = Buffer.from(JSON.stringify({ site_id: parseInt(siteId), skus }), 'utf8');
+      const req = https.request(
+        {
+          hostname: 'api.onbuy.com',
+          path: '/v2/listings/check-winning',
+          method: 'GET',
+          headers: {
+            Authorization: token,
+            'Content-Type': 'application/json',
+            'Content-Length': bodyBuf.length,
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => {
+            try {
+              if (res.statusCode !== 200) {
+                wlog(`[CheckWinning] HTTP ${res.statusCode} — skipping price adjustment`);
+                return resolve(null);
+              }
+              const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+              resolve(data.success && Array.isArray(data.results) ? data.results : null);
+            } catch (e) {
+              wlog(`[CheckWinning] Parse error:`, e.message);
+              resolve(null);
+            }
+          });
+        }
+      );
+      req.on('error', (e) => { wlog(`[CheckWinning] Error:`, e.message); resolve(null); });
+      req.write(bodyBuf);
+      req.end();
+    });
+  }
+
   async _flushBatch(key) {
     const batch = this._batches.get(key);
     if (!batch || batch.length === 0) return;
@@ -144,8 +200,72 @@ class OnBuyUpdater {
     }
     this._rrTs.push(Date.now());
 
-    // ── Batch PUT ──
     const { token, siteId, isSku } = items[0];
+
+    // ── Check-winning: adjust prices for non-winning SKU listings ──
+    if (isSku) {
+      const skus         = items.map(it => it.identifier);
+      const winResults   = await this._checkWinning(token, siteId, skus);
+      if (winResults) {
+        const winMap = new Map(
+          winResults
+            .filter(r => r.lead_price != null)
+            .map(r => [r.sku, { leadPrice: parseFloat(r.lead_price), winning: r.winning }])
+        );
+        let adjusted = 0;
+        for (const item of items) {
+          const winInfo = winMap.get(item.identifier);
+          if (!winInfo) continue;
+          const { leadPrice, winning } = winInfo;
+
+          const effFeeRate = item.feeRate      ?? _onbuyFeeRate;
+          const effMinRoi  = item.minRoiPercent ?? _minRoiPercent;
+
+          let newPrice = item.price;
+
+          // Undercut lead price when not winning and our price is above the lead
+          if (winning === false && item.price > leadPrice) {
+            newPrice = parseFloat((leadPrice - 0.50).toFixed(2));
+          }
+
+          // Always enforce the min-ROI floor — even when winning or when our
+          // price is already at/below the lead.  A stored price can be below the
+          // floor if markup_value was overwritten by a previous run or the user
+          // raised the min-ROI setting after the last sync.
+          if (item.amazonPrice && effMinRoi > 0) {
+            const roiAtPrice  = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
+            if (roiAtPrice < effMinRoi) {
+              const minRoiPrice = parseFloat((item.amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2));
+              wlog(`[CheckWinning] ${item.identifier}: ROI at £${newPrice} = ${roiAtPrice.toFixed(1)}% < min ${effMinRoi}% → floor £${minRoiPrice}`);
+              newPrice = minRoiPrice;
+            }
+          }
+
+          // Per-listing min_price floor
+          if (item.minPrice && newPrice < item.minPrice) newPrice = item.minPrice;
+
+          // Skip if nothing changed
+          if (newPrice === item.price) continue;
+
+          wlog(`[CheckWinning] ${item.identifier}: £${item.price} → £${newPrice} (lead: £${leadPrice}, winning: ${winning})`);
+          item.price = newPrice;
+          adjusted++;
+
+          // Recalculate ROI% and onbuy_fee in DB based on the adjusted price
+          if (item.amazonPrice && item.mappingId) {
+            const newRoi = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
+            const newFee = newPrice * effFeeRate / (1 + effFeeRate);
+            db.query(
+              `UPDATE product_mappings SET markup_value = $1, onbuy_fee = $2 WHERE id = $3`,
+              [parseFloat(newRoi.toFixed(4)), parseFloat(newFee.toFixed(2)), item.mappingId]
+            ).catch(() => {});
+          }
+        }
+        if (adjusted > 0) wlog(`[CheckWinning] Adjusted ${adjusted}/${items.length} prices in this batch`);
+      }
+    }
+
+    // ── Batch PUT ──
     const endpoint   = isSku
       ? `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`
       : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
@@ -158,10 +278,12 @@ class OnBuyUpdater {
       body: JSON.stringify({ listings }),
     });
 
+    wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} payload:`, JSON.stringify({ listings }));
+
     try {
       let res = await doRequest(token);
       let raw = await res.text();
-      wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status}`);
+      wlog(`[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status} response:`, raw.slice(0, 2000));
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
@@ -191,7 +313,7 @@ class OnBuyUpdater {
               }
               res = await doRequest(newToken);
               raw = await res.text();
-              wlog(`[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status}`);
+              wlog(`[OnBuyUpdater] Retry with refreshed token → HTTP ${res.status} response:`, raw.slice(0, 2000));
             }
           } catch (refreshErr) {
             wlog(`[OnBuyUpdater] Token refresh failed:`, refreshErr.message);
@@ -212,7 +334,7 @@ class OnBuyUpdater {
       items.forEach((it, i) => {
         const r = results[i];
         if (r?.success === false) it.reject(new Error(r.message || 'OnBuy rejected update'));
-        else it.resolve(data);
+        else it.resolve({ ...data, _finalPrice: it.price }); // pass adjusted price back to caller
       });
     } catch (err) {
       items.forEach(it => it.reject(err));
@@ -296,20 +418,22 @@ async function resolveUidFromOpc(opc, token, siteId) {
 // PRICE CALCULATION
 // ─────────────────────────────────────────────
 
-let _onbuyFeeRate = 0.15;
-let _defaultRoi   = 20;
+let _onbuyFeeRate  = 0.15;
+let _defaultRoi    = 20;
+let _minRoiPercent = 0;   // 0 = no minimum
 
-export function setRepricerDefaults({ feeRate, defaultRoi } = {}) {
-  if (feeRate   != null) _onbuyFeeRate = Math.min(Math.max(parseFloat(feeRate)   / 100, 0), 0.99);
-  if (defaultRoi != null) _defaultRoi  = parseFloat(defaultRoi);
+export function setRepricerDefaults({ feeRate, defaultRoi, minRoiPercent } = {}) {
+  if (feeRate      != null) _onbuyFeeRate  = Math.min(Math.max(parseFloat(feeRate) / 100, 0), 0.99);
+  if (defaultRoi   != null) _defaultRoi    = parseFloat(defaultRoi);
+  if (minRoiPercent != null) _minRoiPercent = Math.max(0, parseFloat(minRoiPercent));
 }
 
-function computeOnBuyPrice(amazonPrice, markupType, markupValue, minPrice = null) {
+function computeOnBuyPrice(amazonPrice, markupType, markupValue, minPrice = null, feeRate = _onbuyFeeRate) {
   let price;
   if (markupType === 'roi') {
     // P = amazon × (1 + roi/100) × (1 + fee%)
     // e.g. amazon=70, roi=20%, fee=15%: 70 × 1.20 × 1.15 = 96.60
-    price = amazonPrice * (1 + markupValue / 100) * (1 + _onbuyFeeRate);
+    price = amazonPrice * (1 + markupValue / 100) * (1 + feeRate);
   } else if (markupType === 'percent') {
     price = amazonPrice * (1 + markupValue / 100);
   } else if (markupType === 'fixed') {
@@ -346,7 +470,7 @@ function extractOpcFromValue(val) {
 // Called by both workers after scraping completes
 // ─────────────────────────────────────────────
 
-async function applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey } = {}) {
+async function applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings = {} } = {}) {
   const {
     id,
     onbuy_sku,
@@ -360,7 +484,9 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     product_name,
   } = mapping;
 
-  const markup_value = parseFloat(mapping.markup_value) || _defaultRoi;
+  const effFeeRate  = userSettings.feeRate      ?? _onbuyFeeRate;
+  const effMinRoi   = userSettings.minRoiPercent ?? _minRoiPercent;
+  const markup_value = parseFloat(mapping.markup_value) || (userSettings.defaultRoi ?? _defaultRoi);
 
   const label = `${product_name || primary_asin} (#${id})`;
 
@@ -406,12 +532,23 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   }
 
   const amazonPrice   = scraped.price;
-  const newOnBuyPrice = computeOnBuyPrice(amazonPrice, markup_type, markup_value, min_price);
+  const newOnBuyPrice = computeOnBuyPrice(amazonPrice, markup_type, markup_value, min_price, effFeeRate);
   wlog(`[Worker] ${label} — Amazon £${amazonPrice} → OnBuy £${newOnBuyPrice} (${scraped.method})`);
 
   // ── Skip if unchanged ──
-  const alreadyCorrect = last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
+  // Don't skip when the stored price violates the current min-ROI floor — the
+  // floor may have been raised since the last run, and the stored price could
+  // have been written by a previous check-winning adjustment (e.g. markup_value
+  // was overwritten to a negative ROI).
+  const minRoiFloor = effMinRoi > 0
+    ? parseFloat((amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2))
+    : null;
+  const storedBelowFloor = minRoiFloor != null && last_onbuy_price
+    ? parseFloat(last_onbuy_price) < minRoiFloor
+    : false;
+  const alreadyCorrect = !storedBelowFloor && last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
   if (!hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect) {
+    wlog(`[Worker] ⏭  ${label} — price unchanged (Amazon £${amazonPrice}, OnBuy £${newOnBuyPrice}), skipping`);
     await db.query(`UPDATE product_mappings SET last_checked_at = NOW() WHERE id = $1`, [id]);
     return { success: true, skipped: true };
   }
@@ -428,23 +565,31 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   );
 
   const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
-  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice, { consumerKey, secretKey })
-    .then(async () => {
+  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice, {
+    consumerKey, secretKey,
+    amazonPrice,
+    mappingId:    id,
+    minPrice:     min_price ? parseFloat(min_price) : null,
+    feeRate:      effFeeRate !== _onbuyFeeRate  ? effFeeRate  : null,
+    minRoiPercent: effMinRoi !== _minRoiPercent ? effMinRoi   : null,
+  })
+    .then(async (result) => {
+      const finalPrice = result?._finalPrice ?? newOnBuyPrice;
       try {
         await db.query(
           `UPDATE product_mappings SET last_onbuy_price = $1, last_synced_at = NOW() WHERE id = $2`,
-          [newOnBuyPrice, id]
+          [finalPrice, id]
         );
         await Promise.all([
           db.query(
             `INSERT INTO price_history (product_mapping_id, amazon_price, onbuy_price, recorded_at)
              VALUES ($1, $2, $3, NOW())`,
-            [id, amazonPrice, newOnBuyPrice]
+            [id, amazonPrice, finalPrice]
           ),
           db.query(
             `INSERT INTO sync_logs (product_mapping_id, status, message, amazon_price, onbuy_price, created_at)
-             VALUES ($1, 'success', 'Price synced', $2, $3, NOW())`,
-            [id, amazonPrice, newOnBuyPrice]
+             VALUES ($1, 'success', $2, $3, $4, NOW())`,
+            [id, finalPrice !== newOnBuyPrice ? `Price synced (winning adjustment: £${newOnBuyPrice} → £${finalPrice})` : 'Price synced', amazonPrice, finalPrice]
           ),
         ]);
       } catch (dbErr) {
@@ -470,7 +615,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 // ─────────────────────────────────────────────
 
 async function processFastJob(job) {
-  let { mapping, token, siteId, consumerKey, secretKey } = job.data;
+  let { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
 
   // Resolve listing UID from OPC if we only have a raw URL/OPC
   if (!mapping.onbuy_sku && !isValidListingUid(mapping.onbuy_listing_id)) {
@@ -514,7 +659,7 @@ async function processFastJob(job) {
     const delay      = Math.max(5000, Math.min(drainMs, 300000)); // 5 s – 5 min cap
 
     wlog(`[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
-    await slowQueue.add('scrape', { mapping, token, siteId }, {
+    await slowQueue.add('scrape', { mapping, token, siteId, userSettings }, {
       jobId:             `slow-${mapping.id}`,
       delay,
       removeOnComplete:  true,
@@ -525,7 +670,7 @@ async function processFastJob(job) {
     return { escalated: true };
   }
 
-  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey });
+  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
 }
 
 // ─────────────────────────────────────────────
@@ -535,41 +680,28 @@ async function processFastJob(job) {
 // ─────────────────────────────────────────────
 
 async function processSlowJob(job) {
-  const { mapping, token, siteId, consumerKey, secretKey } = job.data;
+  const { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
   const scraped = await scrapeProductSlow(mapping.primary_asin);
-  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey });
+  return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
 }
 
 // ─────────────────────────────────────────────
-// SCHEDULER STATE  (declared before bootstrap so setSchedule() can be called
-// inside the top-level await block without a TDZ error)
-// ─────────────────────────────────────────────
-
-let _intervalMinutes = 30;
-let _startTime       = '00:00';
-let _activeCron      = null;
-
-// ─────────────────────────────────────────────
-// BOOTSTRAP SETTINGS  (top-level await — runs before workers are created)
-// Loads proxy URL, fee rate, and schedule from DB so that any BullMQ jobs
-// already sitting in Redis are processed with the correct configuration.
+// BOOTSTRAP  (top-level await — runs before workers start)
+// Pre-loads super-admin proxy URL so any jobs already in Redis use the
+// correct scraper config.  Per-user pricing settings travel with each
+// job in job.data.userSettings; global fallbacks remain as defaults.
 // ─────────────────────────────────────────────
 
 try {
-  const { rows } = await db.query('SELECT key, value FROM settings');
+  const { rows } = await db.query(`
+    SELECT s.key, s.value FROM settings s
+    JOIN users u ON u.id = s.user_id AND u.role = 'super_admin'
+  `);
   const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-  if (s.webshare_proxy_api)    setProxyApiUrl(s.webshare_proxy_api);
-  if (s.onbuy_fee_percent)     setRepricerDefaults({ feeRate:    parseFloat(s.onbuy_fee_percent) });
-  if (s.default_roi_percent)   setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
-  if (s.job_interval_minutes || s.job_start_time) {
-    setSchedule({
-      intervalMinutes: s.job_interval_minutes ? parseInt(s.job_interval_minutes) : undefined,
-      startTime:       s.job_start_time       || undefined,
-    });
-  }
-  wlog(`[RepricerJob] Settings pre-loaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}  fee: ${s.onbuy_fee_percent || 15}%  interval: ${s.job_interval_minutes || 30}min  start: ${s.job_start_time || '00:00'}`);
+  if (s.webshare_proxy_api) setProxyApiUrl(s.webshare_proxy_api);
+  wlog(`[RepricerJob] Bootstrap — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
 } catch (e) {
-  wlog('[RepricerJob] Could not pre-load settings from DB:', e.message);
+  wlog('[RepricerJob] Could not bootstrap settings:', e.message);
 }
 
 // ─────────────────────────────────────────────
@@ -595,98 +727,144 @@ slowWorker.on('failed', (job, err) =>
   wlog(`[SlowWorker] ❌ job ${job?.id} failed: ${err.message}`)
 );
 
+// ── Flush pending batches immediately when all jobs finish ──
+// Uses live queue counts (waiting + delayed + active) rather than the
+// `drained` event, because `drained` fires when there are no *waiting*
+// jobs but ignores *delayed* ones — escalated Puppeteer jobs land in the
+// slow queue with a delay, so the slow queue looks empty too early.
+let _fastActive = 0, _slowActive = 0;
+
+async function _checkAllDone() {
+  // Cheap early-exit: workers are still processing
+  if (_fastActive > 0 || _slowActive > 0) return;
+
+  const [fc, sc] = await Promise.all([
+    fastQueue.getJobCounts('waiting', 'delayed', 'active'),
+    slowQueue.getJobCounts('waiting', 'delayed', 'active'),
+  ]);
+
+  if (fc.waiting + fc.delayed + fc.active === 0 &&
+      sc.waiting + sc.delayed + sc.active === 0) {
+    wlog('[Workers] All jobs done — flushing pending OnBuy batches immediately');
+    onbuyUpdater.flushAll();
+  }
+}
+
+fastWorker.on('active',    () => { _fastActive++; });
+fastWorker.on('drained',   () => { _checkAllDone(); });
+fastWorker.on('completed', () => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
+fastWorker.on('failed',    () => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
+
+slowWorker.on('active',    () => { _slowActive++; });
+slowWorker.on('drained',   () => { _checkAllDone(); });
+slowWorker.on('completed', () => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
+slowWorker.on('failed',    () => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
+
 wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
 
 // ─────────────────────────────────────────────
-// SCHEDULER
-// Dynamic interval + start-time gate
+// PER-USER SCHEDULER
+// Each active user gets their own cron derived
+// from their job_interval_minutes / job_start_time
+// settings.  refreshSchedules() is called on
+// startup and whenever settings change.
 // ─────────────────────────────────────────────
 
-export function setSchedule({ intervalMinutes, startTime } = {}) {
-  if (intervalMinutes != null) _intervalMinutes = Math.max(0, parseInt(intervalMinutes) ?? 30);
-  if (startTime       != null && /^\d{1,2}:\d{2}$/.test(startTime)) _startTime = startTime;
-  _applySchedule();
-}
-
-function _isAfterStartTime() {
-  const [h, m] = _startTime.split(':').map(Number);
-  const now = new Date();
-  return now.getHours() * 60 + now.getMinutes() >= h * 60 + m;
-}
+const _userCrons = new Map(); // userId → { task, intervalMinutes, startTime }
 
 function _cronPattern(minutes) {
-  if (minutes < 60) return `*/${minutes} * * * *`;          // e.g. 30 → */30 * * * *
-  return `0 */${Math.round(minutes / 60)} * * *`;            // e.g. 120 → 0 */2 * * *
+  if (minutes < 60) return `*/${minutes} * * * *`;
+  return `0 */${Math.round(minutes / 60)} * * *`;
 }
 
-// Re-read all settings from DB and apply them in this worker process.
-// Called before every run so changes made via the Settings UI take effect
-// without requiring a worker restart.
-async function reloadSettings({ log = false } = {}) {
+async function refreshSchedules() {
   try {
-    const { rows } = await db.query('SELECT key, value FROM settings');
-    const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-    setProxyApiUrl(s.webshare_proxy_api || null);
-    if (s.onbuy_fee_percent)   setRepricerDefaults({ feeRate:    parseFloat(s.onbuy_fee_percent) });
-    if (s.default_roi_percent) setRepricerDefaults({ defaultRoi: parseFloat(s.default_roi_percent) });
-    if (log) wlog(`[RepricerJob] Settings reloaded — proxy: ${s.webshare_proxy_api ? 'set' : 'not set'}`);
-  } catch (e) {
-    wlog('[RepricerJob] Could not reload settings:', e.message);
-  }
-}
+    const { rows } = await db.query(`
+      SELECT u.id,
+             MAX(CASE WHEN s.key = 'job_interval_minutes' THEN s.value END) AS interval_minutes,
+             MAX(CASE WHEN s.key = 'job_start_time'       THEN s.value END) AS start_time,
+             MAX(CASE WHEN s.key = 'webshare_proxy_api'   THEN s.value END) AS proxy_url
+      FROM users u
+      LEFT JOIN settings s ON s.user_id = u.id
+        AND s.key IN ('job_interval_minutes', 'job_start_time', 'webshare_proxy_api')
+      WHERE u.is_active = true
+      GROUP BY u.id
+    `);
 
-function _applySchedule() {
-  if (_activeCron) { _activeCron.stop(); _activeCron = null; }
+    const seen = new Set();
+    for (const user of rows) {
+      const intervalMinutes = Math.max(0, parseInt(user.interval_minutes || '30'));
+      const startTime       = user.start_time || '00:00';
+      seen.add(user.id);
 
-  let pattern;
-  if (_intervalMinutes === 0) {
-    // "No interval" — fire exactly once daily at the configured start time
-    const [h, m] = _startTime.split(':').map(Number);
-    pattern = `${m} ${h} * * *`;
-  } else {
-    pattern = _cronPattern(_intervalMinutes);
-  }
+      const existing = _userCrons.get(user.id);
+      if (existing?.intervalMinutes === intervalMinutes && existing?.startTime === startTime) continue;
+      if (existing) existing.task.stop();
 
-  _activeCron = cron.schedule(pattern, async () => {
-    // For interval mode, skip ticks that fall before the daily start time
-    if (_intervalMinutes > 0 && !_isAfterStartTime()) {
-      wlog(`[Scheduler] Before start time ${_startTime} — skipping tick`);
-      return;
+      const [h, m] = startTime.split(':').map(Number);
+      const pattern = intervalMinutes === 0
+        ? `${m} ${h} * * *`
+        : _cronPattern(intervalMinutes);
+
+      const uid = user.id;
+      const task = cron.schedule(pattern, () => {
+        if (intervalMinutes > 0) {
+          const now = new Date();
+          if (now.getHours() * 60 + now.getMinutes() < h * 60 + m) {
+            wlog(`[Scheduler] User #${uid}: before start time ${startTime} — skipping`);
+            return;
+          }
+        }
+        runRepricerJob({ userId: uid });
+      });
+
+      _userCrons.set(uid, { task, intervalMinutes, startTime });
+      const desc = intervalMinutes === 0
+        ? `once daily at ${startTime}`
+        : `every ${intervalMinutes}min from ${startTime}`;
+      wlog(`[Scheduler] User #${uid}: "${pattern}" — ${desc}`);
     }
-    await reloadSettings({ log: true });
-    runRepricerJob();
-  });
 
-  const desc = _intervalMinutes === 0
-    ? `once daily at ${_startTime}`
-    : `every ${_intervalMinutes}min from ${_startTime}`;
-  wlog(`[Scheduler] ✅ Pattern: "${pattern}"  Schedule: ${desc}`);
+    // Stop crons for users that have been deactivated or deleted
+    for (const [uid, entry] of _userCrons) {
+      if (!seen.has(uid)) { entry.task.stop(); _userCrons.delete(uid); }
+    }
+  } catch (e) {
+    wlog('[Scheduler] Error refreshing schedules:', e.message);
+  }
 }
 
-// Called by server.js after settings are loaded from DB, so proxy URL / fee rate
-// are already configured before the first repricer run fires.
-export function startScheduler() {
-  if (_isAfterStartTime()) reloadSettings().then(() => runRepricerJob());
-  _applySchedule();
+export async function startScheduler() {
+  await refreshSchedules();
+  // Immediately run any user whose start time has already passed today
+  for (const [uid, { intervalMinutes, startTime }] of _userCrons) {
+    if (intervalMinutes > 0) {
+      const [h, m] = startTime.split(':').map(Number);
+      const now = new Date();
+      if (now.getHours() * 60 + now.getMinutes() >= h * 60 + m) {
+        runRepricerJob({ userId: uid });
+      }
+    }
+  }
 }
 
 export { fastWorker, slowWorker };
 
-// Start the scheduler now that workers and settings are ready.
+// Start the per-user scheduler.
 startScheduler();
 
 // Subscribe to settings-change events published by the API server.
-// Changes from the Settings UI take effect immediately without a PM2 restart.
+// Refreshes per-user crons immediately when any user saves settings.
 redisSub.subscribe('repricer:settings-updated', (err) => {
   if (err) wlog('[RepricerJob] Could not subscribe to settings channel:', err.message);
   else     wlog('[RepricerJob] Subscribed to repricer:settings-updated');
 });
 redisSub.on('message', (channel) => {
   if (channel === 'repricer:settings-updated') {
-    wlog('[RepricerJob] Settings change detected — reloading from DB');
-    reloadSettings({ log: true });
+    wlog('[RepricerJob] Settings change detected — refreshing schedules');
+    refreshSchedules();
   }
 });
 
-// 60-second poll as fallback in case a pub/sub message is missed.
-setInterval(reloadSettings, 60_000);
+// 5-minute fallback poll in case a pub/sub message is missed.
+setInterval(refreshSchedules, 5 * 60_000);
