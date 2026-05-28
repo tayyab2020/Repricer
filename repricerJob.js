@@ -125,8 +125,9 @@ class OnBuyUpdater {
       const key   = `${token}||${siteId}||${isSku ? '1' : '0'}`;
       if (!this._batches.has(key)) this._batches.set(key, []);
       const batch = this._batches.get(key);
-      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, userId, resolve, reject });
-      // Store credentials under the resolved token (and under rawToken as fallback)
+      // Store consumerKey/secretKey directly in the item so they survive even if
+      // _creds is empty (e.g. after a worker restart clears in-memory state).
+      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, userId, consumerKey: consumerKey || null, secretKey: secretKey || null, resolve, reject });
       if (consumerKey && secretKey) {
         if (!this._creds.has(token))    this._creds.set(token,    { consumerKey, secretKey });
         if (!this._creds.has(rawToken)) this._creds.set(rawToken, { consumerKey, secretKey });
@@ -315,7 +316,11 @@ class OnBuyUpdater {
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
-        const creds = this._creds.get(token) || this._creds.get(items[0].token);
+        // Creds are stored in _creds (by token), but also directly in each item
+        // as a fallback for when _creds was cleared by a worker restart.
+        const creds = this._creds.get(token)
+                   || this._creds.get(items[0].token)
+                   || (items[0].consumerKey ? { consumerKey: items[0].consumerKey, secretKey: items[0].secretKey } : null);
         if (creds) {
           ulog(batchUserId, `[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
           try {
@@ -346,6 +351,8 @@ class OnBuyUpdater {
           } catch (refreshErr) {
             ulog(batchUserId, `[OnBuyUpdater] Token refresh failed:`, refreshErr.message);
           }
+        } else {
+          ulog(batchUserId, `[OnBuyUpdater] Token expired (401) but no credentials available to refresh — check OnBuy account setup`);
         }
       }
 
@@ -774,10 +781,17 @@ let _fastActive = 0, _slowActive = 0;
 // Tracks which users had jobs in the current run so system-level "all done"
 // messages can be written to each of their log files.
 const _runUserIds = new Set();
+let _retryScheduled   = false;      // true after first completion — prevents double-retry until next cron tick
+const _retryPendingFor = new Set(); // userIds with active retry jobs currently in queue
+// Initialized to 24 h ago so a restart with an existing queue catches pre-restart failures.
+// The cron callback resets this to null before each fresh scheduled run.
+let _runStartTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
 async function _checkAllDone() {
   // Cheap early-exit: workers are still processing
   if (_fastActive > 0 || _slowActive > 0) return;
+  // Guard: retry already scheduled/done for this run — nothing more to do until next cron tick
+  if (_retryScheduled && _retryPendingFor.size === 0) return;
 
   const [fc, sc] = await Promise.all([
     fastQueue.getJobCounts('waiting', 'delayed', 'active'),
@@ -786,19 +800,94 @@ async function _checkAllDone() {
 
   if (fc.waiting + fc.delayed + fc.active === 0 &&
       sc.waiting + sc.delayed + sc.active === 0) {
+
+    if (_retryPendingFor.size > 0) {
+      // Retry run just finished — flush its batches and mark the run fully done
+      wlog('[Workers] Retry run completed — flushing remaining OnBuy batches');
+      for (const uid of _runUserIds) logToUser(uid, '[Workers] Retry run completed');
+      onbuyUpdater.flushAll(_runUserIds);
+      _retryPendingFor.clear();
+      _runStartTime = null;
+      _runUserIds.clear();
+      return;
+    }
+
+    // Main run finished — flush batches, then schedule one automatic retry pass
     wlog('[Workers] All jobs done — flushing pending OnBuy batches immediately');
     for (const uid of _runUserIds) logToUser(uid, '[Workers] All jobs done — flushing pending OnBuy batches immediately');
     onbuyUpdater.flushAll(_runUserIds);
+
+    _retryScheduled = true;
+    const runUserIds = [..._runUserIds];
+    const runStart   = _runStartTime;
     _runUserIds.clear();
+    // Wait for all OnBuy batches to send + a brief window for sync_logs DB writes to land
+    onbuyUpdater._mutex
+      .then(() => new Promise(r => setTimeout(r, 5000)))
+      .then(() => _scheduleRetry(runUserIds, runStart))
+      .catch(err => wlog('[Retry] Scheduling error:', err.message));
   }
 }
 
-fastWorker.on('active',    (job) => { _fastActive++; if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
+// Query sync_logs for failures since runStart and re-enqueue those mappings once.
+// Covers both OnBuy 401 errors and Amazon scrape failures (all_methods_failed, etc.).
+async function _scheduleRetry(userIds, runStart) {
+  if (!runStart || !userIds.length) return;
+  const retries = [];
+  for (const userId of userIds) {
+    try {
+      const { rows } = await db.query(`
+        SELECT DISTINCT sl.product_mapping_id
+        FROM sync_logs sl
+        JOIN product_mappings pm ON pm.id = sl.product_mapping_id
+        WHERE sl.status = 'failed'
+          AND sl.created_at >= $2
+          AND pm.user_id = $1
+          AND pm.is_active = true
+          AND NOT EXISTS (
+            SELECT 1 FROM sync_logs s2
+            WHERE s2.product_mapping_id = sl.product_mapping_id
+              AND s2.status = 'success'
+              AND s2.created_at >= $2
+          )
+      `, [userId, runStart]);
+      if (rows.length > 0) {
+        retries.push({ userId, ids: rows.map(r => r.product_mapping_id) });
+      } else {
+        ulog(userId, '[Retry] No failed listings to retry');
+      }
+    } catch (err) {
+      ulog(userId, '[Retry] Error querying failures:', err.message);
+    }
+  }
+
+  if (retries.length === 0) return; // _retryScheduled stays true — guard holds until next cron tick
+
+  // Populate _retryPendingFor BEFORE enqueuing so the _checkAllDone guard holds
+  // even if workers pick up the first retry job before all runRepricerJob calls complete.
+  for (const { userId } of retries) _retryPendingFor.add(userId);
+
+  await Promise.all(retries.map(async ({ userId, ids }) => {
+    ulog(userId, `[Retry] ${ids.length} failed listing(s) — retrying once`);
+    try {
+      await runRepricerJob({ userId, mappingIds: ids, log: (...args) => ulog(userId, ...args) });
+    } catch (err) {
+      ulog(userId, '[Retry] runRepricerJob error:', err.message);
+      _retryPendingFor.delete(userId);
+    }
+  }));
+
+  // If all enqueues failed or produced no jobs, trigger a completion check so
+  // _retryPendingFor doesn't stay non-empty indefinitely.
+  if (_retryPendingFor.size > 0) setTimeout(_checkAllDone, 2000);
+}
+
+fastWorker.on('active',    (job) => { _fastActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
 fastWorker.on('drained',   ()    => { _checkAllDone(); });
 fastWorker.on('completed', ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
 fastWorker.on('failed',    ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
 
-slowWorker.on('active',    (job) => { _slowActive++; if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
+slowWorker.on('active',    (job) => { _slowActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
 slowWorker.on('drained',   ()    => { _checkAllDone(); });
 slowWorker.on('completed', ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
 slowWorker.on('failed',    ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
@@ -858,6 +947,10 @@ async function refreshSchedules() {
             return;
           }
         }
+        // Reset retry state so this new run gets its own retry pass
+        _retryScheduled = false;
+        _retryPendingFor.clear();
+        _runStartTime = null;
         runRepricerJob({ userId: uid, log: (...args) => ulog(uid, ...args) });
       });
 

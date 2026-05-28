@@ -43,15 +43,23 @@ export async function getTokenForAccount(account) {
   }
 }
 
-export async function runRepricerJob({ userId = null, log = null } = {}) {
+export async function runRepricerJob({ userId = null, mappingIds = null, log = null } = {}) {
   const jlog = log ?? ((...a) => console.log(`[${new Date().toISOString()}]`, ...a));
   jlog('\n' + '═'.repeat(60));
-  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}`);
+  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}${mappingIds?.length ? ` — retrying ${mappingIds.length} mapping(s)` : ''}`);
   jlog('═'.repeat(60));
 
   try {
-    const userClause  = userId ? `AND pm.user_id = $1` : '';
-    const queryParams = userId ? [userId] : [];
+    const conditions  = ['pm.is_active = true'];
+    const queryParams = [];
+    if (userId) {
+      queryParams.push(userId);
+      conditions.push(`pm.user_id = $${queryParams.length}`);
+    }
+    if (mappingIds?.length) {
+      queryParams.push(mappingIds);
+      conditions.push(`pm.id = ANY($${queryParams.length})`);
+    }
 
     const { rows: mappings } = await db.query(`
       SELECT pm.*,
@@ -62,7 +70,7 @@ export async function runRepricerJob({ userId = null, log = null } = {}) {
       FROM product_mappings pm
       LEFT JOIN onbuy_accounts oa
              ON pm.onbuy_account_id = oa.id AND oa.is_active = true
-      WHERE pm.is_active = true ${userClause}
+      WHERE ${conditions.join(' AND ')}
       ORDER BY pm.last_synced_at ASC NULLS FIRST
     `, queryParams);
 
