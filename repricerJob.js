@@ -316,11 +316,35 @@ class OnBuyUpdater {
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
-        // Creds are stored in _creds (by token), but also directly in each item
-        // as a fallback for when _creds was cleared by a worker restart.
-        const creds = this._creds.get(token)
-                   || this._creds.get(items[0].token)
-                   || (items[0].consumerKey ? { consumerKey: items[0].consumerKey, secretKey: items[0].secretKey } : null);
+        // Tier 1: in-memory _creds map (populated on first enqueue with valid creds)
+        // Tier 2: creds embedded directly in the batch item (set since the creds-in-data fix)
+        // Tier 3: DB lookup via mappingId — covers jobs created before the fix and slow-queue
+        //         escalations that historically omitted consumerKey/secretKey from their payload.
+        let creds = this._creds.get(token)
+                 || this._creds.get(items[0].token)
+                 || (items[0].consumerKey ? { consumerKey: items[0].consumerKey, secretKey: items[0].secretKey } : null);
+
+        if (!creds) {
+          const mappingId = items.find(it => it.mappingId)?.mappingId;
+          if (mappingId) {
+            try {
+              const { rows } = await db.query(`
+                SELECT oa.consumer_key, oa.secret_key
+                FROM product_mappings pm
+                JOIN onbuy_accounts oa ON oa.id = pm.onbuy_account_id AND oa.is_active = true
+                WHERE pm.id = $1
+              `, [mappingId]);
+              if (rows[0]) {
+                creds = { consumerKey: rows[0].consumer_key, secretKey: rows[0].secret_key };
+                this._creds.set(token, creds); // cache so subsequent batches skip the DB hit
+                ulog(batchUserId, `[OnBuyUpdater] Loaded credentials from DB for mapping #${mappingId}`);
+              }
+            } catch (dbErr) {
+              ulog(batchUserId, `[OnBuyUpdater] DB credential lookup failed:`, dbErr.message);
+            }
+          }
+        }
+
         if (creds) {
           ulog(batchUserId, `[OnBuyUpdater] Token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
           try {
@@ -701,7 +725,7 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
     const delay      = Math.max(5000, Math.min(drainMs, 300000)); // 5 s – 5 min cap
 
     ulog(userId, `[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
-    await slowQueue.add('scrape', { mapping, token, siteId, userSettings }, {
+    await slowQueue.add('scrape', { mapping, token, siteId, consumerKey, secretKey, userSettings }, {
       jobId:             `slow-${mapping.id}`,
       delay,
       removeOnComplete:  true,
