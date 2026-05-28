@@ -749,7 +749,20 @@ async function processSlowJob(job) {
   const { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
   const userId = mapping.user_id;
   return jobContext.run({ userId }, async () => {
-    const scraped = await scrapeProductSlow(mapping.primary_asin);
+    let scraped = await scrapeProductSlow(mapping.primary_asin);
+
+    if (scraped.error === 'all_methods_failed') {
+      ulog(userId, `[SlowWorker] all_methods_failed for ${mapping.primary_asin} — waiting 10s then retrying full pipeline once`);
+      await new Promise(r => setTimeout(r, 10_000));
+      const fastRetry = await scrapeProductFast(mapping.primary_asin);
+      if (fastRetry.price || fastRetry.inStock === false) {
+        scraped = fastRetry;
+      } else {
+        // Fast still failing — one final Puppeteer attempt
+        scraped = await scrapeProductSlow(mapping.primary_asin);
+      }
+    }
+
     return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
   });
 }
