@@ -13,7 +13,7 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, redis } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -357,16 +357,24 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/queue-status — live job counts across both queues
+// GET /api/queue-status — job counts scoped to the requesting user.
+// Super-admin (not impersonating) sees global counts across both queues.
+// All other users see only their own running job count via a Redis key
+// written by jobProducer when their jobs are enqueued.
 app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
-    const [fast, slow] = await Promise.all([
-      fastQueue.getJobCounts('waiting', 'active', 'delayed'),
-      slowQueue.getJobCounts('waiting', 'active', 'delayed'),
-    ]);
-    const total = (fast.waiting + fast.active + fast.delayed) +
-                  (slow.waiting  + slow.active  + slow.delayed);
-    res.json({ fast, slow, total, busy: total > 0 });
+    const isSuperAdmin = req.user.role === 'super_admin' && !req.isImpersonating;
+    if (isSuperAdmin) {
+      const [fast, slow] = await Promise.all([
+        fastQueue.getJobCounts('waiting', 'active', 'delayed'),
+        slowQueue.getJobCounts('waiting', 'active', 'delayed'),
+      ]);
+      const total = (fast.waiting + fast.active + fast.delayed) +
+                    (slow.waiting  + slow.active  + slow.delayed);
+      return res.json({ fast, slow, total, busy: total > 0 });
+    }
+    const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
+    res.json({ total: pending, busy: pending > 0 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

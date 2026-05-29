@@ -841,7 +841,10 @@ async function _checkAllDone() {
     if (_retryPendingFor.size > 0) {
       // Retry run just finished — flush its batches and mark the run fully done
       wlog('[Workers] Retry run completed — flushing remaining OnBuy batches');
-      for (const uid of _runUserIds) logToUser(uid, '[Workers] Retry run completed');
+      for (const uid of _runUserIds) {
+        logToUser(uid, '[Workers] Retry run completed');
+        redis.del(`repricer:running:${uid}`).catch(() => {});
+      }
       onbuyUpdater.flushAll(_runUserIds);
       _retryPendingFor.clear();
       _runStartTime = null;
@@ -898,7 +901,11 @@ async function _scheduleRetry(userIds, runStart) {
     }
   }
 
-  if (retries.length === 0) return; // _retryScheduled stays true — guard holds until next cron tick
+  if (retries.length === 0) {
+    // Nothing to retry — clear the running indicator for all users in this run
+    for (const uid of userIds) redis.del(`repricer:running:${uid}`).catch(() => {});
+    return; // _retryScheduled stays true — guard holds until next cron tick
+  }
 
   // Populate _retryPendingFor BEFORE enqueuing so the _checkAllDone guard holds
   // even if workers pick up the first retry job before all runRepricerJob calls complete.

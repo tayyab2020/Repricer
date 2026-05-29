@@ -19,7 +19,7 @@ const db = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
-const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+export const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
   maxRetriesPerRequest: null,
 });
 
@@ -168,6 +168,16 @@ export async function runRepricerJob({ userId = null, mappingIds = null, log = n
     const CHUNK = 500;
     for (let i = 0; i < jobs.length; i += CHUNK) {
       await fastQueue.addBulk(jobs.slice(i, i + CHUNK));
+    }
+
+    // Write per-user running counts so the dashboard only shows each user's own jobs
+    const userCounts = {};
+    for (const j of jobs) {
+      const uid = j.data.mapping.user_id;
+      if (uid) userCounts[uid] = (userCounts[uid] || 0) + 1;
+    }
+    for (const [uid, count] of Object.entries(userCounts)) {
+      redis.set(`repricer:running:${uid}`, count, 'EX', 14400).catch(() => {});
     }
 
     const [fastCounts, slowCounts] = await Promise.all([
