@@ -192,6 +192,26 @@ function randomDelay(minMs = 2000, maxMs = 6000) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// Global semaphore for Twister+Cheerio requests.
+// Limits concurrent Amazon HTTP requests across ALL fast workers so that proxy IPs
+// are not hit simultaneously and trigger burst-detection blocks.
+// Default 4 — tune via FAST_SCRAPE_CONCURRENCY env var.
+const _fastScrapeLimit = (() => {
+  const cap = parseInt(process.env.FAST_SCRAPE_CONCURRENCY || '4');
+  let active = 0;
+  const waiting = [];
+  return {
+    acquire: () => new Promise(resolve => {
+      if (active < cap) { active++; resolve(); }
+      else waiting.push(resolve);
+    }),
+    release: () => {
+      active--;
+      if (waiting.length > 0 && active < cap) { active++; waiting.shift()(); }
+    },
+  };
+})();
+
 // Local parsePrice — used for non-extraction contexts (sellers list etc.)
 function parsePrice(raw) {
   if (!raw) return null;
@@ -359,7 +379,11 @@ async function fetchTwisterPrice(asin) {
   attempts.push({ agent: undefined, label: 'direct' });
 
   let res;
-  for (const { agent, label } of attempts) {
+  for (let i = 0; i < attempts.length; i++) {
+    const { agent, label } = attempts[i];
+    // Brief pause between proxy attempts — avoids hitting multiple IPs in rapid succession
+    // which looks like distributed scraping to Amazon's detection systems.
+    if (i > 0) await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
     try {
       res = await fetch(apiUrl, { headers: baseHeaders, timeout: 12000, ...(agent ? { agent } : {}) });
       if (res.ok) {
@@ -1071,6 +1095,19 @@ export async function getProductDetails(asin, { maxRetries = 3 } = {}) {
 // ─────────────────────────────────────────────
 
 export async function scrapeProductFast(asin) {
+  await _fastScrapeLimit.acquire();
+  try {
+    return await _scrapeProductFast(asin);
+  } finally {
+    _fastScrapeLimit.release();
+  }
+}
+
+async function _scrapeProductFast(asin) {
+  // Jitter inside the semaphore slot so concurrent holders don't all fire at t=0.
+  // This staggers actual HTTP requests even when multiple slots are available.
+  await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
+
   const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
 
   // Step 0: Twister AJAX
