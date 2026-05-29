@@ -2381,12 +2381,26 @@ function ImportPage() {
                 <div style={{ marginBottom:3 }}><span style={{ color:C.red }}>*</span> Amazon URL or ASIN</div>
                 <div style={{ marginBottom:3, color:C.textDim }}>Product Name, OnBuy SKU, Markup Type, Markup Value, Min Price, Notes</div>
               </div>
-              <a href={`${API}/import/template`}
+              <button
+                onClick={async () => {
+                  const token = localStorage.getItem("repricer_token");
+                  const r = await fetch(`${API}/import/template`, {
+                    headers: token ? { Authorization: `Bearer ${token}` } : {},
+                  });
+                  if (!r.ok) return;
+                  const blob = await r.blob();
+                  const url  = URL.createObjectURL(blob);
+                  const a    = document.createElement("a");
+                  a.href     = url;
+                  a.download = "import-template.xlsx";
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
                 style={{ display:"inline-block", background:C.accent, color:"#000",
                   borderRadius:8, padding:"8px 16px", fontSize:13, fontWeight:600,
-                  textDecoration:"none" }}>
+                  border:"none", cursor:"pointer" }}>
                 ⬇ Download Template (.xlsx)
-              </a>
+              </button>
             </Section>
           </div>
         </div>
