@@ -192,6 +192,35 @@ function randomDelay(minMs = 2000, maxMs = 6000) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ── Bad-proxy circuit breaker ──────────────────────────────────────────────
+// Proxies that return HTTP 503 are blocked by Amazon. Tracking them avoids
+// wasting 12 s × N proxy timeouts per ASIN on known-dead IPs.
+const _badProxies  = new Map();            // rawProxyUrl → unblock timestamp
+const BAD_PROXY_TTL = 30 * 60 * 1000;     // retry after 30 minutes
+
+function markBadProxy(rawUrl) {
+  if (!rawUrl) return;
+  _badProxies.set(rawUrl, Date.now() + BAD_PROXY_TTL);
+  log('warn', `Proxy marked bad (503) — skipping for 30 min: ${new URL(rawUrl).hostname}`);
+}
+
+function isProxyBad(rawUrl) {
+  const exp = _badProxies.get(rawUrl);
+  if (!exp) return false;
+  if (Date.now() > exp) { _badProxies.delete(rawUrl); return false; }
+  return true;
+}
+
+// Returns the proxy pool with blocked IPs filtered out.
+async function getGoodProxies() {
+  const all = await getProxies();
+  const good = all.filter(p => !isProxyBad(p));
+  if (good.length === 0 && all.length > 0) {
+    log('warn', `All ${all.length} proxies are currently blocked — using direct connection only`);
+  }
+  return good;
+}
+
 // Global semaphore for Twister+Cheerio requests.
 // Limits concurrent Amazon HTTP requests across ALL fast workers so that proxy IPs
 // are not hit simultaneously and trigger burst-detection blocks.
@@ -353,36 +382,28 @@ async function fetchTwisterPrice(asin) {
     'Cookie':          'i18n-prefs=GBP; lc-acbuk=en_GB',
   };
 
-  // Build attempt list: try up to 3 different proxy IPs, then direct fallback.
-  // Different IPs have different Amazon bot-detection scores, so rotating helps.
+  // Build attempt list: up to 3 non-blocked proxies, then direct fallback.
   const attempts = [];
-  const pool = await getProxies();
+  const pool = await getGoodProxies();
   if (pool.length > 0) {
     try {
       const { HttpsProxyAgent } = await import('https-proxy-agent');
-      // Pick up to 3 random proxies without repeating
-      const indices = [...Array(pool.length).keys()];
-      for (let i = indices.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [indices[i], indices[j]] = [indices[j], indices[i]];
-      }
-      for (const idx of indices.slice(0, 3)) {
-        const p = parseProxy(pool[idx]);
-        // Format: http://user:pass@host:port  (Webshare standard)
+      const shuffled = [...pool].sort(() => Math.random() - 0.5);
+      for (const rawUrl of shuffled.slice(0, 3)) {
+        const p = parseProxy(rawUrl);
         const proxyUrl = `http://${p.username}:${p.password}@${new URL(p.server).hostname}:${new URL(p.server).port}`;
-        attempts.push({ agent: new HttpsProxyAgent(proxyUrl), label: `proxy(${new URL(p.server).hostname})` });
+        attempts.push({ agent: new HttpsProxyAgent(proxyUrl), label: `proxy(${new URL(p.server).hostname})`, rawUrl });
       }
     } catch (e) {
       log('debug', `Twister: could not build proxy agents — ${e.message}`);
     }
   }
-  attempts.push({ agent: undefined, label: 'direct' });
+  attempts.push({ agent: undefined, label: 'direct', rawUrl: null });
 
   let res;
   for (let i = 0; i < attempts.length; i++) {
-    const { agent, label } = attempts[i];
-    // Brief pause between proxy attempts — avoids hitting multiple IPs in rapid succession
-    // which looks like distributed scraping to Amazon's detection systems.
+    const { agent, label, rawUrl } = attempts[i];
+    // Brief pause between attempts — avoids hitting multiple IPs in rapid succession.
     if (i > 0) await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
     try {
       res = await fetch(apiUrl, { headers: baseHeaders, timeout: 12000, ...(agent ? { agent } : {}) });
@@ -390,6 +411,7 @@ async function fetchTwisterPrice(asin) {
         log('debug', `Twister OK via ${label}`, { asin });
         break;
       }
+      if (res.status === 503) markBadProxy(rawUrl);
       log('debug', `Twister endpoint HTTP ${res.status} (${label})`, { asin });
       res = null;
     } catch (err) {
@@ -468,22 +490,31 @@ async function cheerioScrape(url) {
   const headers = getUKHeaders(ua);
 
   let fetchOptions = { headers, timeout: 20000 };
+  let usedProxyRaw = null;
 
   if (USE_PROXIES) {
-    const proxy = await getUKProxy();
-    try {
-      const { HttpsProxyAgent } = await import('https-proxy-agent');
-      const proxyUrl = proxy ? proxy.server.replace('://', `://${proxy.username}:${proxy.password}@`) : null;
-      if (!proxyUrl) throw new Error('no proxies available');
-      fetchOptions.agent = new HttpsProxyAgent(proxyUrl);
-    } catch {
-      log('debug', 'https-proxy-agent not available, proceeding without proxy agent');
+    const goodPool = await getGoodProxies();
+    if (goodPool.length > 0) {
+      const rawUrl = goodPool[Math.floor(Math.random() * goodPool.length)];
+      usedProxyRaw = rawUrl;
+      try {
+        const { HttpsProxyAgent } = await import('https-proxy-agent');
+        const p = parseProxy(rawUrl);
+        const proxyUrl = `http://${p.username}:${p.password}@${new URL(p.server).hostname}:${new URL(p.server).port}`;
+        fetchOptions.agent = new HttpsProxyAgent(proxyUrl);
+      } catch {
+        log('debug', 'https-proxy-agent not available, proceeding without proxy agent');
+      }
     }
   }
 
   const res = await fetch(url, fetchOptions);
 
-  if (res.status === 503 || res.status === 403 || res.status === 429) {
+  if (res.status === 503) {
+    markBadProxy(usedProxyRaw);
+    return { blocked: true, reason: 'HTTP 503' };
+  }
+  if (res.status === 403 || res.status === 429) {
     return { blocked: true, reason: `HTTP ${res.status}` };
   }
 
