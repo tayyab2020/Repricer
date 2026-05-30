@@ -159,24 +159,51 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
 
 // ─────────────────────────────────────────────────────────────
 // Read the quota % from the Keepa nav widget.
-// Selector: #widget_bucket_quota .bucket-quota__caption → "Quota: 78%"
-// Returns the numeric percentage or null if the widget is not readable.
+// The widget loads asynchronously on the SPA, so we wait for it
+// and fall back to a full-page text scan if the ID selector fails.
+// Returns the numeric percentage or null if unreadable.
 // ─────────────────────────────────────────────────────────────
 async function _readQuotaPercent(page, log) {
+  // Wait up to 8 s for the quota widget to render
+  try {
+    await page.waitForSelector('#widget_bucket_quota', { timeout: 8_000 });
+  } catch { /* widget may not exist on all account types */ }
+
+  // Primary selector: #widget_bucket_quota .bucket-quota__caption → "Quota: 78%"
   try {
     const text = await page.$eval(
       '#widget_bucket_quota .bucket-quota__caption',
       el => el.textContent.trim()
     );
     const m = text.match(/(\d+(?:\.\d+)?)\s*%/);
-    if (!m) return null;
-    const pct = parseFloat(m[1]);
-    log(`[Keepa] Quota: ${pct}%`);
-    return pct;
-  } catch {
-    // Widget not present (e.g. non-Pro account page) — proceed without blocking
-    return null;
-  }
+    if (m) {
+      const pct = parseFloat(m[1]);
+      log(`[Keepa] Quota: ${pct}%`);
+      return pct;
+    }
+  } catch { /* selector not matched — try fallback */ }
+
+  // Fallback: scan all text nodes for "Quota: N%"
+  try {
+    const pct = await page.evaluate(() => {
+      for (const el of document.querySelectorAll('span, div, p')) {
+        const t = el.childNodes.length === 1 && el.childNodes[0].nodeType === 3
+          ? el.textContent.trim()
+          : '';
+        if (!t.startsWith('Quota:')) continue;
+        const m = t.match(/(\d+(?:\.\d+)?)\s*%/);
+        if (m) return parseFloat(m[1]);
+      }
+      return null;
+    });
+    if (pct !== null) {
+      log(`[Keepa] Quota (fallback scan): ${pct}%`);
+      return pct;
+    }
+  } catch { /* ignore */ }
+
+  log('[Keepa] Quota widget not found — proceeding without quota check');
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────
