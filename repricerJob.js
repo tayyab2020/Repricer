@@ -353,7 +353,7 @@ class OnBuyUpdater {
           if (winning === false && item.price > leadPrice) {
             const undercutPrice = parseFloat((leadPrice - 0.50).toFixed(2));
             const minRoiFloor   = (item.amazonPrice && effMinRoi > 0)
-              ? parseFloat((item.amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2))
+              ? parseFloat(((item.amazonPrice * (1 + effMinRoi / 100)) / (1 - effFeeRate)).toFixed(2))
               : 0;
             if (minRoiFloor > 0 && undercutPrice < minRoiFloor) {
               newPrice = minRoiFloor; // can't compete — post at minimum viable margin
@@ -367,9 +367,9 @@ class OnBuyUpdater {
           // minRoi after the last sync, (c) a profitable undercut that still sits below
           // the floor due to rounding.
           if (item.amazonPrice && effMinRoi > 0) {
-            const roiAtPrice  = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
+            const roiAtPrice  = ((newPrice * (1 - effFeeRate)) / item.amazonPrice - 1) * 100;
             if (roiAtPrice < effMinRoi) {
-              const minRoiPrice = parseFloat((item.amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2));
+              const minRoiPrice = parseFloat(((item.amazonPrice * (1 + effMinRoi / 100)) / (1 - effFeeRate)).toFixed(2));
               ulog(item.userId, `[CheckWinning] ${item.identifier}: ROI at £${newPrice} = ${roiAtPrice.toFixed(1)}% < min ${effMinRoi}% → floor £${minRoiPrice}`);
               newPrice = minRoiPrice;
             }
@@ -390,7 +390,7 @@ class OnBuyUpdater {
           // intended ROI policy and must not be overwritten by a transient
           // check-winning adjustment, which would corrupt future price calculations.
           if (item.amazonPrice && item.mappingId) {
-            const newFee = newPrice * (item.feeRate ?? _onbuyFeeRate) / (1 + (item.feeRate ?? _onbuyFeeRate));
+            const newFee = newPrice * (item.feeRate ?? _onbuyFeeRate);
             db.query(
               `UPDATE product_mappings SET onbuy_fee = $1 WHERE id = $2`,
               [parseFloat(newFee.toFixed(2)), item.mappingId]
@@ -597,9 +597,9 @@ export function setRepricerDefaults({ feeRate, defaultRoi, minRoiPercent } = {})
 function computeOnBuyPrice(amazonPrice, markupType, markupValue, minPrice = null, feeRate = _onbuyFeeRate) {
   let price;
   if (markupType === 'roi') {
-    // P = amazon × (1 + roi/100) × (1 + fee%)
-    // e.g. amazon=70, roi=20%, fee=15%: 70 × 1.20 × 1.15 = 96.60
-    price = amazonPrice * (1 + markupValue / 100) * (1 + feeRate);
+    // P = (amazon × (1 + roi/100)) / (1 - fee%)
+    // e.g. amazon=5.99, roi=20%, fee=15%: (5.99 × 1.20) / 0.85 = 8.46
+    price = (amazonPrice * (1 + markupValue / 100)) / (1 - feeRate);
   } else if (markupType === 'percent') {
     price = amazonPrice * (1 + markupValue / 100);
   } else if (markupType === 'fixed') {
@@ -721,7 +721,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // have been written by a previous check-winning adjustment (e.g. markup_value
   // was overwritten to a negative ROI).
   const minRoiFloor = effMinRoi > 0
-    ? parseFloat((amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2))
+    ? parseFloat(((amazonPrice * (1 + effMinRoi / 100)) / (1 - effFeeRate)).toFixed(2))
     : null;
   const storedBelowFloor = minRoiFloor != null && last_onbuy_price
     ? parseFloat(last_onbuy_price) < minRoiFloor
