@@ -13,7 +13,7 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, redis } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, redis } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -367,13 +367,15 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
     const isSuperAdmin = req.user.role === 'super_admin' && !req.isImpersonating;
     if (isSuperAdmin) {
-      const [fast, slow] = await Promise.all([
+      const [fast, slow, keepa] = await Promise.all([
         fastQueue.getJobCounts('waiting', 'active', 'delayed'),
         slowQueue.getJobCounts('waiting', 'active', 'delayed'),
+        keepaQueue.getJobCounts('waiting', 'active', 'delayed'),
       ]);
       const total = (fast.waiting + fast.active + fast.delayed) +
-                    (slow.waiting  + slow.active  + slow.delayed);
-      return res.json({ fast, slow, total, busy: total > 0 });
+                    (slow.waiting  + slow.active  + slow.delayed) +
+                    (keepa.waiting + keepa.active + keepa.delayed);
+      return res.json({ fast, slow, keepa, total, busy: total > 0 });
     }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
     res.json({ total: pending, busy: pending > 0 });

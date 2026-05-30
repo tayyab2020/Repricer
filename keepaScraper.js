@@ -74,9 +74,19 @@ export async function createKeepaSession(email, password, log = console.log) {
     await page.goto(KEEPA_VIEWER, { waitUntil: 'networkidle2', timeout: 60_000 });
     await _sleep(2000);
 
+    let firstBatch = true;
     return {
       async scrape(asins) {
         if (!asins?.length) return {};
+        // After the first batch Keepa hides the ASIN input panel (the results grid
+        // takes over). Reloading the viewer page resets to the clean input state
+        // without triggering a new login — the session cookie is still valid.
+        if (!firstBatch) {
+          log('[Keepa] Reloading viewer to reset input panel…');
+          await page.goto(KEEPA_VIEWER, { waitUntil: 'networkidle2', timeout: 60_000 });
+          await _sleep(1500);
+        }
+        firstBatch = false;
         // Fresh temp dir per call so concurrent downloads never collide
         const dlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keepa-'));
         try {
@@ -161,9 +171,6 @@ async function _dismissExportDialog(page) {
 // Called once per session.scrape() invocation on the same page.
 // ─────────────────────────────────────────────────────────────
 async function _scrapeOnPage(page, dlDir, asins, log) {
-  // Close any export dialog left open from the previous sub-batch
-  await _dismissExportDialog(page);
-
   // ── 1. Inject ASINs into the input field ─────────────────────────────────
   log(`[Keepa] Injecting ${asins.length} ASINs into Product Viewer…`);
   await page.waitForSelector('#importInputAsin', { timeout: 15_000 });

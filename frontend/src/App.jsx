@@ -1800,7 +1800,7 @@ export default function App() {
             onClick={syncAll}
             disabled={syncing || queueBusy}
             title={queueBusy
-              ? `Queue busy — fast: ${queueCounts?.fast?.waiting ?? 0} waiting / ${queueCounts?.fast?.active ?? 0} active, slow: ${queueCounts?.slow?.waiting ?? 0} waiting / ${queueCounts?.slow?.active ?? 0} active`
+              ? `Queue busy — fast: ${queueCounts?.fast?.waiting ?? 0}w/${queueCounts?.fast?.active ?? 0}a, slow: ${queueCounts?.slow?.waiting ?? 0}w/${queueCounts?.slow?.active ?? 0}a, keepa: ${queueCounts?.keepa?.waiting ?? 0}w/${queueCounts?.keepa?.active ?? 0}a`
               : "Run repricer now"}
             style={{ width:"100%", justifyContent:"center" }}
           >
