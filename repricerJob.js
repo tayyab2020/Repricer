@@ -1012,21 +1012,19 @@ async function processKeepaJob(job) {
   };
 
   // ── Process thisBatch one 1 000-ASIN sub-batch at a time ──────────────────
-  // A single browser session is opened here and reused across all sub-batches,
-  // avoiding the ~15 s login + navigation overhead on sub-batches 2, 3, …
-  log(`[KeepaWorker] Opening Keepa browser session…`);
-  const keepaSession = await createKeepaSession(keepaEmail, keepaPassword, log);
-  try {
+  // Each sub-batch opens a fresh browser session (login + navigate + scrape + close).
+  // After the first export Keepa hides the ASIN input panel and reloading the viewer
+  // proved unreliable in production — a fresh session is the only reliable approach.
   for (let i = 0; i < thisBatch.length; i += SUB_BATCH) {
     const chunk    = thisBatch.slice(i, i + SUB_BATCH);
     const chunkNum = Math.floor(i / SUB_BATCH) + 1;
     const totalChunks = Math.ceil(thisBatch.length / SUB_BATCH);
 
-    log(`[KeepaWorker] Sub-batch ${chunkNum}/${totalChunks} — ${chunk.length} ASINs`);
+    log(`[KeepaWorker] Sub-batch ${chunkNum}/${totalChunks} — ${chunk.length} ASINs (fresh session)`);
 
     let chunkPrices = {};
     try {
-      chunkPrices = await keepaSession.scrape(chunk);
+      chunkPrices = await getKeepaPrice(chunk, { email: keepaEmail, password: keepaPassword, log });
     } catch (err) {
       log(`[KeepaWorker] Sub-batch ${chunkNum} failed: ${err.message}`);
     }
@@ -1070,10 +1068,6 @@ async function processKeepaJob(job) {
         lastFlushTime = Date.now();
       }
     }
-  }
-  } finally {
-    await keepaSession.close().catch(() => {});
-    log(`[KeepaWorker] Browser session closed`);
   }
 
   // Final flush for any prices accumulated after the last threshold trigger

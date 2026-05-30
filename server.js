@@ -372,9 +372,19 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
         slowQueue.getJobCounts('waiting', 'active', 'delayed'),
         keepaQueue.getJobCounts('waiting', 'active', 'delayed'),
       ]);
-      const total = (fast.waiting + fast.active + fast.delayed) +
-                    (slow.waiting  + slow.active  + slow.delayed) +
-                    (keepa.waiting + keepa.active + keepa.delayed);
+      const bullTotal = (fast.waiting + fast.active + fast.delayed) +
+                        (slow.waiting  + slow.active  + slow.delayed) +
+                        (keepa.waiting + keepa.active + keepa.delayed);
+
+      // When Keepa is running the BullMQ keepa queue has 1 job but the Redis
+      // repricer:running:* keys hold the actual ASIN count — use whichever is larger.
+      const runningKeys = await redis.keys('repricer:running:*');
+      let asinTotal = 0;
+      if (runningKeys.length > 0) {
+        const vals = await redis.mget(...runningKeys);
+        asinTotal = vals.reduce((sum, v) => sum + (parseInt(v) || 0), 0);
+      }
+      const total = Math.max(bullTotal, asinTotal);
       return res.json({ fast, slow, keepa, total, busy: total > 0 });
     }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
