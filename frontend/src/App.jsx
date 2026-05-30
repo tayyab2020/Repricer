@@ -414,6 +414,21 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
     setClearing(false);
   };
 
+  const exportMappings = async () => {
+    const token = localStorage.getItem("repricer_token");
+    const res = await fetch(API + "/mappings/export", {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) { alert("Export failed"); return; }
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = "mappings.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleSearchInput = (v) => {
     setSearchInput(v);
     clearTimeout(searchTimer.current);
@@ -454,6 +469,13 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
             style={{ background:"#7f1d1d", opacity: (clearing || total === 0) ? 0.5 : 1 }}
           >
             {clearing ? "Clearing…" : "Clear All Mappings"}
+          </Btn>
+          <Btn
+            onClick={exportMappings}
+            disabled={total === 0}
+            style={{ background:"#166534", opacity: total === 0 ? 0.5 : 1 }}
+          >
+            Export to Excel
           </Btn>
           <Btn onClick={() => setShowForm(true)}>+ Add Mapping</Btn>
         </div>

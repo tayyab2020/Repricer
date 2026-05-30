@@ -981,7 +981,7 @@ async function processKeepaJob(job) {
   const toFetch   = pendingAsins ?? asins;
   const quota     = runNumber === 1 ? KEEPA_QUOTA_FULL : KEEPA_HOURLY_FILL;
   const thisBatch = toFetch.slice(0, quota);
-  const leftover  = toFetch.slice(quota);
+  let   leftover  = toFetch.slice(quota);
 
   log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}`);
 
@@ -1015,6 +1015,8 @@ async function processKeepaJob(job) {
   // Each sub-batch opens a fresh browser session (login + navigate + scrape + close).
   // After the first export Keepa hides the ASIN input panel and reloading the viewer
   // proved unreliable in production — a fresh session is the only reliable approach.
+  let quotaExhaustedIdx = -1;  // index in thisBatch where quota was detected ≤5%
+
   for (let i = 0; i < thisBatch.length; i += SUB_BATCH) {
     const chunk    = thisBatch.slice(i, i + SUB_BATCH);
     const chunkNum = Math.floor(i / SUB_BATCH) + 1;
@@ -1026,6 +1028,11 @@ async function processKeepaJob(job) {
     try {
       chunkPrices = await getKeepaPrice(chunk, { email: keepaEmail, password: keepaPassword, log });
     } catch (err) {
+      if (err.message === 'KEEPA_QUOTA_EXHAUSTED') {
+        log(`[KeepaWorker] ⏸ Quota ${err.quota ?? 0}% ≤5% at sub-batch ${chunkNum}/${totalChunks} — deferring ${thisBatch.length - i} ASINs for 1 h`);
+        quotaExhaustedIdx = i;
+        break;
+      }
       log(`[KeepaWorker] Sub-batch ${chunkNum} failed: ${err.message}`);
     }
 
@@ -1068,6 +1075,14 @@ async function processKeepaJob(job) {
         lastFlushTime = Date.now();
       }
     }
+  }
+
+  // When quota ran out mid-run, fold unprocessed ASINs into leftover so the
+  // existing 1-hour refill scheduler picks them up automatically.
+  if (quotaExhaustedIdx >= 0) {
+    const unprocessed = thisBatch.slice(quotaExhaustedIdx);
+    leftover = [...unprocessed, ...leftover];
+    log(`[KeepaWorker] ${unprocessed.length} unprocessed ASINs added to refill queue (total deferred: ${leftover.length})`);
   }
 
   // Final flush for any prices accumulated after the last threshold trigger

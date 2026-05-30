@@ -264,6 +264,52 @@ app.get('/api/mappings', requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/mappings/export — download all mappings as XLSX
+app.get('/api/mappings/export', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows } = await db.query(
+      `SELECT product_name, primary_asin, markup_type, markup_value,
+              last_amazon_price, last_onbuy_price, last_synced_at
+       FROM product_mappings
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [uid]
+    );
+
+    const sheetData = [
+      ['Product Title', 'ASIN', 'Markup', 'Amazon £', 'OnBuy £', 'Last Sync'],
+      ...rows.map(r => {
+        const val = parseFloat(r.markup_value) || 0;
+        const markup = r.markup_type === 'roi'     ? `+${val.toFixed(2)}% ROI`
+                     : r.markup_type === 'percent' ? `+${val.toFixed(2)}%`
+                     : r.markup_type === 'fixed'   ? `+£${val.toFixed(2)}`
+                     : r.markup_value ?? '';
+        return [
+          r.product_name     ?? '',
+          r.primary_asin     ?? '',
+          markup,
+          r.last_amazon_price != null ? parseFloat(r.last_amazon_price) : '',
+          r.last_onbuy_price  != null ? parseFloat(r.last_onbuy_price)  : '',
+          r.last_synced_at    ? new Date(r.last_synced_at).toLocaleString('en-GB') : 'Never',
+        ];
+      }),
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+    ws['!cols'] = [{ wch: 60 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 22 }];
+    XLSX.utils.book_append_sheet(wb, ws, 'Mappings');
+
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Disposition', 'attachment; filename="mappings.xlsx"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/mappings/:id — single mapping detail
 app.get('/api/mappings/:id', requireAuth, async (req, res) => {
   try {

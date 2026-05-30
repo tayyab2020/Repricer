@@ -76,6 +76,9 @@ export async function createKeepaSession(email, password, log = console.log) {
 
     let firstBatch = true;
     return {
+      async checkQuota() {
+        return _readQuotaPercent(page, log);
+      },
       async scrape(asins) {
         if (!asins?.length) return {};
         // After the first batch Keepa hides the ASIN input panel (the results grid
@@ -124,6 +127,14 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
   const session = await createKeepaSession(email, password, log);
   const results = {};
   try {
+    // Check quota before any scraping — ≤5% means ~0 products can be fetched
+    const quotaPct = await session.checkQuota();
+    if (quotaPct !== null && quotaPct <= 5) {
+      const err = new Error('KEEPA_QUOTA_EXHAUSTED');
+      err.quota = quotaPct;
+      throw err;
+    }
+
     for (let bi = 0; bi < batches.length; bi++) {
       log(`[Keepa] Batch ${bi + 1}/${batches.length} — ${batches[bi].length} ASINs`);
       try {
@@ -132,6 +143,7 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
         const found = Object.values(batchResult).filter(r => r.price !== null).length;
         log(`[Keepa] Batch ${bi + 1} done — ${found}/${batches[bi].length} prices found`);
       } catch (err) {
+        if (err.message === 'KEEPA_QUOTA_EXHAUSTED') throw err;
         log(`[Keepa] Batch ${bi + 1} error: ${err.message}`);
       }
       if (bi < batches.length - 1) await _sleep(5000);
@@ -143,6 +155,28 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
   const total = Object.values(results).filter(r => r.price !== null).length;
   log(`[Keepa] Complete — ${total}/${asins.length} prices retrieved`);
   return results;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read the quota % from the Keepa nav widget.
+// Selector: #widget_bucket_quota .bucket-quota__caption → "Quota: 78%"
+// Returns the numeric percentage or null if the widget is not readable.
+// ─────────────────────────────────────────────────────────────
+async function _readQuotaPercent(page, log) {
+  try {
+    const text = await page.$eval(
+      '#widget_bucket_quota .bucket-quota__caption',
+      el => el.textContent.trim()
+    );
+    const m = text.match(/(\d+(?:\.\d+)?)\s*%/);
+    if (!m) return null;
+    const pct = parseFloat(m[1]);
+    log(`[Keepa] Quota: ${pct}%`);
+    return pct;
+  } catch {
+    // Widget not present (e.g. non-Pro account page) — proceed without blocking
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
