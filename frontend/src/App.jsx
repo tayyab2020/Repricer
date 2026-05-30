@@ -1350,15 +1350,15 @@ const INTERVAL_OPTIONS = [
 ];
 
 function SettingsPage({ onIntervalChange, onStartTimeChange }) {
-  const [proxyUrl,   setProxyUrl]   = useState("");
-  const [feePercent, setFeePercent] = useState("15");
-  const [defaultRoi, setDefaultRoi] = useState("20");
-  const [minRoi,     setMinRoi]     = useState("0");
-  const [interval,   setInterval]   = useState("30");
-  const [startTime,  setStartTime]  = useState("00:00");
-  const [status,     setStatus]     = useState(null);
-  const [saving,     setSaving]     = useState(false);
-  const [msg,        setMsg]        = useState(null);
+  const [proxyUrl,      setProxyUrl]      = useState("");
+  const [feePercent,    setFeePercent]    = useState("15");
+  const [defaultRoi,    setDefaultRoi]    = useState("20");
+  const [minRoi,        setMinRoi]        = useState("0");
+  const [interval,      setInterval]      = useState("30");
+  const [startTime,     setStartTime]     = useState("00:00");
+  const [status,        setStatus]        = useState(null);
+  const [saving,        setSaving]        = useState(false);
+  const [msg,           setMsg]           = useState(null);
 
   useEffect(() => {
     api("/settings").then(s => {
@@ -1378,12 +1378,12 @@ function SettingsPage({ onIntervalChange, onStartTimeChange }) {
       const s = await api("/settings", {
         method: "PUT",
         body: JSON.stringify({
-          webshare_proxy_api:  proxyUrl,
-          onbuy_fee_percent:   feePercent,
-          default_roi_percent: defaultRoi,
-          min_roi_percent:     minRoi,
+          webshare_proxy_api:   proxyUrl,
+          onbuy_fee_percent:    feePercent,
+          default_roi_percent:  defaultRoi,
+          min_roi_percent:      minRoi,
           job_interval_minutes: interval,
-          job_start_time:      startTime,
+          job_start_time:       startTime,
         }),
       });
       setStatus(s._proxy_status);
@@ -1689,9 +1689,25 @@ export default function App() {
 
   const syncAll = async () => {
     setSyncing(true);
-    await api("/sync", { method:"POST" }).catch(console.error);
-    pollQueue();
-    setTimeout(() => { loadDashboard(); setSyncing(false); pollQueue(); }, 3000);
+    await api("/sync", { method: "POST" }).catch(console.error);
+    // Poll every second until the queue actually shows busy (jobs enqueued) or
+    // 30 s pass without activity — whichever comes first.
+    let attempts = 0;
+    const waitForBusy = setInterval(() => {
+      attempts++;
+      api("/queue-status").then(s => {
+        if (!s) return;
+        setQueueBusy(s.busy);
+        setQueueCounts(s);
+        if (s.busy || attempts >= 30) {
+          clearInterval(waitForBusy);
+          setSyncing(false);
+          loadDashboard();
+        }
+      }).catch(() => {
+        if (attempts >= 30) { clearInterval(waitForBusy); setSyncing(false); }
+      });
+    }, 1000);
   };
 
   const nav = [
@@ -1876,7 +1892,7 @@ export default function App() {
 // ════════════════════════════════════════════
 function AccountsPage() {
   const [accounts, setAccounts] = useState([]);
-  const [form, setForm]         = useState({ account_name:"", consumer_key:"", secret_key:"", site_id:"2000" });
+  const [form, setForm]         = useState({ account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false });
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
   const [testResult, setResult] = useState({});
@@ -1888,6 +1904,8 @@ function AccountsPage() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
+  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false };
+
   async function save() {
     if (!form.account_name || !form.consumer_key || !form.secret_key)
       return setErr("Account name, Consumer Key and Secret Key are required.");
@@ -1895,7 +1913,7 @@ function AccountsPage() {
     try {
       if (editId) { await api(`/accounts/${editId}`, { method:"PUT", body: JSON.stringify(form) }); }
       else        { await api("/accounts", { method:"POST", body: JSON.stringify(form) }); }
-      setForm({ account_name:"", consumer_key:"", secret_key:"", site_id:"2000" });
+      setForm(emptyForm);
       setEditId(null); await load();
     } catch (e) { setErr(e.message); }
     setLoading(false);
@@ -1969,11 +1987,62 @@ function AccountsPage() {
                 onChange={e => setForm(f => ({ ...f, site_id:e.target.value }))} />
               <p style={{ color:C.muted, fontSize:11, marginTop:4 }}>UK marketplace = 2000</p>
             </div>
+
+            {/* ── Keepa credentials (per-account) ── */}
+            <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:12, display:"flex", flexDirection:"column", gap:12 }}>
+              <p style={{ color:C.textDim, fontSize:12, margin:0 }}>
+                <strong style={{ color:C.text }}>Keepa credentials</strong> — optional. When set, the
+                repricer fetches prices via keepa.com Product Viewer for this account's ASINs before
+                each run, eliminating proxy blocks. Requires a Keepa Pro subscription.
+              </p>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                <div>
+                  <label style={labelStyle}>Keepa Email</label>
+                  <input style={fieldStyle} type="email" placeholder="you@example.com"
+                    value={form.keepa_email} onChange={e => setForm(f => ({ ...f, keepa_email:e.target.value }))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Keepa Password</label>
+                  <input style={fieldStyle} type="password" placeholder="••••••••"
+                    value={form.keepa_password} onChange={e => setForm(f => ({ ...f, keepa_password:e.target.value }))} />
+                </div>
+              </div>
+            </div>
+
+            {/* ── Scraping method toggles (all default off — rely on Keepa) ── */}
+            <div style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 14px", display:"flex", flexDirection:"column", gap:10 }}>
+              <p style={{ color:C.text, fontSize:13, fontWeight:600, margin:0 }}>Amazon scraping methods</p>
+              <p style={{ color:C.muted, fontSize:11, marginTop:0 }}>
+                Enable individual methods to use alongside Keepa. If all are off, only Keepa prices are used.
+              </p>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <div>
+                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Twister API</p>
+                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Fast AJAX endpoint — low overhead, no browser required.</p>
+                </div>
+                <Toggle value={form.enable_twister} onChange={v => setForm(f => ({ ...f, enable_twister:v }))} />
+              </div>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <div>
+                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Cheerio (HTML scraping)</p>
+                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Parses Amazon product pages — fallback when Twister returns no price.</p>
+                </div>
+                <Toggle value={form.enable_cheerio} onChange={v => setForm(f => ({ ...f, enable_cheerio:v }))} />
+              </div>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <div>
+                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Puppeteer (browser fallback)</p>
+                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Full browser session — slowest, used only when Twister + Cheerio both fail.</p>
+                </div>
+                <Toggle value={form.enable_puppeteer} onChange={v => setForm(f => ({ ...f, enable_puppeteer:v }))} />
+              </div>
+            </div>
+
             <div style={{ display:"flex", gap:8 }}>
               <Btn onClick={save} loading={loading}>{editId ? "Update Account" : "Add Account"}</Btn>
               {editId && <Btn variant="secondary" onClick={() => {
                 setEditId(null);
-                setForm({ account_name:"", consumer_key:"", secret_key:"", site_id:"2000" });
+                setForm(emptyForm);
               }}>Cancel</Btn>}
             </div>
           </div>
@@ -1993,6 +2062,25 @@ function AccountsPage() {
                       <div style={{ color:C.muted, fontSize:12, marginTop:4 }}>
                         Site ID: {a.site_id} · Key: {a.consumer_key_hint}
                       </div>
+                      <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginTop:5 }}>
+                        {a.keepa_email
+                          ? <span style={{ background:"#00d4aa18", color:C.accent, borderRadius:5,
+                              padding:"1px 7px", fontSize:11, fontWeight:600 }}>
+                              Keepa: {a.keepa_email}
+                            </span>
+                          : <span style={{ background:"#6b728022", color:C.muted, borderRadius:5,
+                              padding:"1px 7px", fontSize:11 }}>No Keepa</span>
+                        }
+                        {["twister","cheerio","puppeteer"].map(m => {
+                          const on = a[`enable_${m}`] === true;
+                          return (
+                            <span key={m} style={{ background: on ? "#3b82f622" : "#6b728022",
+                              color: on ? C.blue : C.muted, borderRadius:5, padding:"1px 7px", fontSize:11 }}>
+                              {m.charAt(0).toUpperCase()+m.slice(1)} {on ? "on" : "off"}
+                            </span>
+                          );
+                        })}
+                      </div>
                       {a.last_tested_at && (
                         <div style={{ fontSize:11, marginTop:4,
                           color: a.last_test_ok ? C.accent : C.red }}>
@@ -2011,7 +2099,11 @@ function AccountsPage() {
                         onClick={() => testAccount(a.id)}>Test</Btn>
                       <Btn small variant="secondary" onClick={() => {
                         setEditId(a.id);
-                        setForm({ account_name:a.account_name, consumer_key:"", secret_key:"", site_id:a.site_id });
+                        setForm({ account_name:a.account_name, consumer_key:"", secret_key:"", site_id:a.site_id,
+                          keepa_email:a.keepa_email||"", keepa_password:"",
+                          enable_puppeteer:a.enable_puppeteer===true,
+                          enable_twister:a.enable_twister===true,
+                          enable_cheerio:a.enable_cheerio===true });
                       }}>Edit</Btn>
                       <button onClick={() => toggleActive(a)} title={a.is_active ? "Disable account" : "Enable account"} style={{
                         background: a.is_active ? "#00d4aa18" : "#ef444418",

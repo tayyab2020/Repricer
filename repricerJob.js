@@ -34,7 +34,8 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, getTokenForAccount } from './jobProducer.js';
+import { getKeepaPrice, createKeepaSession } from './keepaScraper.js';
 
 dotenv.config();
 
@@ -42,6 +43,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
 export const LOGS_DIR = join(__dirname, 'logs');
 try { mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
+
+// Prevent unhandled errors from crashing the worker process.
+// BullMQ and IORedis can throw outside of any try-catch (e.g. network events).
+process.on('uncaughtException',   (err) => console.error(`[Worker] uncaughtException: ${err.stack || err}`));
+process.on('unhandledRejection',  (err) => console.error(`[Worker] unhandledRejection: ${err?.stack || err}`));
 
 const { Pool } = pg;
 
@@ -69,6 +75,10 @@ const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', 
 
 const FAST_CONCURRENCY = parseInt(process.env.FAST_WORKERS ?? '20');
 const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
+
+// Keepa Pro quota: 100% = 36 000 products, refills at 5%/hr = 1 800 products/hr
+const KEEPA_QUOTA_FULL  = 36_000;
+const KEEPA_HOURLY_FILL =  1_800;
 
 // Timestamped console.log — keeps live-logs timestamps accurate for lines
 // that don't come from amazonScraper.js (which adds its own timestamps).
@@ -100,14 +110,16 @@ function ulog(userId, ...args) {
 
 class OnBuyUpdater {
   constructor({ maxBatch = 1000, maxPerHour = 200 } = {}) {
-    this._maxBatch   = maxBatch;
-    this._maxPerHour = maxPerHour;
-    this._batches    = new Map(); // key → [{ token, siteId, identifier, isSku, price, resolve, reject }]
-    this._timers     = new Map(); // key → timer id
-    this._rrTs       = [];        // timestamps of sent requests (sliding 1-hour window)
-    this._mutex      = Promise.resolve(); // serialises all batch flushes
-    this._creds      = new Map(); // token → { consumerKey, secretKey } for refresh on 401
-    this._tokenMap   = new Map(); // oldToken → newToken (redirect after 401 refresh)
+    this._maxBatch     = maxBatch;
+    this._maxPerHour   = maxPerHour;
+    this._batches      = new Map(); // key → [{ token, siteId, identifier, isSku, price, resolve, reject }]
+    this._timers       = new Map(); // key → timer id
+    this._stockBatches = new Map(); // key → [{ token, siteId, identifier, isSku, stock, resolve, reject }]
+    this._stockTimers  = new Map(); // key → timer id (30-second window)
+    this._rrTs         = [];        // timestamps of sent requests (sliding 1-hour window)
+    this._mutex        = Promise.resolve(); // serialises all batch flushes
+    this._creds        = new Map(); // token → { consumerKey, secretKey } for refresh on 401
+    this._tokenMap     = new Map(); // oldToken → newToken (redirect after 401 refresh)
   }
 
   // Follow the redirect chain so stale tokens from job.data are silently
@@ -153,6 +165,81 @@ class OnBuyUpdater {
       .catch(err => wlog(`[OnBuyUpdater] Unhandled flush error:`, err.message));
   }
 
+  // Enqueue a stock-only update (e.g. stock=0 for OOS, stock=2 for back-in-stock).
+  // Uses a 30-second collection window (shorter than price's 5 min because OOS changes are urgent)
+  // and routes through the same _rrTs rate limiter so stock + price PUTs share the 200/hr ceiling.
+  enqueueStock(rawToken, siteId, identifier, isSku, stock, { consumerKey, secretKey, userId = null } = {}) {
+    return new Promise((resolve, reject) => {
+      const token = this._resolveToken(rawToken);
+      const key   = `stock||${token}||${siteId}||${isSku ? '1' : '0'}`;
+      if (!this._stockBatches.has(key)) this._stockBatches.set(key, []);
+      const batch = this._stockBatches.get(key);
+      batch.push({ token, siteId, identifier, isSku, stock, userId, consumerKey: consumerKey || null, secretKey: secretKey || null, resolve, reject });
+      if (consumerKey && secretKey && !this._creds.has(token)) this._creds.set(token, { consumerKey, secretKey });
+
+      if (batch.length >= this._maxBatch) {
+        if (this._stockTimers.has(key)) { clearTimeout(this._stockTimers.get(key)); this._stockTimers.delete(key); }
+        this._enqueueStockFlush(key);
+      } else if (!this._stockTimers.has(key)) {
+        const t = setTimeout(() => { this._stockTimers.delete(key); this._enqueueStockFlush(key); }, 30_000);
+        this._stockTimers.set(key, t);
+      }
+    });
+  }
+
+  _enqueueStockFlush(key) {
+    this._mutex = this._mutex
+      .then(() => this._flushStockBatch(key))
+      .catch(err => wlog(`[OnBuyUpdater] Unhandled stock flush error:`, err.message));
+  }
+
+  async _flushStockBatch(key) {
+    const batch = this._stockBatches.get(key);
+    if (!batch || batch.length === 0) return;
+    const items = batch.splice(0, this._maxBatch);
+
+    const now = Date.now();
+    this._rrTs = this._rrTs.filter(t => now - t < 3_600_000);
+    if (this._rrTs.length >= this._maxPerHour) {
+      const waitMs = 3_600_000 - (now - this._rrTs[0]) + 1000;
+      wlog(`[OnBuyUpdater] Rate limit reached (${this._rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
+      await new Promise(r => setTimeout(r, waitMs));
+      this._rrTs = this._rrTs.filter(t => Date.now() - t < 3_600_000);
+    }
+    this._rrTs.push(Date.now());
+
+    const { token, siteId, isSku } = items[0];
+    const batchUserId = items[0].userId ?? null;
+    const endpoint    = isSku
+      ? `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`
+      : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
+    const listingKey  = isSku ? 'sku' : 'uid';
+    const listings    = items.map(it => ({ [listingKey]: it.identifier, stock: it.stock }));
+
+    ulog(batchUserId, `[OnBuyUpdater] Stock batch ${listingKey.toUpperCase()} ×${items.length}`, JSON.stringify({ listings }));
+
+    try {
+      const res = await fetch(endpoint, {
+        method:  'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ listings }),
+      });
+      const raw = await res.text();
+      ulog(batchUserId, `[OnBuyUpdater] Stock batch → HTTP ${res.status} ${raw.slice(0, 200)}`);
+
+      if (!res.ok) {
+        const err = new Error(`OnBuy stock ${res.status}: ${raw.slice(0, 200)}`);
+        items.forEach(it => it.reject(err));
+        return;
+      }
+      items.forEach(it => it.resolve());
+    } catch (err) {
+      items.forEach(it => it.reject(err));
+    }
+
+    if ((this._stockBatches.get(key) || []).length > 0) this._enqueueStockFlush(key);
+  }
+
   // Called when all queue jobs are done — flushes every pending batch immediately
   // rather than waiting for the 5-minute collection window to expire.
   flushAll(runUserIds = new Set()) {
@@ -162,6 +249,12 @@ class OnBuyUpdater {
       pending += batch.length;
       if (this._timers.has(key)) { clearTimeout(this._timers.get(key)); this._timers.delete(key); }
       this._enqueueFlush(key);
+    }
+    for (const [key, batch] of this._stockBatches) {
+      if (batch.length === 0) continue;
+      pending += batch.length;
+      if (this._stockTimers.has(key)) { clearTimeout(this._stockTimers.get(key)); this._stockTimers.delete(key); }
+      this._enqueueStockFlush(key);
     }
     const msg = pending === 0
       ? '[OnBuyUpdater] flushAll: no pending updates (all prices unchanged or skipped)'
@@ -252,15 +345,27 @@ class OnBuyUpdater {
 
           let newPrice = item.price;
 
-          // Undercut lead price when not winning and our price is above the lead
+          // Undercut lead price when not winning and our price is above the lead.
+          // Three outcomes:
+          //   1. undercutPrice ≥ minRoiFloor  → undercut (we can compete profitably)
+          //   2. undercutPrice < minRoiFloor  → post floor price (lead is cheaper than our cost floor)
+          //   3. no minRoiFloor configured    → undercut unconditionally
           if (winning === false && item.price > leadPrice) {
-            newPrice = parseFloat((leadPrice - 0.50).toFixed(2));
+            const undercutPrice = parseFloat((leadPrice - 0.50).toFixed(2));
+            const minRoiFloor   = (item.amazonPrice && effMinRoi > 0)
+              ? parseFloat((item.amazonPrice * (1 + effMinRoi / 100) * (1 + effFeeRate)).toFixed(2))
+              : 0;
+            if (minRoiFloor > 0 && undercutPrice < minRoiFloor) {
+              newPrice = minRoiFloor; // can't compete — post at minimum viable margin
+            } else {
+              newPrice = undercutPrice; // profitable undercut
+            }
           }
 
-          // Always enforce the min-ROI floor — even when winning or when our
-          // price is already at/below the lead.  A stored price can be below the
-          // floor if markup_value was overwritten by a previous run or the user
-          // raised the min-ROI setting after the last sync.
+          // Enforce the min-ROI floor on whatever price we landed on.
+          // Covers: (a) corrupted markup_value not yet auto-corrected, (b) user raised
+          // minRoi after the last sync, (c) a profitable undercut that still sits below
+          // the floor due to rounding.
           if (item.amazonPrice && effMinRoi > 0) {
             const roiAtPrice  = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
             if (roiAtPrice < effMinRoi) {
@@ -280,13 +385,15 @@ class OnBuyUpdater {
           item.price = newPrice;
           adjusted++;
 
-          // Recalculate ROI% and onbuy_fee in DB based on the adjusted price
+          // Update onbuy_fee to reflect the adjusted price (display only).
+          // markup_value is intentionally NOT updated — it represents the user's
+          // intended ROI policy and must not be overwritten by a transient
+          // check-winning adjustment, which would corrupt future price calculations.
           if (item.amazonPrice && item.mappingId) {
-            const newRoi = (newPrice / (item.amazonPrice * (1 + effFeeRate)) - 1) * 100;
-            const newFee = newPrice * effFeeRate / (1 + effFeeRate);
+            const newFee = newPrice * (item.feeRate ?? _onbuyFeeRate) / (1 + (item.feeRate ?? _onbuyFeeRate));
             db.query(
-              `UPDATE product_mappings SET markup_value = $1, onbuy_fee = $2 WHERE id = $3`,
-              [parseFloat(newRoi.toFixed(4)), parseFloat(newFee.toFixed(2)), item.mappingId]
+              `UPDATE product_mappings SET onbuy_fee = $1 WHERE id = $2`,
+              [parseFloat(newFee.toFixed(2)), item.mappingId]
             ).catch(() => {});
           }
         }
@@ -546,7 +653,18 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 
   const effFeeRate  = userSettings.feeRate      ?? _onbuyFeeRate;
   const effMinRoi   = userSettings.minRoiPercent ?? _minRoiPercent;
-  const markup_value = parseFloat(mapping.markup_value) || (userSettings.defaultRoi ?? _defaultRoi);
+  let markup_value = parseFloat(mapping.markup_value) || (userSettings.defaultRoi ?? _defaultRoi);
+
+  // Auto-correct markup_value that was corrupted by a previous CheckWinning run.
+  // A stored ROI below the user's own minimum threshold is always wrong — a user
+  // who configured min_roi=10% would never intentionally set markup_value to 4%.
+  // Reset to defaultRoi and persist the correction so future runs start clean.
+  if (markup_type === 'roi' && effMinRoi > 0 && markup_value < effMinRoi) {
+    const corrected = userSettings.defaultRoi ?? _defaultRoi;
+    ulog(userId, `[Worker] 🔧 ${product_name || primary_asin} (#${id}) — markup_value ${markup_value.toFixed(2)}% < minRoi ${effMinRoi}% (corrupted) → reset to ${corrected}%`);
+    markup_value = corrected;
+    db.query(`UPDATE product_mappings SET markup_value = $1 WHERE id = $2`, [corrected, id]).catch(() => {});
+  }
 
   const label = `${product_name || primary_asin} (#${id})`;
 
@@ -556,7 +674,8 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     const identifier    = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
     if (!wasAlreadyOos) {
       ulog(userId, `[Worker] ⚠️  ${label} — OOS, setting stock=0`);
-      await setOnBuyStock(identifier, 0, token, siteId, !!onbuy_sku);
+      onbuyUpdater.enqueueStock(token, siteId, identifier, !!onbuy_sku, 0, { consumerKey, secretKey, userId })
+        .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=0 failed: ${err.message}`));
     } else {
       ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
     }
@@ -576,7 +695,8 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   if (amazon_in_stock === false && scraped.price) {
     const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
     ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=2`);
-    await setOnBuyStock(identifier, 2, token, siteId, !!onbuy_sku);
+    onbuyUpdater.enqueueStock(token, siteId, identifier, !!onbuy_sku, 2, { consumerKey, secretKey, userId })
+      .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=2 failed: ${err.message}`));
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
 
@@ -711,12 +831,67 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
     mapping = { ...mapping, onbuy_listing_id: uid, onbuy_opc: opc };
   }
 
-  const scraped = await scrapeProductFast(mapping.primary_asin);
+  // ── Keepa price cache check ───────────────────────────────────────────────
+  // Prices are cached per OnBuy account in keepa:prices:{accountId}.
+  // Use the cached price directly and skip all Amazon scraping.
+  // Only act on a cached price when it's a positive number — a null entry means
+  // Keepa had no current price (possible OOS), so fall back to live scraping.
+  const keepaCacheKey = mapping.onbuy_account_id
+    ? `keepa:prices:${mapping.onbuy_account_id}`
+    : null;
+  if (keepaCacheKey) {
+    try {
+      const cachedRaw = await redis.hget(keepaCacheKey, mapping.primary_asin);
+      if (cachedRaw) {
+        const cached = JSON.parse(cachedRaw);
+        if (cached.price !== null && cached.price > 0) {
+          ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa cache (account ${mapping.onbuy_account_id}): £${cached.price} (${cached.source})`);
+          return applyResult(
+            { price: cached.price, inStock: true, method: cached.source || 'keepa_viewer', priceSource: cached.source },
+            mapping, token, siteId, { consumerKey, secretKey, userSettings }
+          );
+        }
+        // Keepa had no price in any column → item is out of stock on Amazon.
+        // Trust Keepa's OOS signal; do not fall back to live scraping.
+        if (cached.inStock === false) {
+          ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa: no current price → out of stock`);
+          return applyResult(
+            { price: null, inStock: false, method: 'keepa_viewer', priceSource: 'keepa_oos' },
+            mapping, token, siteId, { consumerKey, secretKey, userSettings }
+          );
+        }
+        ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa cache: no price data, falling back to scraper`);
+      }
+    } catch (cacheErr) {
+      ulog(userId, `[FastWorker] Keepa cache read error: ${cacheErr.message} — continuing with scraper`);
+    }
+  }
 
-  // Escalate to slow queue if Twister + Cheerio both failed.
-  // Delay is computed so all remaining fast-queue (Twister/Cheerio) jobs finish
-  // before any Puppeteer session starts — prevents mixing the two phases.
+  const { enableTwister = false, enableCheerio = false, enablePuppeteer = false } = userSettings;
+
+  // If all three scraping methods are disabled, skip scraping entirely.
+  // The Keepa cache above is the sole price source for this account.
+  if (!enableTwister && !enableCheerio && !enablePuppeteer) {
+    ulog(userId, `[FastWorker] ${mapping.primary_asin} — all scraping methods disabled, no Keepa price — skipping`);
+    return { success: false, error: 'no_scraping_methods' };
+  }
+
+  const scraped = await scrapeProductFast(mapping.primary_asin, { enableTwister, enableCheerio });
+
+  // Escalate to slow queue if Twister + Cheerio both failed (or were skipped).
+  // Skip escalation when puppeteer is disabled for this account — mark as failed instead.
+  // Delay is computed so all remaining fast-queue jobs finish before Puppeteer starts.
   if (scraped.needsBrowser) {
+    if (!enablePuppeteer) {
+      ulog(userId, `[FastWorker] ${mapping.primary_asin} → needs browser but puppeteer disabled for this account — marking failed`);
+      await db.query(
+        `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
+         VALUES ($1, 'failed', 'Scrape requires browser (puppeteer disabled for this OnBuy account)', NOW())`,
+        [mapping.id]
+      );
+      return { success: false, error: 'puppeteer_disabled' };
+    }
+
     const fastCounts = await fastQueue.getJobCounts('waiting', 'active');
     const queuedFast = fastCounts.waiting;
     const batches    = Math.ceil(queuedFast / FAST_CONCURRENCY);
@@ -729,7 +904,7 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
       jobId:             `slow-${mapping.id}`,
       delay,
       removeOnComplete:  true,
-      removeOnFail:      { count: 100 },
+      removeOnFail:      true,
       attempts:          2,
       backoff:           { type: 'fixed', delay: 15000 },
     });
@@ -787,6 +962,195 @@ try {
 }
 
 // ─────────────────────────────────────────────
+// KEEPA WORKER
+// Runs one job at a time (concurrency = 1).
+// Job payload: { userId, asins[], keepaEmail, keepaPassword }
+// On completion: stores prices in Redis then kicks off the
+// normal pricing phase via runRepricerJob({ skipKeepa: true }).
+// ─────────────────────────────────────────────
+
+async function processKeepaJob(job) {
+  const {
+    userId, accountId, asins, keepaEmail, keepaPassword,
+    pendingAsins    = null,  // set on quota-refill runs; null on the initial run
+    runNumber       = 1,     // which quota cycle this is (1 = initial, 2+ = hourly refill)
+    asinToMappingIds = {},   // ASIN → [mappingId, ...] built by jobProducer for incremental flush
+  } = job.data;
+  const log = (...args) => ulog(userId, ...args);
+
+  const toFetch   = pendingAsins ?? asins;
+  const quota     = runNumber === 1 ? KEEPA_QUOTA_FULL : KEEPA_HOURLY_FILL;
+  const thisBatch = toFetch.slice(0, quota);
+  const leftover  = toFetch.slice(quota);
+
+  log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}`);
+
+  const cacheKey           = `keepa:prices:${accountId}`;
+  const SUB_BATCH          = 1000;          // one Keepa browser session per sub-batch
+  const FLUSH_PRICE_COUNT  = 1000;          // trigger OnBuy update after this many prices accumulated
+  const FLUSH_INTERVAL_MS  = 5 * 60 * 1000; // …or after 5 minutes, whichever comes first
+
+  let totalPriceCount  = 0;
+  let pendingMappingIds = [];   // mapping IDs waiting for the next OnBuy pricing flush
+  let lastFlushTime    = Date.now();
+  const hasAsinMap     = Object.keys(asinToMappingIds).length > 0;
+
+  // Flush accumulated mapping IDs to the OnBuy pricing phase.
+  // skipCounter=true prevents overwriting the DECRBY-managed counter.
+  // fromKeepaFlush=true prevents the fast worker from double-decrementing per job.
+  const flushToOnBuy = async (ids) => {
+    if (!ids.length) return;
+    log(`[KeepaWorker] Flushing ${ids.length} mapping(s) to OnBuy pricing phase`);
+    try {
+      await runRepricerJob({
+        userId, accountId, mappingIds: ids,
+        skipKeepa: true, skipCounter: true, fromKeepaFlush: true, log,
+      });
+    } catch (err) {
+      log(`[KeepaWorker] OnBuy flush error: ${err.message}`);
+    }
+  };
+
+  // ── Process thisBatch one 1 000-ASIN sub-batch at a time ──────────────────
+  // A single browser session is opened here and reused across all sub-batches,
+  // avoiding the ~15 s login + navigation overhead on sub-batches 2, 3, …
+  log(`[KeepaWorker] Opening Keepa browser session…`);
+  const keepaSession = await createKeepaSession(keepaEmail, keepaPassword, log);
+  try {
+  for (let i = 0; i < thisBatch.length; i += SUB_BATCH) {
+    const chunk    = thisBatch.slice(i, i + SUB_BATCH);
+    const chunkNum = Math.floor(i / SUB_BATCH) + 1;
+    const totalChunks = Math.ceil(thisBatch.length / SUB_BATCH);
+
+    log(`[KeepaWorker] Sub-batch ${chunkNum}/${totalChunks} — ${chunk.length} ASINs`);
+
+    let chunkPrices = {};
+    try {
+      chunkPrices = await keepaSession.scrape(chunk);
+    } catch (err) {
+      log(`[KeepaWorker] Sub-batch ${chunkNum} failed: ${err.message}`);
+    }
+
+    // Persist prices to Redis hash
+    const entries = Object.entries(chunkPrices);
+    if (entries.length > 0) {
+      const pipeline = redis.pipeline();
+      for (const [asin, data] of entries) pipeline.hset(cacheKey, asin, JSON.stringify(data));
+      await pipeline.exec();
+      await redis.expire(cacheKey, 12 * 3600);
+    }
+
+    const chunkPriceCount = Object.values(chunkPrices).filter(r => r.price !== null).length;
+    totalPriceCount += chunkPriceCount;
+    log(`[KeepaWorker] Sub-batch ${chunkNum}: ${chunkPriceCount}/${chunk.length} prices found`);
+
+    // Decrement UI counter by the full chunk size — counter reflects ASINs processed,
+    // not just ones with a price.
+    const afterDecr = await redis.decrby(`repricer:running:${userId}`, chunk.length).catch(() => null);
+    if (afterDecr !== null && afterDecr < 0)
+      redis.set(`repricer:running:${userId}`, 0, 'KEEPTTL').catch(() => {});
+
+    // Accumulate mapping IDs for all ASINs that received a definitive result
+    if (hasAsinMap) {
+      for (const asin of chunk) {
+        if (!chunkPrices[asin]) continue;  // no result from Keepa for this ASIN
+        for (const id of (asinToMappingIds[asin] || [])) pendingMappingIds.push(id);
+      }
+
+      // Flush when ≥ FLUSH_PRICE_COUNT prices have accumulated, or 5 min have passed
+      const byCount = pendingMappingIds.length >= FLUSH_PRICE_COUNT;
+      const byTime  = (Date.now() - lastFlushTime) >= FLUSH_INTERVAL_MS;
+
+      if (byCount || byTime) {
+        // Time-based: flush everything; count-based: flush first FLUSH_PRICE_COUNT, keep remainder
+        const toFlush = byTime
+          ? pendingMappingIds.splice(0)
+          : pendingMappingIds.splice(0, FLUSH_PRICE_COUNT);
+        await flushToOnBuy(toFlush);
+        lastFlushTime = Date.now();
+      }
+    }
+  }
+  } finally {
+    await keepaSession.close().catch(() => {});
+    log(`[KeepaWorker] Browser session closed`);
+  }
+
+  // Final flush for any prices accumulated after the last threshold trigger
+  if (hasAsinMap && pendingMappingIds.length > 0) {
+    log(`[KeepaWorker] Final flush — ${pendingMappingIds.length} remaining mapping(s)`);
+    await flushToOnBuy(pendingMappingIds);
+  }
+
+  // For accounts without asinToMappingIds (old job format), fall back to full account handoff
+  if (!hasAsinMap) {
+    _retryPendingFor.clear();
+    log('[KeepaWorker] No asinToMappingIds — falling back to full account handoff');
+    try {
+      await runRepricerJob({ userId, accountId, skipKeepa: true, log });
+    } catch (err) {
+      log(`[KeepaWorker] Handoff error: ${err.message}`);
+    }
+  }
+
+  _retryPendingFor.clear();
+
+  // ── Schedule quota-refill run for ASINs that exceeded the current cycle limit ──
+  if (leftover.length > 0) {
+    const nextRun = runNumber + 1;
+    const ttlSecs = (Math.ceil(leftover.length / KEEPA_HOURLY_FILL) + 2) * 3600;
+    log(`[KeepaWorker] Quota exhausted (${thisBatch.length} fetched). Scheduling run #${nextRun} in 1 h for ${leftover.length} remaining ASINs.`);
+    redis.set(`repricer:running:${userId}`,     leftover.length, 'EX', ttlSecs).catch(() => {});
+    redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
+    await keepaQueue.add('prefetch', {
+      userId, accountId, asins, asinToMappingIds,
+      pendingAsins: leftover, keepaEmail, keepaPassword, runNumber: nextRun,
+    }, {
+      jobId:            `keepa-${accountId}-r${nextRun}`,
+      delay:            60 * 60 * 1000,
+      removeOnComplete: true, removeOnFail: true, attempts: 1,
+    });
+    log(`[KeepaWorker] ✅ Refill job #${nextRun} scheduled — ${leftover.length} ASINs in ~1 h`);
+  } else {
+    redis.del(`keepa:refill-pending:${userId}`).catch(() => {});
+    if (runNumber > 1) log(`[KeepaWorker] All ASINs processed across ${runNumber} quota cycles`);
+  }
+
+  return { priceCount: totalPriceCount, asinCount: thisBatch.length, remaining: leftover.length };
+}
+
+const keepaWorker = new Worker('keepa-scrape', processKeepaJob, {
+  connection:  redis,
+  concurrency: 1,          // only one Keepa browser session at a time
+});
+
+keepaWorker.on('active', (job) => {
+  _keepaActive++;
+  if (!_runStartTime) _runStartTime = new Date();
+  const { userId, accountId, asins, pendingAsins } = job.data || {};
+  // For refill runs use pendingAsins length; for first run use full asins length
+  const displayCount = pendingAsins?.length ?? asins?.length ?? 1;
+  wlog(`[DEBUG KeepaWorker active] job=${job?.id} userId=${userId} accountId=${accountId} asins=${displayCount} _keepaActive=${_keepaActive} _runUserIds=${_runUserIds.size}`);
+  if (userId) {
+    _runUserIds.add(userId);
+    // Show pending ASIN count as "jobs in queue" while browser session runs
+    redis.set(`repricer:running:${userId}`, displayCount, 'EX', 1800).catch(() => {});
+  }
+});
+keepaWorker.on('completed', (job, result) => {
+  _keepaActive = Math.max(0, _keepaActive - 1);
+  wlog(`[KeepaWorker] ✅ job ${job?.id} done — ${result?.priceCount}/${result?.asinCount} prices fetched`);
+  wlog(`[DEBUG KeepaWorker completed] _keepaActive=${_keepaActive} _runUserIds=${_runUserIds.size} _retryPendingFor=${_retryPendingFor.size}`);
+  _checkAllDone();
+});
+keepaWorker.on('failed', (job, err) => {
+  _keepaActive = Math.max(0, _keepaActive - 1);
+  wlog(`[KeepaWorker] ❌ job ${job?.id} failed: ${err.message}`);
+  wlog(`[DEBUG KeepaWorker failed] _keepaActive=${_keepaActive} _runUserIds=${_runUserIds.size}`);
+  _checkAllDone();
+});
+
+// ─────────────────────────────────────────────
 // START WORKERS
 // Workers boot with the process and idle until
 // jobs arrive. Concurrency tuned via env vars.
@@ -814,21 +1178,22 @@ slowWorker.on('failed', (job, err) =>
 // `drained` event, because `drained` fires when there are no *waiting*
 // jobs but ignores *delayed* ones — escalated Puppeteer jobs land in the
 // slow queue with a delay, so the slow queue looks empty too early.
-let _fastActive = 0, _slowActive = 0;
+let _fastActive = 0, _slowActive = 0, _keepaActive = 0;
 // Tracks which users had jobs in the current run so system-level "all done"
 // messages can be written to each of their log files.
+// Cleared synchronously when the main-run completion path fires — this acts as the
+// guard that prevents double-firing: subsequent _checkAllDone calls see size===0 and
+// return immediately. Re-populated when the next run's worker 'active' events fire.
 const _runUserIds = new Set();
-let _retryScheduled   = false;      // true after first completion — prevents double-retry until next cron tick
 const _retryPendingFor = new Set(); // userIds with active retry jobs currently in queue
 // Initialized to 24 h ago so a restart with an existing queue catches pre-restart failures.
 // The cron callback resets this to null before each fresh scheduled run.
 let _runStartTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
 async function _checkAllDone() {
-  // Cheap early-exit: workers are still processing
-  if (_fastActive > 0 || _slowActive > 0) return;
-  // Guard: retry already scheduled/done for this run — nothing more to do until next cron tick
-  if (_retryScheduled && _retryPendingFor.size === 0) return;
+  // Cheap early-exit: workers are still processing (including keepa browser phase)
+  if (_fastActive > 0 || _slowActive > 0 || _keepaActive > 0) return;
+  wlog(`[DEBUG _checkAllDone] entering — _runUserIds=${_runUserIds.size} _retryPendingFor=${_retryPendingFor.size} _runStartTime=${_runStartTime}`);
 
   const [fc, sc] = await Promise.all([
     fastQueue.getJobCounts('waiting', 'delayed', 'active'),
@@ -843,24 +1208,32 @@ async function _checkAllDone() {
       wlog('[Workers] Retry run completed — flushing remaining OnBuy batches');
       for (const uid of _runUserIds) {
         logToUser(uid, '[Workers] Retry run completed');
-        redis.del(`repricer:running:${uid}`).catch(() => {});
+        // Don't clear the UI counter if a Keepa quota-refill job is still pending
+        const hasRefill = await redis.exists(`keepa:refill-pending:${uid}`).catch(() => 0);
+        if (!hasRefill) redis.del(`repricer:running:${uid}`).catch(() => {});
       }
       onbuyUpdater.flushAll(_runUserIds);
       _retryPendingFor.clear();
       _runStartTime = null;
       _runUserIds.clear();
+      fastQueue.clean(0, 1000, 'failed').catch(() => {});
+      slowQueue.clean(0, 1000, 'failed').catch(() => {});
       return;
     }
+
+    // Guard: _runUserIds is cleared synchronously at the bottom of this path,
+    // so any subsequent spurious call returns here until the next run starts.
+    wlog(`[DEBUG _checkAllDone] queues empty — _retryPendingFor=${_retryPendingFor.size} _runUserIds=${_runUserIds.size}`);
+    if (!_runUserIds.size) { wlog('[DEBUG _checkAllDone] _runUserIds empty — returning (no active run)'); return; }
 
     // Main run finished — flush batches, then schedule one automatic retry pass
     wlog('[Workers] All jobs done — flushing pending OnBuy batches immediately');
     for (const uid of _runUserIds) logToUser(uid, '[Workers] All jobs done — flushing pending OnBuy batches immediately');
     onbuyUpdater.flushAll(_runUserIds);
 
-    _retryScheduled = true;
     const runUserIds = [..._runUserIds];
     const runStart   = _runStartTime;
-    _runUserIds.clear();
+    _runUserIds.clear(); // ← synchronous — guards against re-entry before async work below
     // Wait for all OnBuy batches to send + a brief window for sync_logs DB writes to land
     onbuyUpdater._mutex
       .then(() => new Promise(r => setTimeout(r, 5000)))
@@ -902,9 +1275,15 @@ async function _scheduleRetry(userIds, runStart) {
   }
 
   if (retries.length === 0) {
-    // Nothing to retry — clear the running indicator for all users in this run
-    for (const uid of userIds) redis.del(`repricer:running:${uid}`).catch(() => {});
-    return; // _retryScheduled stays true — guard holds until next cron tick
+    // Nothing to retry — clear counter unless a Keepa quota-refill job is still pending
+    for (const uid of userIds) {
+      const hasRefill = await redis.exists(`keepa:refill-pending:${uid}`).catch(() => 0);
+      if (!hasRefill) redis.del(`repricer:running:${uid}`).catch(() => {});
+    }
+    _runStartTime = null;
+    fastQueue.clean(0, 1000, 'failed').catch(() => {});
+    slowQueue.clean(0, 1000, 'failed').catch(() => {});
+    return;
   }
 
   // Populate _retryPendingFor BEFORE enqueuing so the _checkAllDone guard holds
@@ -926,15 +1305,52 @@ async function _scheduleRetry(userIds, runStart) {
   if (_retryPendingFor.size > 0) setTimeout(_checkAllDone, 2000);
 }
 
-fastWorker.on('active',    (job) => { _fastActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
-fastWorker.on('drained',   ()    => { _checkAllDone(); });
-fastWorker.on('completed', ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
-fastWorker.on('failed',    ()    => { _fastActive = Math.max(0, _fastActive - 1); _checkAllDone(); });
+// Decrement the per-user running counter by 1 as each ASIN is processed.
+// Uses KEEPTTL so the decrement doesn't reset the expiry set at job start.
+// Floors at 0 to prevent the key going negative after a counter reset.
+// Skips jobs that originated from a Keepa flush — the Keepa worker already
+// decremented by the full sub-batch size (DECRBY 1000), so individual job
+// decrements would undercount and push the key negative.
+async function _decrementCounter(job) {
+  if (job?.data?.fromKeepaFlush) return;
+  const uid = job?.data?.mapping?.user_id;
+  if (!uid) return;
+  const remaining = await redis.decr(`repricer:running:${uid}`).catch(() => null);
+  if (remaining !== null && remaining < 0)
+    redis.set(`repricer:running:${uid}`, 0, 'KEEPTTL').catch(() => {});
+}
 
-slowWorker.on('active',    (job) => { _slowActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id); });
+fastWorker.on('active',    (job) => {
+  _fastActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id);
+});
+fastWorker.on('drained',   ()    => { _checkAllDone(); });
+fastWorker.on('completed', (job, result) => {
+  _fastActive = Math.max(0, _fastActive - 1);
+  // Escalated jobs are re-queued on the slow queue — don't count them as done yet;
+  // the slow worker's completed/failed event will decrement instead.
+  if (result?.escalated !== true) _decrementCounter(job);
+  _checkAllDone();
+});
+fastWorker.on('failed',    (job) => {
+  _fastActive = Math.max(0, _fastActive - 1);
+  _decrementCounter(job);
+  _checkAllDone();
+});
+
+slowWorker.on('active',    (job) => {
+  _slowActive++; if (!_runStartTime) _runStartTime = new Date(); if (job?.data?.mapping?.user_id) _runUserIds.add(job.data.mapping.user_id);
+});
 slowWorker.on('drained',   ()    => { _checkAllDone(); });
-slowWorker.on('completed', ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
-slowWorker.on('failed',    ()    => { _slowActive = Math.max(0, _slowActive - 1); _checkAllDone(); });
+slowWorker.on('completed', (job) => {
+  _slowActive = Math.max(0, _slowActive - 1);
+  _decrementCounter(job);
+  _checkAllDone();
+});
+slowWorker.on('failed',    (job) => {
+  _slowActive = Math.max(0, _slowActive - 1);
+  _decrementCounter(job);
+  _checkAllDone();
+});
 
 wlog(`[Workers] ✅ Fast workers: ${FAST_CONCURRENCY}  |  Slow workers: ${SLOW_CONCURRENCY}`);
 
@@ -991,8 +1407,6 @@ async function refreshSchedules() {
             return;
           }
         }
-        // Reset retry state so this new run gets its own retry pass
-        _retryScheduled = false;
         _retryPendingFor.clear();
         _runStartTime = null;
         runRepricerJob({ userId: uid, log: (...args) => ulog(uid, ...args) });
@@ -1035,14 +1449,24 @@ startScheduler();
 
 // Subscribe to settings-change events published by the API server.
 // Refreshes per-user crons immediately when any user saves settings.
-redisSub.subscribe('repricer:settings-updated', (err) => {
-  if (err) wlog('[RepricerJob] Could not subscribe to settings channel:', err.message);
-  else     wlog('[RepricerJob] Subscribed to repricer:settings-updated');
+redisSub.subscribe('repricer:settings-updated', 'repricer:manual-sync', (err) => {
+  if (err) wlog('[RepricerJob] Could not subscribe to channels:', err.message);
+  else     wlog('[RepricerJob] Subscribed to repricer:settings-updated + repricer:manual-sync');
 });
-redisSub.on('message', (channel) => {
+redisSub.on('message', (channel, message) => {
   if (channel === 'repricer:settings-updated') {
     wlog('[RepricerJob] Settings change detected — refreshing schedules');
     refreshSchedules();
+  }
+  if (channel === 'repricer:manual-sync') {
+    wlog(`[DEBUG manual-sync] received — _runUserIds=${_runUserIds.size} _retryPendingFor=${_retryPendingFor.size} _fastActive=${_fastActive} _slowActive=${_slowActive} _keepaActive=${_keepaActive} _runStartTime=${_runStartTime}`);
+    _retryPendingFor.clear();
+    _runStartTime = null;
+    // Trigger the repricer run directly in the worker process so sync works even if
+    // the server-side runRepricerJob call fails silently.
+    const syncUserId = message === 'all' ? null : (parseInt(message) || null);
+    runRepricerJob({ userId: syncUserId, log: (...args) => ulog(syncUserId, ...args) })
+      .catch(err => wlog('[ManualSync] runRepricerJob error:', err.message));
   }
 });
 

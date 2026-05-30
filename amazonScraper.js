@@ -1125,53 +1125,49 @@ export async function getProductDetails(asin, { maxRetries = 3 } = {}) {
 //   scrapeProductSlow  — Puppeteer only
 // ─────────────────────────────────────────────
 
-export async function scrapeProductFast(asin) {
+export async function scrapeProductFast(asin, { enableTwister = true, enableCheerio = true } = {}) {
   await _fastScrapeLimit.acquire();
   try {
-    return await _scrapeProductFast(asin);
+    return await _scrapeProductFast(asin, { enableTwister, enableCheerio });
   } finally {
     _fastScrapeLimit.release();
   }
 }
 
-async function _scrapeProductFast(asin) {
+async function _scrapeProductFast(asin, { enableTwister = true, enableCheerio = true } = {}) {
   // Jitter inside the semaphore slot so concurrent holders don't all fire at t=0.
-  // This staggers actual HTTP requests even when multiple slots are available.
   await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
 
   const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
 
   // Step 0: Twister AJAX
-  const twisterResult = await fetchTwisterPrice(asin);
-
-  if (twisterResult?.price)
-    return { asin, url, price: twisterResult.price, priceSource: 'twister_ajax', inStock: true, method: 'twister_ajax' };
-
-  if (twisterResult?.responded) {
-    // Twister reached Amazon and got a valid response but found no price.
-    // Treat as OOS — no point launching an expensive browser session.
-    return { asin, url, price: null, inStock: false, method: 'twister_no_price' };
+  if (enableTwister) {
+    const twisterResult = await fetchTwisterPrice(asin);
+    if (twisterResult?.price)
+      return { asin, url, price: twisterResult.price, priceSource: 'twister_ajax', inStock: true, method: 'twister_ajax' };
+    if (twisterResult?.responded) {
+      // Twister reached Amazon but found no price — treat as OOS.
+      return { asin, url, price: null, inStock: false, method: 'twister_no_price' };
+    }
+    // twisterResult === null: Twister failed (network/proxy). Fall through to Cheerio.
   }
-
-  // twisterResult === null: Twister failed entirely (all proxies returned HTTP errors /
-  // network errors). Fall through to Cheerio, then escalate only if Cheerio also fails.
 
   // Step 1: Cheerio HTML
-  // Wrap in try/catch — TLS disconnects and proxy network errors throw here.
-  // Treat as a transient failure and escalate to Puppeteer rather than crashing the job.
-  let cheerioResult;
-  try {
-    cheerioResult = await cheerioScrape(url);
-  } catch (err) {
-    log('warn', `Cheerio network error — escalating to Puppeteer: ${err.message}`, { asin });
-    return { asin, url, needsBrowser: true };
+  if (enableCheerio) {
+    let cheerioResult;
+    try {
+      cheerioResult = await cheerioScrape(url);
+    } catch (err) {
+      log('warn', `Cheerio network error — escalating to Puppeteer: ${err.message}`, { asin });
+      return { asin, url, needsBrowser: true };
+    }
+    if (!cheerioResult.blocked && !cheerioResult.needsBrowser && cheerioResult.price)
+      return { asin, url, ...cheerioResult, method: 'cheerio' };
+    if (cheerioResult.inStock === false)
+      return { asin, url, price: null, inStock: false, method: 'cheerio' };
   }
-  if (!cheerioResult.blocked && !cheerioResult.needsBrowser && cheerioResult.price)
-    return { asin, url, ...cheerioResult, method: 'cheerio' };
-  if (cheerioResult.inStock === false)
-    return { asin, url, price: null, inStock: false, method: 'cheerio' };
 
-  // Both Twister and Cheerio failed — signal worker to escalate to slow queue (Puppeteer)
+  // All enabled fast methods failed (or none were enabled) — signal slow-queue escalation.
   return { asin, url, needsBrowser: true };
 }
 

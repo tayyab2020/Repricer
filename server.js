@@ -345,12 +345,14 @@ app.delete('/api/mappings', requireAuth, async (req, res) => {
 // MANUAL SYNC TRIGGER
 // ─────────────────────────────────────────────
 
-// POST /api/sync — trigger full sync manually
-// Super admin (not impersonating) syncs all users; everyone else is scoped to their own account.
+// POST /api/sync — trigger a sync for the requesting user's own mappings.
+// Always scoped to req.effectiveUserId so super_admin only syncs their own listings,
+// not every user's listings in the system.
 app.post('/api/sync', requireAuth, async (req, res) => {
   try {
-    const globalSync = req.user.role === 'super_admin' && !req.isImpersonating;
-    runRepricerJob({ userId: globalSync ? null : req.effectiveUserId }).catch(console.error);
+    const uid = req.effectiveUserId;
+    console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid}`);
+    redisPub.publish('repricer:manual-sync', String(uid)).catch(() => {});
     res.json({ message: 'Sync job started successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -681,7 +683,10 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, account_name, site_id, is_active, last_tested_at, last_test_ok, created_at,
-              LEFT(consumer_key, 6) || '••••••' AS consumer_key_hint
+              LEFT(consumer_key, 6) || '••••••' AS consumer_key_hint,
+              keepa_email,
+              CASE WHEN keepa_password IS NOT NULL AND keepa_password != '' THEN true ELSE false END AS has_keepa_password,
+              enable_puppeteer, enable_twister, enable_cheerio
        FROM onbuy_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.effectiveUserId]
     );
@@ -691,14 +696,20 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
 
 // POST /api/accounts — create account
 app.post('/api/accounts', requireAuth, async (req, res) => {
-  const { account_name, consumer_key, secret_key, site_id = '2000' } = req.body;
+  const { account_name, consumer_key, secret_key, site_id = '2000', keepa_email, keepa_password,
+          enable_puppeteer, enable_twister, enable_cheerio } = req.body;
   if (!account_name || !consumer_key || !secret_key)
     return res.status(400).json({ error: 'account_name, consumer_key and secret_key are required' });
   try {
     const { rows } = await db.query(
-      `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, account_name, site_id, is_active, created_at`,
-      [account_name, consumer_key, secret_key, site_id, req.effectiveUserId]
+      `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id, keepa_email, keepa_password,
+                                   enable_puppeteer, enable_twister, enable_cheerio)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, account_name, site_id, is_active, created_at, keepa_email,
+                 enable_puppeteer, enable_twister, enable_cheerio`,
+      [account_name, consumer_key, secret_key, site_id, req.effectiveUserId,
+       keepa_email || null, keepa_password || null,
+       enable_puppeteer === true, enable_twister === true, enable_cheerio === true]
     );
     res.status(201).json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -706,18 +717,29 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 
 // PUT /api/accounts/:id — update account
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
-  const { account_name, consumer_key, secret_key, site_id, is_active } = req.body;
+  const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
+          enable_puppeteer, enable_twister, enable_cheerio } = req.body;
   try {
     const { rows } = await db.query(
       `UPDATE onbuy_accounts SET
-         account_name = COALESCE($1, account_name),
-         consumer_key = COALESCE(NULLIF($2,''), consumer_key),
-         secret_key   = COALESCE(NULLIF($3,''), secret_key),
-         site_id      = COALESCE($4, site_id),
-         is_active    = COALESCE($5, is_active),
-         updated_at   = NOW()
-       WHERE id = $6 AND user_id = $7 RETURNING id, account_name, site_id, is_active`,
-      [account_name, consumer_key, secret_key, site_id, is_active, req.params.id, req.effectiveUserId]
+         account_name     = COALESCE($1, account_name),
+         consumer_key     = COALESCE(NULLIF($2,''), consumer_key),
+         secret_key       = COALESCE(NULLIF($3,''), secret_key),
+         site_id          = COALESCE($4, site_id),
+         is_active        = COALESCE($5, is_active),
+         keepa_email      = COALESCE(NULLIF($6,''), keepa_email),
+         keepa_password   = COALESCE(NULLIF($7,''), keepa_password),
+         enable_puppeteer = COALESCE($8, enable_puppeteer),
+         enable_twister   = COALESCE($9, enable_twister),
+         enable_cheerio   = COALESCE($10, enable_cheerio),
+         updated_at       = NOW()
+       WHERE id = $11 AND user_id = $12
+       RETURNING id, account_name, site_id, is_active, keepa_email,
+                 enable_puppeteer, enable_twister, enable_cheerio`,
+      [account_name || null, consumer_key || null, secret_key || null, site_id || null,
+       is_active ?? null, keepa_email ?? null, keepa_password ?? null,
+       enable_puppeteer ?? null, enable_twister ?? null, enable_cheerio ?? null,
+       req.params.id, req.effectiveUserId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
@@ -979,26 +1001,18 @@ async function createOnBuyListing(opc, price, sku, token, siteId) {
 
 // GET /api/import/template — download the import template
 app.get('/api/import/template', requireAuth, (req, res) => {
-  // Columns: No# | Product Name | Sourcing Link | Onbuy Link | Source Price | Selling Price |
-  //          Onbuy Fee | Total Cost | Net Profit | ROI % | Seller SKU | OPC
+  // Columns: No# | Product Name | Seller SKU
   //
-  // Selling Price = Source Price + (Source Price × ROI%) + Onbuy Fee
-  // Total Cost    = Source Price + Onbuy Fee
-  // Net Profit    = Selling Price − Total Cost
-  // Seller SKU    = SKU you assigned when listing on OnBuy (used by repricer to update price)
-  // OPC           = OnBuy listing identifier (numeric = product code, alphanumeric = listing UID)
+  // Seller SKU = Amazon ASIN and OnBuy seller SKU (used to scrape Amazon price and update the listing)
 
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet([
-    // Row 1: Column headers
-    ['No#', 'Product Name', 'Selling Price', 'Onbuy Fee', 'Total Cost', 'Net Profit', 'ROI %', 'Seller SKU', 'OPC'],
-    // Row 2: Sample 1 (all fields filled)
-    [1, 'TP-Link Tapo 3K 5MP Pan/Tilt Security Camera', 106, 15.9, 85.9, 20.1, 28.71, 'B0F5K2H4NQ', 'PV5JMNM'],
-    // Row 3: Sample 2 (minimal — Product Name + financial cols auto-filled on import)
-    [2, '', 20.5, '', '', '', '', 'B0CW9BC1XF', 'PF2XQP8'],
+    ['No#', 'Product Name', 'Seller SKU'],
+    [1, 'TP-Link Tapo 3K 5MP Pan/Tilt Security Camera', 'B0F5K2H4NQ'],
+    [2, 'Foam Exercise Floor Mats', 'B0CPM1JG1B'],
   ]);
 
-  ws['!cols'] = [5, 40, 13, 10, 10, 10, 8, 16, 14].map(w => ({ wch: w }));
+  ws['!cols'] = [5, 50, 18].map(w => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, ws, 'Import Template');
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1087,7 +1101,7 @@ app.post('/api/import/preview', requireAuth, upload.single('file'), (req, res) =
       const sheetRoi    = parseFloat(mapped.markup_value);
       const hasRoiCol   = !isNaN(sheetRoi) && String(mapped.markup_value || '').trim() !== '';
       const markupType  = (hasRoiCol || sellingPrice) ? 'roi'
-                        : String(mapped.markup_type || 'percent').toLowerCase().trim();
+                        : String(mapped.markup_type || 'roi').toLowerCase().trim();
       const markupValue = hasRoiCol ? sheetRoi : _globalSettings.defaultRoi;
 
       // OnBuy Fee: use sheet value if present, otherwise auto-calculate as fee% of selling price
@@ -1304,6 +1318,8 @@ async function runMigrations() {
   const steps = [
     // onbuy_listing_id was VARCHAR(100) — OnBuy product URLs exceed that
     `ALTER TABLE product_mappings ALTER COLUMN onbuy_listing_id TYPE TEXT`,
+    // SKU-only imports don't supply a listing UID — make the column nullable
+    `ALTER TABLE product_mappings ALTER COLUMN onbuy_listing_id DROP NOT NULL`,
     // store OPC alongside UID so we can always re-link or re-create if needed
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS onbuy_opc TEXT`,
     // onbuy_fee: fixed platform fee added on top of ROI-based price calculation
@@ -1356,6 +1372,16 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts   ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE`,
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE`,
     `ALTER TABLE import_logs      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE SET NULL`,
+    // Per-account Keepa credentials (replaces global keepa_email/keepa_password in settings)
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS keepa_email TEXT`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS keepa_password TEXT`,
+    // Per-account puppeteer toggle: false = skip slow-queue browser escalation
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_puppeteer BOOLEAN NOT NULL DEFAULT false`,
+    // Per-account Twister/Cheerio toggles — default off, rely on Keepa by default
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_twister BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_cheerio BOOLEAN NOT NULL DEFAULT false`,
+    // Index for the repricer job query: ORDER BY last_synced_at per active user avoids a full table scan
+    `CREATE INDEX IF NOT EXISTS idx_pm_active_synced ON product_mappings (user_id, last_synced_at ASC NULLS FIRST) WHERE is_active = true`,
   ];
   for (const sql of steps) {
     try {
