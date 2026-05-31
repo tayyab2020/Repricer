@@ -46,10 +46,10 @@ export async function getTokenForAccount(account) {
   }
 }
 
-export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false } = {}) {
+export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
   const jlog = log ?? ((...a) => console.log(`[${new Date().toISOString()}]`, ...a));
   jlog('\n' + '═'.repeat(60));
-  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}${accountId ? ` (account ${accountId})` : ''}${mappingIds?.length ? ` — retrying ${mappingIds.length} mapping(s)` : ''}`);
+  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}${accountId ? ` (account ${accountId})` : ''}${mappingIds?.length ? ` — retrying ${mappingIds.length} mapping(s)` : ''}${onlyUnsynced ? ' — unsynced-only' : ''}`);
   jlog('═'.repeat(60));
 
   try {
@@ -66,6 +66,9 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
     if (mappingIds?.length) {
       queryParams.push(mappingIds);
       conditions.push(`pm.id = ANY($${queryParams.length})`);
+    }
+    if (onlyUnsynced) {
+      conditions.push('pm.last_synced_at IS NULL');
     }
 
     const { rows: mappings } = await db.query(`
@@ -197,6 +200,11 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
     for (const m of pricingMappings) {
       const aid = m.onbuy_account_id;
       if (aid && !(aid in tokenCache)) {
+        if (!m.acct_consumer_key || !m.acct_secret_key) {
+          jlog(`[Job] ⚠️  Account id=${aid} not found or inactive — skipping its mappings`);
+          tokenCache[aid] = null;  // mark as checked so we don't log again
+          continue;
+        }
         jlog(`[Job] Fetching token for "${m.acct_name}" (id=${aid})…`);
         credCache[aid]  = { consumerKey: m.acct_consumer_key, secretKey: m.acct_secret_key };
         tokenCache[aid] = await getTokenForAccount({
@@ -205,7 +213,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
           secret_key:   m.acct_secret_key,
         });
         siteCache[aid] = m.acct_site_id || '2000';
-        jlog(`[Job] Token for "${m.acct_name}": ${tokenCache[aid] ? '✅' : '❌'}`);
+        jlog(`[Job] Token for "${m.acct_name}" (id=${aid}): ${tokenCache[aid] ? '✅' : '❌'}`);
       }
     }
 

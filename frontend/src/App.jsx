@@ -1723,9 +1723,12 @@ export default function App() {
     return <LoginPage onLogin={login} />;
   }
 
-  const syncAll = async () => {
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
+
+  const triggerSync = async (onlyUnsynced) => {
+    setSyncModalOpen(false);
     setSyncing(true);
-    await api("/sync", { method: "POST" }).catch(console.error);
+    await api("/sync", { method: "POST", body: JSON.stringify({ onlyUnsynced }) }).catch(console.error);
     // Poll every second until the queue actually shows busy (jobs enqueued) or
     // 30 s pass without activity — whichever comes first.
     let attempts = 0;
@@ -1833,7 +1836,7 @@ export default function App() {
         {/* Sync + user info */}
         <div style={{ padding:"16px 20px", borderTop:`1px solid ${C.border}` }}>
           <Btn
-            onClick={syncAll}
+            onClick={() => { if (!syncing && !queueBusy) setSyncModalOpen(true); }}
             disabled={syncing || queueBusy}
             title={queueBusy
               ? `Queue busy — fast: ${queueCounts?.fast?.waiting ?? 0}w/${queueCounts?.fast?.active ?? 0}a, slow: ${queueCounts?.slow?.waiting ?? 0}w/${queueCounts?.slow?.active ?? 0}a, keepa: ${queueCounts?.keepa?.waiting ?? 0}w/${queueCounts?.keepa?.active ?? 0}a`
@@ -1842,6 +1845,57 @@ export default function App() {
           >
             {syncing ? "⏳ Syncing…" : queueBusy ? "⏳ Jobs Running…" : "↺ Sync All Now"}
           </Btn>
+
+          {/* Sync scope modal */}
+          {syncModalOpen && (
+            <div style={{
+              position:"fixed", inset:0, zIndex:1000,
+              background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center",
+            }} onClick={() => setSyncModalOpen(false)}>
+              <div style={{
+                background: C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+                padding:28, width:340, display:"flex", flexDirection:"column", gap:16,
+              }} onClick={e => e.stopPropagation()}>
+                <h3 style={{ color:C.text, margin:0, fontSize:16 }}>Choose Sync Scope</h3>
+                <p style={{ color:C.muted, margin:0, fontSize:13, lineHeight:1.5 }}>
+                  Which listings should be synced?
+                </p>
+                <button
+                  onClick={() => triggerSync(false)}
+                  style={{
+                    background:C.accent, color:"#000", border:"none", borderRadius:8,
+                    padding:"12px 16px", cursor:"pointer", fontWeight:600, fontSize:14, textAlign:"left",
+                  }}
+                >
+                  ↺ Sync All Listings
+                  <div style={{ fontWeight:400, fontSize:12, marginTop:3, opacity:0.7 }}>
+                    Re-sync every active listing
+                  </div>
+                </button>
+                <button
+                  onClick={() => triggerSync(true)}
+                  style={{
+                    background:"#1a2535", color:C.text, border:`1px solid ${C.border}`,
+                    borderRadius:8, padding:"12px 16px", cursor:"pointer", fontWeight:600, fontSize:14, textAlign:"left",
+                  }}
+                >
+                  ✦ Sync Unsynced Only
+                  <div style={{ fontWeight:400, fontSize:12, marginTop:3, opacity:0.7 }}>
+                    Only listings with Last Sync = Never
+                  </div>
+                </button>
+                <button
+                  onClick={() => setSyncModalOpen(false)}
+                  style={{
+                    background:"transparent", color:C.muted, border:"none",
+                    cursor:"pointer", fontSize:13, padding:"4px 0",
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
           <p style={{ color: queueBusy ? C.amber : C.muted, fontSize:10, textAlign:"center", marginTop:8 }}>
             {queueBusy
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`

@@ -397,8 +397,9 @@ app.delete('/api/mappings', requireAuth, async (req, res) => {
 app.post('/api/sync', requireAuth, async (req, res) => {
   try {
     const uid = req.effectiveUserId;
-    console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid}`);
-    redisPub.publish('repricer:manual-sync', String(uid)).catch(() => {});
+    const onlyUnsynced = req.body?.onlyUnsynced === true;
+    console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid} onlyUnsynced=${onlyUnsynced}`);
+    redisPub.publish('repricer:manual-sync', JSON.stringify({ userId: uid, onlyUnsynced })).catch(() => {});
     res.json({ message: 'Sync job started successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });

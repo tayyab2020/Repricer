@@ -1472,10 +1472,16 @@ redisSub.on('message', (channel, message) => {
     wlog(`[DEBUG manual-sync] received — _runUserIds=${_runUserIds.size} _retryPendingFor=${_retryPendingFor.size} _fastActive=${_fastActive} _slowActive=${_slowActive} _keepaActive=${_keepaActive} _runStartTime=${_runStartTime}`);
     _retryPendingFor.clear();
     _runStartTime = null;
-    // Trigger the repricer run directly in the worker process so sync works even if
-    // the server-side runRepricerJob call fails silently.
-    const syncUserId = message === 'all' ? null : (parseInt(message) || null);
-    runRepricerJob({ userId: syncUserId, log: (...args) => ulog(syncUserId, ...args) })
+    // Parse message — new format is JSON {userId, onlyUnsynced}; old format was plain userId string
+    let syncUserId = null, onlyUnsynced = false;
+    try {
+      const parsed = JSON.parse(message);
+      syncUserId   = parsed.userId      ?? null;
+      onlyUnsynced = parsed.onlyUnsynced ?? false;
+    } catch {
+      syncUserId = message === 'all' ? null : (parseInt(message) || null);
+    }
+    runRepricerJob({ userId: syncUserId, onlyUnsynced, log: (...args) => ulog(syncUserId, ...args) })
       .catch(err => wlog('[ManualSync] runRepricerJob error:', err.message));
   }
 });
