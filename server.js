@@ -423,8 +423,8 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
                         (slow.waiting  + slow.active  + slow.delayed) +
                         (keepa.waiting + keepa.active + keepa.delayed);
 
-      // When Keepa is running the BullMQ keepa queue has 1 job but the Redis
-      // repricer:running:* keys hold the actual ASIN count — use whichever is larger.
+      // Display total = all users' jobs (for the info counter).
+      // busy = only super-admin's OWN jobs — other users running should not block the button.
       const runningKeys = await redis.keys('repricer:running:*');
       let asinTotal = 0;
       if (runningKeys.length > 0) {
@@ -432,7 +432,8 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
         asinTotal = vals.reduce((sum, v) => sum + (parseInt(v) || 0), 0);
       }
       const total = Math.max(bullTotal, asinTotal);
-      return res.json({ fast, slow, keepa, total, busy: total > 0 });
+      const ownRunning = parseInt(await redis.get(`repricer:running:${req.user.id}`) || '0');
+      return res.json({ fast, slow, keepa, total, busy: ownRunning > 0 });
     }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
     res.json({ total: pending, busy: pending > 0 });
