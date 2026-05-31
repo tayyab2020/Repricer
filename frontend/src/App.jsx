@@ -346,7 +346,8 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   const [search, setSearch]     = useState("");
   const [searchInput, setSearchInput] = useState("");
   const searchTimer = useRef(null);
-  const [clearing, setClearing] = useState(false);
+  const [clearing, setClearing]   = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [form, setForm] = useState({
     product_name: "", onbuy_listing_id: "", onbuy_sku: "",
     primary_asin: "", markup_type: "percent", markup_value: 20,
@@ -415,18 +416,23 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   };
 
   const exportMappings = async () => {
-    const token = localStorage.getItem("repricer_token");
-    const res = await fetch(API + "/mappings/export", {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!res.ok) { alert("Export failed"); return; }
-    const blob = await res.blob();
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href     = url;
-    a.download = "mappings.xlsx";
-    a.click();
-    URL.revokeObjectURL(url);
+    setExporting(true);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const res = await fetch(API + "/mappings/export", {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) { alert("Export failed"); return; }
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = "mappings.xlsx";
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
   };
 
   const handleSearchInput = (v) => {
@@ -472,10 +478,17 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
           </Btn>
           <Btn
             onClick={exportMappings}
-            disabled={total === 0}
-            style={{ background:"#166534", opacity: total === 0 ? 0.5 : 1 }}
+            disabled={exporting || total === 0}
+            style={{ background:"#166534", opacity: (exporting || total === 0) ? 0.5 : 1, display:"flex", alignItems:"center", gap:6 }}
           >
-            Export to Excel
+            {exporting && (
+              <span style={{
+                display:"inline-block", width:12, height:12, borderRadius:"50%",
+                border:"2px solid rgba(255,255,255,0.3)", borderTopColor:"#fff",
+                animation:"spin 0.7s linear infinite",
+              }} />
+            )}
+            {exporting ? "Exporting…" : "Export to Excel"}
           </Btn>
           <Btn onClick={() => setShowForm(true)}>+ Add Mapping</Btn>
         </div>
@@ -1051,6 +1064,7 @@ function LoginPage({ onLogin }) {
         * { box-sizing: border-box; margin: 0; padding: 0; }
         input { outline: none; }
         input:focus { border-color: ${C.accent} !important; }
+        @keyframes spin { to { transform: rotate(360deg); } }
       `}</style>
       <div style={{
         background: C.surface, border: `1px solid ${C.border}`,

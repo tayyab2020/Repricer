@@ -680,7 +680,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
       ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
     }
     await db.query(
-      `UPDATE product_mappings SET amazon_in_stock = false, last_checked_at = NOW() WHERE id = $1`, [id]
+      `UPDATE product_mappings SET amazon_in_stock = false, last_checked_at = NOW(), last_synced_at = NOW() WHERE id = $1`, [id]
     );
     await db.query(
       `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
@@ -1108,7 +1108,8 @@ async function processKeepaJob(job) {
   if (leftover.length > 0) {
     const nextRun = runNumber + 1;
     const ttlSecs = (Math.ceil(leftover.length / KEEPA_HOURLY_FILL) + 2) * 3600;
-    log(`[KeepaWorker] Quota exhausted (${thisBatch.length} fetched). Scheduling run #${nextRun} in 1 h for ${leftover.length} remaining ASINs.`);
+    const fetched = thisBatch.length - (quotaExhaustedIdx >= 0 ? thisBatch.length - quotaExhaustedIdx : 0);
+    log(`[KeepaWorker] Quota exhausted (${fetched} fetched this run). Scheduling run #${nextRun} in 1 h for ${leftover.length} remaining ASINs.`);
     redis.set(`repricer:running:${userId}`,     leftover.length, 'EX', ttlSecs).catch(() => {});
     redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
     await keepaQueue.add('prefetch', {
