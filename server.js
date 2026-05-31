@@ -1257,8 +1257,9 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
   const { rows: existing } = await db.query(
     `SELECT id, onbuy_sku, onbuy_listing_id
      FROM product_mappings
-     WHERE onbuy_sku = ANY($1::text[]) OR onbuy_listing_id = ANY($2::text[])`,
-    [allSkus.length ? allSkus : ['__none__'], allUids.length ? allUids : ['__none__']]
+     WHERE user_id = $3
+       AND (onbuy_sku = ANY($1::text[]) OR onbuy_listing_id = ANY($2::text[]))`,
+    [allSkus.length ? allSkus : ['__none__'], allUids.length ? allUids : ['__none__'], req.effectiveUserId]
   );
   const bySkuMap = new Map(existing.filter(r => r.onbuy_sku).map(r => [r.onbuy_sku, r.id]));
   const byUidMap = new Map(existing.filter(r => r.onbuy_listing_id).map(r => [r.onbuy_listing_id, r.id]));
@@ -1294,7 +1295,7 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
         $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]
       ) AS v(id, product_name, listing_id, opc, sku,
              markup_type, markup_value, onbuy_fee, target_price, min_price, notes)) v
-      WHERE pm.id = v.id`,
+      WHERE pm.id = v.id AND pm.user_id = ${req.effectiveUserId}`,
     [
       c.map(r => r._id),
       c.map(r => r.product_name     || ''),
