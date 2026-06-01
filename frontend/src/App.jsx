@@ -1755,6 +1755,7 @@ export default function App() {
     { id:"current-prices", label:"💷 Current Prices" },
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
+    { id:"onbuy-bulk",     label:"📦 OnBuy Products" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
@@ -1939,6 +1940,7 @@ export default function App() {
             {page === "current-prices" && "Fetch real-time price for any Amazon ASIN"}
             {page === "accounts"       && "Connect and manage your OnBuy seller accounts"}
             {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
+            {page === "onbuy-bulk"     && "Create new products and listings directly on your OnBuy store"}
             {page === "settings"       && "Configure proxies and global repricer options"}
             {page === "logs"           && "Real-time output from API server and job worker"}
             {page === "users"          && "Manage user accounts and impersonate users"}
@@ -1952,6 +1954,7 @@ export default function App() {
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
+        {page === "onbuy-bulk"     && <OnBuyBulkPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
@@ -2770,6 +2773,484 @@ function ImportPage() {
           </table>
         </Section>
       )}
+    </div>
+  );
+}
+
+// ── OnBuy Bulk Product Import Page ────────────
+function OnBuyBulkPage() {
+  const [tab, setTab]             = useState("import");
+  const [step, setStep]           = useState(1);
+  const [accounts, setAccounts]   = useState([]);
+  const [accountId, setAccountId] = useState("");
+  const [file, setFile]           = useState(null);
+  const [preview, setPreview]     = useState(null);
+  const [result, setResult]       = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [err, setErr]             = useState("");
+  const [dragOver, setDragOver]   = useState(false);
+
+  // History state
+  const [history, setHistory]           = useState([]);
+  const [histLoading, setHistLoading]   = useState(false);
+  const [expandedSession, setExpandedSession] = useState(null);
+  const [sessionItems, setSessionItems] = useState({});
+
+  useEffect(() => {
+    api("/accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (tab === "history") loadHistory();
+  }, [tab]);
+
+  async function loadHistory() {
+    setHistLoading(true);
+    try { setHistory(await api("/onbuy-bulk/history")); } catch {}
+    setHistLoading(false);
+  }
+
+  async function loadSessionItems(sessionId) {
+    if (sessionItems[sessionId]) { setExpandedSession(sessionId); return; }
+    try {
+      const items = await api(`/onbuy-bulk/history/${sessionId}/items`);
+      setSessionItems(p => ({ ...p, [sessionId]: items }));
+      setExpandedSession(sessionId);
+    } catch {}
+  }
+
+  function toggleSession(id) {
+    if (expandedSession === id) { setExpandedSession(null); return; }
+    loadSessionItems(id);
+  }
+
+  async function parseFile(f) {
+    setErr(""); setLoading(true);
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/onbuy-bulk/preview`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
+      if (!r.ok) throw new Error(await r.text());
+      setPreview(await r.json());
+      setStep(2);
+    } catch (e) { setErr(String(e.message || e)); }
+    setLoading(false);
+  }
+
+  async function runImport() {
+    if (!accountId) { setErr("Please select an OnBuy account before importing."); return; }
+    setLoading(true); setImporting(true); setErr("");
+    try {
+      const r = await api("/onbuy-bulk/import", {
+        method: "POST",
+        body: JSON.stringify({ rows: preview.rows, account_id: accountId }),
+      });
+      setResult(r); setStep(3);
+    } catch (e) { setErr(String(e.message || e)); }
+    setImporting(false); setLoading(false);
+  }
+
+  const reset = () => { setStep(1); setFile(null); setPreview(null); setResult(null); setErr(""); };
+
+  const dropStyle = {
+    border: `2px dashed ${dragOver ? C.accent : C.border}`,
+    borderRadius: 12, padding: "40px 24px", textAlign: "center",
+    cursor: "pointer", background: dragOver ? C.accentDim : "transparent", transition: "all 0.2s",
+  };
+
+  const statusColor = s => s === 'product_created' ? C.accent : s === 'listing_created' ? C.blue : s === 'error' ? C.red : C.muted;
+  const statusLabel = s => s === 'product_created' ? 'Product Created' : s === 'listing_created' ? 'Listed' : s === 'error' ? 'Error' : s;
+
+  return (
+    <div>
+      {/* Tab switcher */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 0 }}>
+        {[["import","📦 Import"], ["history","📋 History"]].map(([t, label]) => (
+          <button key={t} onClick={() => setTab(t)} style={{
+            background: "none", border: "none", cursor: "pointer",
+            padding: "8px 18px", fontSize: 14, fontWeight: 600,
+            color: tab === t ? C.accent : C.muted,
+            borderBottom: `2px solid ${tab === t ? C.accent : "transparent"}`,
+            marginBottom: -1, transition: "color 0.15s",
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {/* ── History Tab ── */}
+      {tab === "history" && (
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ color: C.muted, fontSize: 13 }}>Your last 50 bulk import sessions</div>
+            <Btn variant="secondary" onClick={loadHistory} style={{ padding: "6px 14px", fontSize: 12 }}>
+              ↻ Refresh
+            </Btn>
+          </div>
+          {histLoading ? (
+            <div style={{ color: C.muted, padding: 32, textAlign: "center" }}>Loading…</div>
+          ) : history.length === 0 ? (
+            <div style={{ color: C.muted, padding: 32, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 12 }}>
+              No import history yet. Run your first bulk import to see it here.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {history.map(s => (
+                <div key={s.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+                  <div
+                    onClick={() => toggleSession(s.id)}
+                    style={{
+                      display: "grid", gridTemplateColumns: "1fr auto auto auto auto auto auto",
+                      gap: 16, padding: "12px 16px", cursor: "pointer", alignItems: "center",
+                      background: expandedSession === s.id ? "#ffffff08" : "transparent",
+                    }}>
+                    <div>
+                      <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>
+                        {s.account_name || "—"}
+                      </div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
+                        {new Date(s.created_at).toLocaleString()}
+                      </div>
+                    </div>
+                    {[
+                      ["Total", s.total_rows, C.text],
+                      ["Created", s.products_created, C.accent],
+                      ["Listed", s.listings_created, C.blue],
+                      ["Skipped", s.skipped, s.skipped > 0 ? C.red : C.muted],
+                      ["Errors", s.errors_count, s.errors_count > 0 ? C.red : C.muted],
+                    ].map(([label, val, color]) => (
+                      <div key={label} style={{ textAlign: "center" }}>
+                        <div style={{ color, fontSize: 16, fontWeight: 700 }}>{val}</div>
+                        <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase" }}>{label}</div>
+                      </div>
+                    ))}
+                    <div style={{ color: C.muted, fontSize: 18 }}>
+                      {expandedSession === s.id ? "▲" : "▼"}
+                    </div>
+                  </div>
+
+                  {expandedSession === s.id && sessionItems[s.id] && (
+                    <div style={{ borderTop: `1px solid ${C.border}`, overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ background: "#ffffff06" }}>
+                            {["Row","Product","SKU","EAN","Brand","Category","Source £","Selling £","Stock","Condition","OPC","Status"].map(h => (
+                              <th key={h} style={{ padding: "7px 10px", color: C.muted, textAlign: "left",
+                                fontSize: 10, textTransform: "uppercase", whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sessionItems[s.id].map((item, i) => (
+                            <tr key={i} style={{ borderBottom: `1px solid ${C.border}22`,
+                              background: item.status === "error" ? "#ef444406" : "transparent" }}>
+                              <td style={{ padding: "6px 10px", color: C.muted }}>{item.row_number}</td>
+                              <td style={{ padding: "6px 10px", color: C.text, maxWidth: 180,
+                                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                title={item.product_name}>{item.product_name}</td>
+                              <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.sku || "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.muted, fontFamily: "monospace" }}>{item.ean || "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.textDim }}>{item.brand || "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.muted, maxWidth: 120,
+                                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                title={item.category}>{item.category || "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.muted }}>
+                                {item.source_price ? `£${parseFloat(item.source_price).toFixed(2)}` : "—"}
+                              </td>
+                              <td style={{ padding: "6px 10px", color: C.blue, fontWeight: 600 }}>
+                                {item.selling_price ? `£${parseFloat(item.selling_price).toFixed(2)}` : "—"}
+                              </td>
+                              <td style={{ padding: "6px 10px", color: C.text }}>{item.stock ?? "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.textDim }}>{item.condition || "—"}</td>
+                              <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.opc || "—"}</td>
+                              <td style={{ padding: "6px 10px" }}>
+                                <span style={{
+                                  background: item.status === "error" ? "#ef444422" : item.status === "product_created" ? "#00d4aa22" : "#3b82f622",
+                                  color: statusColor(item.status), borderRadius: 5,
+                                  padding: "2px 7px", fontSize: 10, fontWeight: 600, whiteSpace: "nowrap",
+                                }}>{statusLabel(item.status)}</span>
+                                {item.error_message && (
+                                  <div style={{ color: C.red, fontSize: 10, marginTop: 3, maxWidth: 200 }}
+                                    title={item.error_message}>
+                                    {item.error_message.slice(0, 60)}{item.error_message.length > 60 ? "…" : ""}
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Import Tab ── */}
+      {tab === "import" && <>
+      {importing && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(5,8,18,0.92)", backdropFilter: "blur(6px)",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 28,
+        }}>
+          <div style={{ position: "relative", width: 80, height: 80 }}>
+            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid ${C.border}` }} />
+            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid transparent`,
+              borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
+            <div style={{ position: "absolute", inset: 10, borderRadius: "50%", border: `3px solid transparent`,
+              borderTopColor: C.blue, animation: "spin 1.4s linear infinite reverse" }} />
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ color: C.text, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Creating OnBuy Products</div>
+            <div style={{ color: C.accent, fontSize: 14 }}>Searching, creating products and listings…</div>
+            <div style={{ color: C.muted, fontSize: 12, marginTop: 16 }}>Please don't close this window</div>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 0, marginBottom: 28 }}>
+        {[["1","Upload File"],["2","Review Rows"],["3","Done"]].map(([n, label], i) => (
+          <div key={n} style={{ display: "flex", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: "50%", display: "flex",
+                alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700,
+                background: step > i+1 ? C.accent : step === i+1 ? C.accent : C.border,
+                color: step >= i+1 ? "#000" : C.muted,
+              }}>{step > i+1 ? "✓" : n}</div>
+              <span style={{ fontSize: 13, color: step === i+1 ? C.text : C.muted }}>{label}</span>
+            </div>
+            {i < 2 && <div style={{ width: 32, height: 1, background: C.border, margin: "0 8px" }} />}
+          </div>
+        ))}
+      </div>
+
+      {err && (
+        <div style={{ background: "#ef444422", border: `1px solid ${C.red}`, borderRadius: 8,
+          padding: "10px 14px", color: C.red, fontSize: 13, marginBottom: 16 }}>{err}</div>
+      )}
+
+      {/* Step 1 — Upload + select account */}
+      {step === 1 && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+          <Section title="Upload Excel File">
+            <div style={dropStyle}
+              onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) { setFile(f); parseFile(f); } }}
+              onClick={() => document.getElementById("bulk-file-input").click()}>
+              <div style={{ fontSize: 36, marginBottom: 8 }}>📂</div>
+              <div style={{ color: C.text, fontWeight: 600, marginBottom: 4 }}>
+                {file ? file.name : "Drop your .xlsx or .csv file here"}
+              </div>
+              <div style={{ color: C.muted, fontSize: 13 }}>or click to browse</div>
+              {loading && <div style={{ color: C.accent, marginTop: 12, fontSize: 13 }}>Parsing…</div>}
+            </div>
+            <input id="bulk-file-input" type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }}
+              onChange={e => { const f = e.target.files[0]; if (f) { setFile(f); parseFile(f); } }} />
+          </Section>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <Section title="Select OnBuy Account">
+              <select value={accountId} onChange={e => setAccountId(e.target.value)}
+                style={{
+                  background: "#0b0f1a", border: `1px solid ${C.border}`, borderRadius: 8,
+                  color: C.text, padding: "9px 12px", fontSize: 14, width: "100%",
+                }}>
+                <option value="">— Select account —</option>
+                {accounts.map(a => (
+                  <option key={a.id} value={a.id}>{a.account_name} (Site {a.site_id})</option>
+                ))}
+              </select>
+              <p style={{ color: C.muted, fontSize: 12, marginTop: 8 }}>
+                Products and listings will be created in this OnBuy store.
+              </p>
+            </Section>
+
+            <Section title="Download Template">
+              <p style={{ color: C.textDim, fontSize: 13, marginBottom: 10 }}>
+                Fill in the template and upload it. Columns marked * are required.
+              </p>
+              <div style={{ fontSize: 12, color: C.muted, background: "#0b0f1a",
+                borderRadius: 8, padding: "10px 12px", marginBottom: 12, lineHeight: 1.8 }}>
+                <div><span style={{ color: C.red }}>*</span> Product Name · Category Name</div>
+                <div><span style={{ color: C.red }}>*</span> SKU · Price (£) · Stock</div>
+                <div style={{ color: C.textDim }}>Brand · EAN · MPN · Condition</div>
+                <div style={{ color: C.textDim }}>Description · Image URL 1/2/3</div>
+                <div style={{ color: C.textDim }}>Delivery Weight (kg)</div>
+              </div>
+              <button
+                onClick={async () => {
+                  const token = localStorage.getItem("repricer_token");
+                  const r = await fetch(`${API}/onbuy-bulk/template`, {
+                    headers: token ? { Authorization: `Bearer ${token}` } : {},
+                  });
+                  if (!r.ok) return;
+                  const blob = await r.blob();
+                  const url  = URL.createObjectURL(blob);
+                  const a    = document.createElement("a");
+                  a.href = url; a.download = "onbuy-bulk-template.xlsx"; a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                style={{
+                  display: "inline-block", background: C.accent, color: "#000",
+                  borderRadius: 8, padding: "8px 16px", fontSize: 13, fontWeight: 600,
+                  border: "none", cursor: "pointer",
+                }}>
+                ⬇ Download Template (.xlsx)
+              </button>
+            </Section>
+          </div>
+        </div>
+      )}
+
+      {/* Step 2 — Review rows */}
+      {step === 2 && preview && (
+        <div>
+          <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+            {[["Total", preview.total, C.text], ["Valid", preview.valid, C.accent],
+              ["Invalid", preview.total - preview.valid, C.red]].map(([label, val, color]) => (
+              <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`,
+                borderRadius: 10, padding: "12px 20px", minWidth: 100 }}>
+                <div style={{ color: C.muted, fontSize: 11, textTransform: "uppercase", marginBottom: 4 }}>{label}</div>
+                <div style={{ color, fontSize: 24, fontWeight: 700 }}>{val}</div>
+              </div>
+            ))}
+          </div>
+
+          {!accountId && (
+            <div style={{ background: "#f59e0b11", border: `1px solid #f59e0b44`, borderRadius: 8,
+              padding: "10px 14px", color: C.amber, fontSize: 13, marginBottom: 16 }}>
+              ⚠ Please go back and select an OnBuy account before importing.
+            </div>
+          )}
+
+          {preview.valid > 0 && (
+            <Section title="Row Preview">
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                      {["Row","Product Name","Category","Brand","EAN","SKU","Price","Stock","Status"].map(h => (
+                        <th key={h} style={{ padding: "8px 10px", color: C.muted, textAlign: "left",
+                          fontSize: 11, textTransform: "uppercase", whiteSpace: "nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.rows.map(r => (
+                      <tr key={r._row} style={{ borderBottom: `1px solid ${C.border}22`,
+                        background: r.valid ? "transparent" : "#ef444408" }}>
+                        <td style={{ padding: "7px 10px", color: C.muted }}>{r._row}</td>
+                        <td style={{ padding: "7px 10px", color: C.text, maxWidth: 200,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {r.name || "—"}
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.textDim, maxWidth: 140,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {r.category || "—"}
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.textDim }}>{r.brand || "—"}</td>
+                        <td style={{ padding: "7px 10px", color: C.muted, fontFamily: "monospace", fontSize: 12 }}>
+                          {r.ean || "—"}
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.accent, fontFamily: "monospace", fontSize: 12 }}>
+                          {r.sku}
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.blue }}>
+                          {r.price != null ? `£${parseFloat(r.price).toFixed(2)}` : "—"}
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.text }}>{r.stock}</td>
+                        <td style={{ padding: "7px 10px" }}>
+                          {r.valid
+                            ? <span style={{ background: "#00d4aa22", color: C.accent, borderRadius: 5,
+                                padding: "2px 8px", fontSize: 11, fontWeight: 600 }}>✓ OK</span>
+                            : <span style={{ color: C.red, fontSize: 11 }} title={r.errors.join(", ")}>
+                                ✗ {r.errors[0]}
+                              </span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Section>
+          )}
+
+          <div style={{ display: "flex", gap: 12, marginTop: 20 }}>
+            <Btn variant="secondary" onClick={() => { setStep(1); setPreview(null); setFile(null); }}>
+              ← Back
+            </Btn>
+            <Btn
+              disabled={preview.valid === 0 || !accountId || loading}
+              onClick={runImport}
+            >
+              {loading
+                ? "Importing…"
+                : `Import ${preview.valid} Product${preview.valid !== 1 ? "s" : ""} to OnBuy`}
+            </Btn>
+          </div>
+        </div>
+      )}
+
+      {/* Step 3 — Results */}
+      {step === 3 && result && (
+        <Section title="Import Complete">
+          <div style={{ padding: "28px 24px" }}>
+            <div style={{ textAlign: "center", marginBottom: result.errors?.length ? 24 : 0 }}>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>
+                {result.listing_created > 0 ? "🎉" : "⚠️"}
+              </div>
+              <div style={{ color: result.listing_created > 0 ? C.accent : C.amber,
+                fontSize: 26, fontWeight: 700, marginBottom: 8 }}>
+                {result.listing_created} listing{result.listing_created !== 1 ? "s" : ""} created on OnBuy
+              </div>
+              {result.product_created > 0 && (
+                <div style={{ color: C.blue, fontSize: 14, marginBottom: 6 }}>
+                  {result.product_created} new product{result.product_created !== 1 ? "s" : ""} created
+                </div>
+              )}
+              {result.skipped > 0 && (
+                <div style={{ color: C.red, fontSize: 14 }}>
+                  {result.skipped} row{result.skipped !== 1 ? "s" : ""} skipped due to errors
+                </div>
+              )}
+            </div>
+
+            {result.errors?.length > 0 && (
+              <div style={{ marginTop: 20 }}>
+                <div style={{ color: C.amber, fontWeight: 600, fontSize: 13, marginBottom: 8 }}>
+                  Error details:
+                </div>
+                <div style={{ maxHeight: 280, overflowY: "auto" }}>
+                  {result.errors.map((e, i) => (
+                    <div key={i} style={{ background: "#ef444411", border: `1px solid #ef444433`,
+                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
+                      <span style={{ color: C.red, fontWeight: 600 }}>Row {e.row}</span>
+                      {e.product && <span style={{ color: C.textDim }}> — {e.product}</span>}
+                      <div style={{ color: C.muted, marginTop: 2 }}>{e.error}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ textAlign: "center", marginTop: 24 }}>
+              <Btn onClick={reset}>Import More</Btn>
+            </div>
+          </div>
+        </Section>
+      )}
+      </>}
     </div>
   );
 }

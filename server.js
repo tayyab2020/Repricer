@@ -15,7 +15,7 @@ import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import { runRepricerJob, fastQueue, slowQueue, keepaQueue, redis } from './jobProducer.js';
 import IORedis from 'ioredis';
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
+import { appendFile, appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
@@ -1443,6 +1443,41 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_cheerio BOOLEAN NOT NULL DEFAULT false`,
     // Index for the repricer job query: ORDER BY last_synced_at per active user avoids a full table scan
     `CREATE INDEX IF NOT EXISTS idx_pm_active_synced ON product_mappings (user_id, last_synced_at ASC NULLS FIRST) WHERE is_active = true`,
+    // OnBuy bulk import history tables
+    `CREATE TABLE IF NOT EXISTS onbuy_bulk_import_sessions (
+      id               SERIAL PRIMARY KEY,
+      user_id          INTEGER NOT NULL,
+      account_id       INTEGER,
+      account_name     TEXT,
+      total_rows       INTEGER DEFAULT 0,
+      products_created INTEGER DEFAULT 0,
+      listings_created INTEGER DEFAULT 0,
+      skipped          INTEGER DEFAULT 0,
+      errors_count     INTEGER DEFAULT 0,
+      status           TEXT    DEFAULT 'processing',
+      created_at       TIMESTAMP DEFAULT NOW(),
+      completed_at     TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS onbuy_bulk_import_items (
+      id            SERIAL PRIMARY KEY,
+      session_id    INTEGER REFERENCES onbuy_bulk_import_sessions(id) ON DELETE CASCADE,
+      user_id       INTEGER NOT NULL,
+      row_number    INTEGER,
+      product_name  TEXT,
+      sku           TEXT,
+      ean           TEXT,
+      category      TEXT,
+      brand         TEXT,
+      source_price  NUMERIC,
+      selling_price NUMERIC,
+      stock         INTEGER,
+      condition     TEXT,
+      opc           TEXT,
+      status        TEXT,
+      error_message TEXT,
+      created_at    TIMESTAMP DEFAULT NOW()
+    )`,
+    `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS listings_updated INTEGER DEFAULT 0`,
   ];
   for (const sql of steps) {
     try {
@@ -1543,6 +1578,685 @@ app.put('/api/settings', requireAuth, async (req, res) => {
     redisPub.publish('repricer:settings-updated', '1').catch(() => {});
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────
+// ONBUY BULK PRODUCT IMPORT
+// ─────────────────────────────────────────────
+
+// Flexible column aliases for the OnBuy bulk template
+const BULK_COL_ALIASES = {
+  name:            ['product name', 'title', 'name', 'product title'],
+  category:        ['category name', 'category', 'cat'],
+  brand:           ['brand', 'brand name', 'manufacturer'],
+  ean:             ['ean', 'barcode', 'ean/barcode', 'ean / barcode', 'gtin'],
+  mpn:             ['mpn', 'manufacturer part number', 'part number', 'model number'],
+  condition:       ['condition'],
+  description:     ['description', 'product description', 'desc'],
+  image1:          ['image url 1', 'image url', 'image 1', 'image', 'main image'],
+  image2:          ['image url 2', 'image 2', 'additional image 1'],
+  image3:          ['image url 3', 'image 3', 'additional image 2'],
+  sku:             ['sku', 'seller sku', 'your sku', 'listing sku'],
+  price:           ['price (£)', 'price', 'selling price', 'sale price'],
+  stock:           ['stock', 'quantity', 'qty', 'inventory'],
+  delivery_weight: ['delivery weight (kg)', 'delivery weight', 'weight (kg)', 'weight'],
+};
+
+function findBulkColIdx(headers, aliases) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+  return headers.findIndex(h => aliases.some(a => norm(h) === norm(a) || norm(h).includes(norm(a))));
+}
+
+// GET /api/onbuy-bulk/template — download blank import template
+app.get('/api/onbuy-bulk/template', requireAuth, (req, res) => {
+  const headers = [
+    'Product Name', 'Category Name', 'Brand', 'EAN', 'MPN',
+    'Condition', 'Description', 'Image URL 1', 'Image URL 2', 'Image URL 3',
+    'SKU', 'Price (£)', 'Stock', 'Delivery Weight (kg)',
+  ];
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([
+    headers,
+    [
+      'TP-Link Tapo C320WS Security Camera', 'IP Cameras', 'TP-Link',
+      '6935364099213', 'C320WS', 'new',
+      '5MP pan/tilt Smart Security Camera with Night Vision & Colour',
+      'https://example.com/tp-link-main.jpg', '', '',
+      'TPLINK-C320WS-001', '49.99', '5', '0.5',
+    ],
+    [
+      'Foam Exercise Floor Mats (6-Pack)', 'Exercise Mats', 'Generic',
+      '', '', 'new',
+      'Interlocking foam floor mats — pack of 6, ideal for gym or play room',
+      'https://example.com/foam-mats.jpg', '', '',
+      'FOAM-MAT-6PK-001', '19.99', '10', '1.2',
+    ],
+  ]);
+  ws['!cols'] = [40, 25, 18, 18, 15, 10, 55, 45, 45, 45, 22, 12, 8, 22].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, ws, 'OnBuy Products');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="onbuy-bulk-template.xlsx"');
+  res.send(buf);
+});
+
+// POST /api/onbuy-bulk/preview — parse uploaded Excel, validate and return rows
+app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (allRows.length < 2) return res.json({ total: 0, valid: 0, rows: [], headers: [] });
+
+    const headers = allRows[0].map(h => String(h || '').trim());
+    const dataRows = allRows.slice(1);
+
+    const idx = {};
+    for (const [key, aliases] of Object.entries(BULK_COL_ALIASES)) {
+      idx[key] = findBulkColIdx(headers, aliases);
+    }
+
+    const getCell = (row, key) => {
+      const i = idx[key];
+      return (i >= 0 && row[i] !== undefined) ? String(row[i]).trim() : '';
+    };
+
+    const rows = dataRows.map((row, i) => {
+      if (!row.filter(v => String(v).trim()).length) return null;
+
+      const name      = getCell(row, 'name');
+      const category  = getCell(row, 'category');
+      const brand     = getCell(row, 'brand');
+      const ean       = getCell(row, 'ean');
+      const mpn       = getCell(row, 'mpn');
+      const condition = normalizeCondition(getCell(row, 'condition'));
+      const desc      = getCell(row, 'description');
+      const img1      = getCell(row, 'image1');
+      const img2      = getCell(row, 'image2');
+      const img3      = getCell(row, 'image3');
+      const sku       = getCell(row, 'sku');
+      const price     = parseFloat(getCell(row, 'price').replace(/[£,]/g, '')) || null;
+      const stock     = parseInt(getCell(row, 'stock')) || 0;
+      const delivery_weight = parseFloat(getCell(row, 'delivery_weight')) || null;
+
+      const errors = [];
+      if (!name)     errors.push('Product Name required');
+      if (!category) errors.push('Category Name required');
+      if (!price)    errors.push('Price (£) required');
+      if (!sku)      errors.push('SKU required');
+      if (!stock)    errors.push('Stock must be > 0');
+
+      return {
+        _row: i + 2, valid: errors.length === 0, errors,
+        name, category, brand, ean, mpn, condition, description: desc,
+        images: [img1, img2, img3].filter(Boolean),
+        sku, price, stock, delivery_weight,
+      };
+    }).filter(Boolean);
+
+    res.json({ total: rows.length, valid: rows.filter(r => r.valid).length, rows, headers });
+  } catch (err) {
+    console.error('[OnBuy Bulk] Parse error:', err);
+    res.status(400).json({ error: `Failed to parse file: ${err.message}` });
+  }
+});
+
+const ONBUY_CONDITIONS = new Set(['new', 'used', 'good', 'fair', 'poor', 'refurbished', 'atypical']);
+function normalizeCondition(val) {
+  const s = String(val ?? '').toLowerCase().trim();
+  return ONBUY_CONDITIONS.has(s) ? s : 'new';
+}
+
+// OnBuy enforces a 150-byte UTF-8 limit on product names.
+// JS string.slice(0,150) counts chars, not bytes — multi-byte chars (e.g. –, ©, é)
+// cause overflow. This truncates by byte count, never splitting a multi-byte sequence.
+function truncateToBytes(str, maxBytes) {
+  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;
+  let bytes = 0, i = 0;
+  while (i < str.length) {
+    const charBytes = Buffer.byteLength(str[i], 'utf8');
+    if (bytes + charBytes > maxBytes) break;
+    bytes += charBytes;
+    i++;
+  }
+  return str.slice(0, i);
+}
+
+// POST /api/onbuy-bulk/import — create OnBuy products and listings from validated rows
+app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
+  const { rows, account_id } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided' });
+  if (!account_id)
+    return res.status(400).json({ error: 'OnBuy account required' });
+
+  const account = await getImportAccount(account_id);
+  if (!account) return res.status(400).json({ error: 'Account not found or inactive' });
+
+  const token = await getOnBuyTokenForAccount(account);
+  if (!token) return res.status(400).json({ error: 'Failed to get OnBuy token — check API credentials' });
+
+  const siteId    = account.site_id || '2000';
+  const validRows = rows.filter(r => r.valid);
+  const results   = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
+
+  // Create import session record
+  const { rows: [session] } = await db.query(
+    `INSERT INTO onbuy_bulk_import_sessions (user_id, account_id, account_name, total_rows, status)
+     VALUES ($1, $2, $3, $4, 'processing') RETURNING id`,
+    [req.user.userId, account_id, account.account_name, validRows.length]
+  );
+  const sessionId = session.id;
+
+  // Per-session logger: writes to logs/bulk-import.log AND console
+  const categoryCache = {};
+
+  function blog(...args) {
+    const msg      = args.join(' ');
+    const line     = `[${new Date().toISOString()}] [Bulk][session=${sessionId}] ${msg}\n`;
+    const logFile  = join(__dirname, 'logs', `user-${req.user.userId}-import.log`);
+    try { appendFileSync(logFile, line, 'utf8'); } catch {}
+    console.log(`[OnBuy Bulk][s=${sessionId}]`, msg);
+  }
+
+  async function lookupCategoryId(name) {
+    if (categoryCache[name] !== undefined) return categoryCache[name];
+    const leafName = name.includes('>') ? name.split('>').pop().trim() : name.trim();
+    try {
+      const r = await fetch(
+        `https://api.onbuy.com/v2/categories?filter[name]=${encodeURIComponent(leafName)}&site_id=${siteId}`,
+        { headers: { Authorization: token } }
+      );
+      const data = await r.json();
+      const cats = data?.payload ?? data?.results ?? data ?? [];
+      categoryCache[name] = Array.isArray(cats) ? (cats[0]?.category_id ?? cats[0]?.id ?? null) : null;
+      blog(`Category "${leafName}" → id=${categoryCache[name]}`);
+    } catch { categoryCache[name] = null; }
+    return categoryCache[name];
+  }
+
+  async function pollProductQueue(queueId, maxWaitMs = 90000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      await new Promise(r => setTimeout(r, 4000));
+      let data;
+      try {
+        const r = await fetch(
+          `https://api.onbuy.com/v2/queues/${queueId}?site_id=${siteId}`,
+          { headers: { Authorization: token } }
+        );
+        data = await r.json();
+      } catch (e) {
+        blog(`Queue poll fetch error: ${e.message} — retrying`);
+        continue;
+      }
+      blog(`Queue ${queueId}: ${JSON.stringify(data)}`);
+      const status = data?.results?.status ?? '';
+      const opc    = data?.results?.opc ?? null;
+      if (status === 'success' && opc) return opc;
+      if (status === 'failed' || status === 'error') {
+        throw new Error(data?.results?.error_message || 'Product queue failed');
+      }
+    }
+    blog(`Queue ${queueId} timed out after ${maxWaitMs / 1000}s`);
+    return null;
+  }
+
+  // ── Phase 1a: Batch EAN search — up to 50 EANs per GET (600/hr GET limit) ──
+  // Uses filter[field]=product_code to search by barcode specifically.
+  const rowsWithEan = validRows.filter(r => r.ean);
+  const eanOpcMap   = new Map(); // EAN string → opc
+
+  blog(`Phase 1: batch EAN search — ${rowsWithEan.length} row(s) with EAN, ${validRows.length - rowsWithEan.length} without`);
+  for (let i = 0; i < rowsWithEan.length; i += 50) {
+    const chunk = rowsWithEan.slice(i, i + 50);
+    const eans  = chunk.map(r => r.ean).join(',');
+    try {
+      const r = await fetch(
+        `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(eans)}`,
+        { headers: { Authorization: token } }
+      );
+      const data     = await r.json();
+      const products = data?.results ?? data?.payload ?? [];
+      for (const p of products) {
+        const opc   = p.opc ?? p.product_code ?? null;
+        const codes = Array.isArray(p.product_codes) ? p.product_codes : [];
+        for (const code of codes) eanOpcMap.set(String(code).trim(), opc);
+      }
+      blog(`EAN batch ${Math.floor(i / 50) + 1}: searched ${chunk.length} EAN(s) → ${products.length} match(es)`);
+    } catch (e) {
+      blog(`EAN batch ${Math.floor(i / 50) + 1} error: ${e.message} — treating these rows as new products`);
+    }
+  }
+
+  // ── Phase 1b: Category lookup + distribute into existingMeta / newMeta ──
+  const existingMeta = []; // OPC known from EAN search — listing only
+  const newMeta      = []; // no OPC — needs product creation
+
+  for (const row of validRows) {
+    const sourcePrice  = parseFloat(row.price) || 0;
+    const sellingPrice = parseFloat((sourcePrice * 1.20 / 0.85).toFixed(2));
+
+    const categoryId = await lookupCategoryId(row.category);
+    if (!categoryId) {
+      const errMsg = `Category "${row.category}" not found on OnBuy`;
+      results.errors.push({ row: row._row, product: row.name, error: errMsg });
+      results.skipped++;
+      db.query(
+        `INSERT INTO onbuy_bulk_import_items
+          (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+        [sessionId, req.user.userId, row._row, row.name, row.sku, row.ean, row.category,
+         row.brand, sourcePrice, sellingPrice, parseInt(row.stock)||0,
+         normalizeCondition(row.condition), errMsg]
+      ).catch(() => {});
+      continue;
+    }
+
+    const opc  = row.ean ? (eanOpcMap.get(String(row.ean).trim()) ?? null) : null;
+    const meta = { row, sourcePrice, sellingPrice, categoryId, opc };
+    if (opc) existingMeta.push(meta);
+    else      newMeta.push(meta);
+  }
+  blog(`Phase 1 complete: ${existingMeta.length} existing product(s), ${newMeta.length} new product(s)`);
+
+  // ── Phase 2: Batch create new products ──
+  // Products missing a default image are errored immediately; the rest are sent in chunks of 1000.
+  const CHUNK      = 1000;
+  const queueItems = []; // { meta, queueId } — fed into Phase 3
+
+  for (const m of newMeta) {
+    if (!m.row.images?.[0]) {
+      const errMsg = 'Default image is required to create a new product — add Image URL 1 to this row';
+      results.errors.push({ row: m.row._row, product: m.row.name, error: errMsg });
+      results.skipped++;
+      db.query(
+        `INSERT INTO onbuy_bulk_import_items
+          (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+        [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+         m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0,
+         normalizeCondition(m.row.condition), errMsg]
+      ).catch(() => {});
+    }
+  }
+  const toCreate = newMeta.filter(m => m.row.images?.[0]);
+
+  for (let i = 0; i < toCreate.length; i += CHUNK) {
+    const chunk    = toCreate.slice(i, i + CHUNK);
+    const products = chunk.map(({ row, sellingPrice, categoryId }) => {
+      const conditionVal   = normalizeCondition(row.condition);
+      const brandVal       = row.brand?.trim();
+      const brandFields    = brandVal ? { brand_name: brandVal } : { brand_id: 1 };
+      const additionalImgs = (row.images || []).slice(1).filter(Boolean);
+      return {
+        uid:          row.sku || `bulk-${row._row ?? Date.now()}`,
+        published:    '1',
+        category_id:  categoryId,
+        product_name: truncateToBytes(row.name, 150),
+        ...brandFields,
+        default_image: row.images[0],
+        ...(additionalImgs.length  ? { additional_images: additionalImgs }  : {}),
+        ...(row.description        ? { description: row.description }        : {}),
+        ...(row.ean                ? { product_codes: [row.ean] }            : {}),
+        ...(row.mpn                ? { mpn: row.mpn }                        : {}),
+        listings: {
+          [conditionVal]: {
+            price: sellingPrice,
+            stock: parseInt(row.stock) || 0,
+            ...(row.sku             ? { sku: row.sku }                             : {}),
+            ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
+          },
+        },
+      };
+    });
+
+    blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i / CHUNK) + 1} of ${Math.ceil(toCreate.length / CHUNK)})`);
+    blog(`Phase 2 payload: ${JSON.stringify({ site_id: parseInt(siteId) || 2000, products })}`);
+    const createRes  = await fetch('https://api.onbuy.com/v2/products', {
+      method: 'POST',
+      headers: { Authorization: token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site_id: parseInt(siteId) || 2000, products }),
+    });
+    const createData = await createRes.json();
+    blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData)}`);
+
+    if (!createRes.ok) {
+      const msg = createData?.message || createData?.error || 'Batch product create failed';
+      for (const m of chunk) {
+        results.errors.push({ row: m.row._row, product: m.row.name, error: msg });
+        results.skipped++;
+        db.query(
+          `INSERT INTO onbuy_bulk_import_items
+            (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+          [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+           m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0,
+           normalizeCondition(m.row.condition), msg]
+        ).catch(() => {});
+      }
+      continue;
+    }
+
+    const batchResults = createData?.results ?? [];
+    for (let j = 0; j < chunk.length; j++) {
+      const m  = chunk[j];
+      const br = batchResults[j];
+      if (!br?.queue_id) {
+        const msg = br?.message || `No queue_id returned for "${m.row.name}"`;
+        results.errors.push({ row: m.row._row, product: m.row.name, error: msg });
+        results.skipped++;
+        db.query(
+          `INSERT INTO onbuy_bulk_import_items
+            (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+          [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+           m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0,
+           normalizeCondition(m.row.condition), msg]
+        ).catch(() => {});
+      } else {
+        queueItems.push({ meta: m, queueId: br.queue_id });
+      }
+    }
+  }
+
+  // ── Phase 3: Poll all product queues concurrently ──
+  if (queueItems.length > 0) {
+    blog(`Phase 3: polling ${queueItems.length} product queue(s) concurrently`);
+    const pollOutcomes = await Promise.all(queueItems.map(async ({ meta, queueId }) => {
+      try   { return { meta, opc: await pollProductQueue(queueId), error: null }; }
+      catch (err) { return { meta, opc: null, error: err.message }; }
+    }));
+
+    for (const { meta, opc, error } of pollOutcomes) {
+      if (!error) {
+        // Product created — push to existingMeta so Phase 4 sets price/stock via POST /v2/listings.
+        // Embedded listings in POST /v2/products don't reliably apply price or stock.
+        results.product_created++;
+        existingMeta.push({ ...meta, opc });
+        db.query(
+          `INSERT INTO onbuy_bulk_import_items
+            (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'product_created')`,
+          [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+           meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+           parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), opc]
+        ).catch(() => {});
+      } else {
+        const dupEan     = (error.match(/Duplicate entry '(\d+)'/) || [])[1];
+        const brandOwned = /brand is owned by another seller/i.test(error);
+
+        if (dupEan) {
+          // Duplicate EAN: search for the existing product, add to listing batch
+          blog(`Duplicate EAN "${dupEan}" — searching for existing product...`);
+          try {
+            const sr    = await fetch(
+              `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`,
+              { headers: { Authorization: token } }
+            );
+            const sd    = await sr.json();
+            const prods = sd?.results ?? sd?.payload ?? [];
+            const existingOpc = Array.isArray(prods) && prods.length
+              ? (prods[0]?.opc ?? prods[0]?.product_code ?? null) : null;
+            if (existingOpc) {
+              blog(`Found OPC=${existingOpc} for duplicate EAN "${dupEan}" — adding to listing batch`);
+              existingMeta.push({ ...meta, opc: existingOpc });
+            } else {
+              throw new Error(`EAN "${dupEan}" already registered on OnBuy but matching product not found — list it manually`);
+            }
+          } catch (searchErr) {
+            results.errors.push({ row: meta.row._row, product: meta.row.name, error: searchErr.message });
+            results.skipped++;
+            db.query(
+              `INSERT INTO onbuy_bulk_import_items
+                (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+              [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+               meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+               parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), searchErr.message]
+            ).catch(() => {});
+          }
+        } else if (brandOwned) {
+          // Brand is protected on OnBuy — skip this product
+          results.errors.push({ row: meta.row._row, product: meta.row.name, error: 'The supplied brand is owned by another seller — skipped' });
+          results.skipped++;
+          db.query(
+            `INSERT INTO onbuy_bulk_import_items
+              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+            [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+             meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+             parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition),
+             'The supplied brand is owned by another seller — skipped']
+          ).catch(() => {});
+        } else {
+          results.errors.push({ row: meta.row._row, product: meta.row.name, error });
+          results.skipped++;
+          db.query(
+            `INSERT INTO onbuy_bulk_import_items
+              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+            [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+             meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+             parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), error]
+          ).catch(() => {});
+        }
+      }
+    }
+  }
+
+  // ── Phase 3.5: Batch update existing products with fresh data (images, descriptions, etc.) ──
+  // Covers all items in existingMeta that have an OPC — Phase 1 EAN matches + Phase 3 newly created / recovered products.
+  // Uses PUT /v2/products (batch, synchronous) so images and metadata are refreshed before listings go live.
+  const toUpdate = existingMeta.filter(m => m.opc);
+  if (toUpdate.length > 0) {
+    blog(`Phase 3.5: updating ${toUpdate.length} product(s) with fresh data (images, descriptions, etc.)`);
+
+    for (let i = 0; i < toUpdate.length; i += CHUNK) {
+      const chunk    = toUpdate.slice(i, i + CHUNK);
+      const products = chunk.map(({ row, categoryId, opc }) => {
+        const brandVal       = row.brand?.trim();
+        const brandFields    = brandVal ? { brand_name: brandVal } : {};
+        const additionalImgs = (row.images || []).slice(1).filter(Boolean);
+        return {
+          opc,
+          product_name: truncateToBytes(row.name, 150),
+          category_id:  categoryId,
+          ...brandFields,
+          ...(row.images?.[0]       ? { default_image: row.images[0] }      : {}),
+          ...(additionalImgs.length ? { additional_images: additionalImgs } : {}),
+          ...(row.description       ? { description: row.description }      : {}),
+          ...(row.mpn               ? { mpn: row.mpn }                      : {}),
+        };
+      });
+
+      blog(`Phase 3.5: chunk ${Math.floor(i / CHUNK) + 1} of ${Math.ceil(toUpdate.length / CHUNK)} — ${chunk.length} product(s)`);
+      const p35Res  = await fetch('https://api.onbuy.com/v2/products', {
+        method:  'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ site_id: parseInt(siteId) || 2000, products }),
+      });
+      const p35Data = await p35Res.json();
+      blog(`Phase 3.5 HTTP ${p35Res.status}: ${JSON.stringify(p35Data)}`);
+
+      if (!p35Res.ok) {
+        blog(`Phase 3.5: batch update failed — ${p35Data?.message || p35Data?.error || 'unknown error'}. Proceeding to Phase 4.`);
+        continue;
+      }
+
+      const p35Results = p35Data?.products ?? p35Data?.results ?? [];
+      let p35Ok = 0, p35Fail = 0;
+      for (let j = 0; j < chunk.length; j++) {
+        const ur = Array.isArray(p35Results) ? p35Results[j] : null;
+        if (ur?.success === false) {
+          blog(`Phase 3.5: failed OPC=${chunk[j].opc} — ${ur.message}`);
+          p35Fail++;
+        } else {
+          p35Ok++;
+        }
+      }
+      blog(`Phase 3.5: chunk done — ${p35Ok} updated, ${p35Fail} failed`);
+    }
+  }
+
+  // ── Phase 4: Batch create listings ──
+  // existingMeta includes: Phase 1 matches + Phase 3 dup-EAN recoveries + Phase 3 new products (OPC from queue)
+  if (existingMeta.length > 0) {
+    blog(`Phase 4: batch creating ${existingMeta.length} listing(s) for existing products`);
+
+    for (let i = 0; i < existingMeta.length; i += CHUNK) {
+      const chunk    = existingMeta.slice(i, i + CHUNK);
+      const listings = chunk.map(({ row, sellingPrice, opc }) => ({
+        opc,
+        condition: normalizeCondition(row.condition),
+        price: sellingPrice,
+        stock: parseInt(row.stock) || 0,
+        ...(row.sku             ? { sku: row.sku }                             : {}),
+        ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
+      }));
+
+      blog(`Listing batch ${Math.floor(i / CHUNK) + 1}: ${chunk.length} listing(s)`);
+      const listingRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
+        method: 'POST',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ site_id: parseInt(siteId) || 2000, listings }),
+      });
+      const listingData = await listingRes.json();
+      blog(`Batch listing HTTP ${listingRes.status}: ${JSON.stringify(listingData)}`);
+
+      const listingResults = listingData?.results ?? listingData?.payload ?? [];
+      const updateNeeded   = []; // items that already exist — retry with PUT
+
+      for (let j = 0; j < chunk.length; j++) {
+        const m            = chunk[j];
+        const lr           = Array.isArray(listingResults) ? listingResults[j] : null;
+        const conditionVal = normalizeCondition(m.row.condition);
+        if (!listingRes.ok || lr?.success === false) {
+          const msg          = lr?.message || listingData?.message || listingData?.error || 'Listing rejected by OnBuy';
+          const alreadyExists = /already have a listing|listing already exist|duplicate listing/i.test(msg);
+          if (alreadyExists && m.row.sku) {
+            updateNeeded.push(m);
+          } else {
+            const finalMsg = alreadyExists
+              ? `${msg} (no SKU provided — cannot update automatically)`
+              : msg;
+            results.errors.push({ row: m.row._row, product: m.row.name, error: finalMsg });
+            results.skipped++;
+            db.query(
+              `INSERT INTO onbuy_bulk_import_items
+                (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status,error_message)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error',$14)`,
+              [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+               m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0, conditionVal, m.opc, finalMsg]
+            ).catch(() => {});
+          }
+        } else {
+          results.listing_created++;
+          db.query(
+            `INSERT INTO onbuy_bulk_import_items
+              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'listing_created')`,
+            [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+             m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0, conditionVal, m.opc]
+          ).catch(() => {});
+        }
+      }
+
+      // ── PUT batch: update listings that already exist (identified by SKU) ──
+      if (updateNeeded.length > 0) {
+        blog(`Listing update batch: ${updateNeeded.length} already-existing listing(s) — updating via PUT`);
+        const updatePayload = updateNeeded.map(({ row, sellingPrice }) => ({
+          sku:   row.sku,
+          price: sellingPrice,
+          stock: parseInt(row.stock) || 0,
+          ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
+        }));
+
+        const updateRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
+          method:  'PUT',
+          headers: { Authorization: token, 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ site_id: parseInt(siteId) || 2000, listings: updatePayload }),
+        });
+        const updateData = await updateRes.json();
+        blog(`Listing PUT HTTP ${updateRes.status}: ${JSON.stringify(updateData)}`);
+
+        const updateResults = updateData?.results ?? updateData?.payload ?? [];
+        for (let j = 0; j < updateNeeded.length; j++) {
+          const m            = updateNeeded[j];
+          const ur           = Array.isArray(updateResults) ? updateResults[j] : null;
+          const conditionVal = normalizeCondition(m.row.condition);
+          if (!updateRes.ok || ur?.success === false) {
+            const msg = ur?.message || updateData?.message || updateData?.error || 'Listing update rejected by OnBuy';
+            results.errors.push({ row: m.row._row, product: m.row.name, error: msg });
+            results.skipped++;
+            db.query(
+              `INSERT INTO onbuy_bulk_import_items
+                (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status,error_message)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error',$14)`,
+              [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+               m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0, conditionVal, m.opc, msg]
+            ).catch(() => {});
+          } else {
+            results.listing_updated++;
+            db.query(
+              `INSERT INTO onbuy_bulk_import_items
+                (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'listing_updated')`,
+              [sessionId, req.user.userId, m.row._row, m.row.name, m.row.sku, m.row.ean, m.row.category,
+               m.row.brand, m.sourcePrice, m.sellingPrice, parseInt(m.row.stock)||0, conditionVal, m.opc]
+            ).catch(() => {});
+          }
+        }
+      }
+    }
+  }
+
+  // Finalize session
+  await db.query(
+    `UPDATE onbuy_bulk_import_sessions SET
+       products_created=$1, listings_created=$2, listings_updated=$3, skipped=$4, errors_count=$5,
+       status='completed', completed_at=NOW()
+     WHERE id=$6`,
+    [results.product_created, results.listing_created, results.listing_updated, results.skipped, results.errors.length, sessionId]
+  );
+
+  res.json({ ...results, session_id: sessionId });
+});
+
+// GET /api/onbuy-bulk/history — import sessions for the current user
+app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, account_name, total_rows, products_created, listings_created,
+              listings_updated, skipped, errors_count, status, created_at, completed_at
+       FROM onbuy_bulk_import_sessions
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [req.user.userId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/onbuy-bulk/history/:sessionId/items — rows for a specific import session
+app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT row_number, product_name, sku, ean, brand, category,
+              source_price, selling_price, stock, condition, opc, status, error_message, created_at
+       FROM onbuy_bulk_import_items
+       WHERE session_id = $1 AND user_id = $2
+       ORDER BY row_number ASC`,
+      [req.params.sessionId, req.user.userId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/import/logs — import history (scoped to current user; super admin sees all)

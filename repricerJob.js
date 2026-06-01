@@ -131,7 +131,7 @@ class OnBuyUpdater {
     return t;
   }
 
-  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey, amazonPrice = null, mappingId = null, minPrice = null, feeRate = null, minRoiPercent = null, userId = null } = {}) {
+  enqueue(rawToken, siteId, identifier, isSku, price, { consumerKey, secretKey, amazonPrice = null, mappingId = null, minPrice = null, feeRate = null, minRoiPercent = null, userId = null, noChangeEnqueue = false } = {}) {
     return new Promise((resolve, reject) => {
       const token = this._resolveToken(rawToken);
       const key   = `${token}||${siteId}||${isSku ? '1' : '0'}`;
@@ -139,7 +139,7 @@ class OnBuyUpdater {
       const batch = this._batches.get(key);
       // Store consumerKey/secretKey directly in the item so they survive even if
       // _creds is empty (e.g. after a worker restart clears in-memory state).
-      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, userId, consumerKey: consumerKey || null, secretKey: secretKey || null, resolve, reject });
+      batch.push({ token, siteId, identifier, isSku, price, amazonPrice, mappingId, minPrice, feeRate, minRoiPercent, userId, consumerKey: consumerKey || null, secretKey: secretKey || null, noChangeEnqueue, resolve, reject });
       if (consumerKey && secretKey) {
         if (!this._creds.has(token))    this._creds.set(token,    { consumerKey, secretKey });
         if (!this._creds.has(rawToken)) this._creds.set(rawToken, { consumerKey, secretKey });
@@ -378,8 +378,13 @@ class OnBuyUpdater {
           // Per-listing min_price floor
           if (item.minPrice && newPrice < item.minPrice) newPrice = item.minPrice;
 
-          // Skip if nothing changed
-          if (newPrice === item.price) continue;
+          // No check-winning adjustment needed
+          if (newPrice === item.price) {
+            // noChangeEnqueue items were only enqueued to run check-winning, not to force a PUT.
+            // If check-winning also makes no change, mark them to be skipped from the batch PUT.
+            if (item.noChangeEnqueue) item._skipPut = true;
+            continue;
+          }
 
           ulog(item.userId, `[CheckWinning] ${item.identifier}: £${item.price} → £${newPrice} (lead: £${leadPrice}, winning: ${winning})`);
           item.price = newPrice;
@@ -406,7 +411,20 @@ class OnBuyUpdater {
       ? `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`
       : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
     const listingKey = isSku ? 'sku' : 'uid';
-    const listings   = items.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
+
+    // Resolve items that were enqueued only for check-winning and needed no adjustment.
+    const skipItems = items.filter(it => it._skipPut);
+    const sendItems = items.filter(it => !it._skipPut);
+    if (skipItems.length > 0) {
+      ulog(batchUserId, `[CheckWinning] ${skipItems.length} item(s) already winning — no PUT needed`);
+      skipItems.forEach(it => it.resolve({ _noChange: true, _finalPrice: it.price }));
+    }
+    if (sendItems.length === 0) {
+      if ((this._batches.get(key) || []).length > 0) this._enqueueFlush(key);
+      return;
+    }
+
+    const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
 
     const doRequest = (authToken) => fetch(endpoint, {
       method: 'PUT',
@@ -414,12 +432,12 @@ class OnBuyUpdater {
       body: JSON.stringify({ listings }),
     });
 
-    ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} payload:`, JSON.stringify({ listings }));
+    ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${sendItems.length} payload:`, JSON.stringify({ listings }));
 
     try {
       let res = await doRequest(token);
       let raw = await res.text();
-      ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${items.length} → HTTP ${res.status} response:`, raw.slice(0, 2000));
+      ulog(batchUserId, `[OnBuyUpdater] Batch ${listingKey.toUpperCase()} ×${sendItems.length} → HTTP ${res.status} response:`, raw.slice(0, 2000));
 
       // Token expired mid-run — refresh once and retry the batch
       if (res.status === 401) {
@@ -428,11 +446,11 @@ class OnBuyUpdater {
         // Tier 3: DB lookup via mappingId — covers jobs created before the fix and slow-queue
         //         escalations that historically omitted consumerKey/secretKey from their payload.
         let creds = this._creds.get(token)
-                 || this._creds.get(items[0].token)
-                 || (items[0].consumerKey ? { consumerKey: items[0].consumerKey, secretKey: items[0].secretKey } : null);
+                 || this._creds.get(sendItems[0].token)
+                 || (sendItems[0].consumerKey ? { consumerKey: sendItems[0].consumerKey, secretKey: sendItems[0].secretKey } : null);
 
         if (!creds) {
-          const mappingId = items.find(it => it.mappingId)?.mappingId;
+          const mappingId = sendItems.find(it => it.mappingId)?.mappingId;
           if (mappingId) {
             try {
               const { rows } = await db.query(`
@@ -489,7 +507,7 @@ class OnBuyUpdater {
 
       if (!res.ok) {
         const err = new Error(`OnBuy ${res.status}: ${raw.slice(0, 200)}`);
-        items.forEach(it => it.reject(err));
+        sendItems.forEach(it => it.reject(err));
         return;
       }
 
@@ -497,13 +515,13 @@ class OnBuyUpdater {
       const results = Array.isArray(data?.results) ? data.results
                     : Array.isArray(data?.payload)  ? data.payload
                     : [];
-      items.forEach((it, i) => {
+      sendItems.forEach((it, i) => {
         const r = results[i];
         if (r?.success === false) it.reject(new Error(r.message || 'OnBuy rejected update'));
         else it.resolve({ ...data, _finalPrice: it.price }); // pass adjusted price back to caller
       });
     } catch (err) {
-      items.forEach(it => it.reject(err));
+      sendItems.forEach(it => it.reject(err));
     }
 
     // Flush any remaining items that arrived while this batch was in flight
@@ -668,13 +686,19 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 
   const label = `${product_name || primary_asin} (#${id})`;
 
+  // Use explicit onbuy_sku first, then fall back to primary_asin (sellers commonly use
+  // the ASIN as their OnBuy seller SKU), then fall back to the listing UID.
+  // effectiveSku drives both the identifier sent to OnBuy and the isSku flag that
+  // enables check-winning (which only works for SKU-keyed listings).
+  const effectiveSku = onbuy_sku || primary_asin || null;
+
   // ── OOS: set OnBuy stock=0 ──
   if (scraped.inStock === false) {
     const wasAlreadyOos = amazon_in_stock === false;
-    const identifier    = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
+    const identifier    = effectiveSku || mapping.onbuy_listing_id || rawListingId;
     if (!wasAlreadyOos) {
       ulog(userId, `[Worker] ⚠️  ${label} — OOS, setting stock=0`);
-      onbuyUpdater.enqueueStock(token, siteId, identifier, !!onbuy_sku, 0, { consumerKey, secretKey, userId })
+      onbuyUpdater.enqueueStock(token, siteId, identifier, !!effectiveSku, 0, { consumerKey, secretKey, userId })
         .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=0 failed: ${err.message}`));
     } else {
       ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
@@ -693,9 +717,9 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // A missing price with no explicit inStock=false means the scrape failed (blocked/timeout),
   // not that the item is back in stock. Never restore from a failed scrape.
   if (amazon_in_stock === false && scraped.price) {
-    const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
+    const identifier = effectiveSku || mapping.onbuy_listing_id || rawListingId;
     ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=2`);
-    onbuyUpdater.enqueueStock(token, siteId, identifier, !!onbuy_sku, 2, { consumerKey, secretKey, userId })
+    onbuyUpdater.enqueueStock(token, siteId, identifier, !!effectiveSku, 2, { consumerKey, secretKey, userId })
       .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=2 failed: ${err.message}`));
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
@@ -726,11 +750,13 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   const storedBelowFloor = minRoiFloor != null && last_onbuy_price
     ? parseFloat(last_onbuy_price) < minRoiFloor
     : false;
-  const alreadyCorrect = !storedBelowFloor && last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
-  if (!hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect) {
-    ulog(userId, `[Worker] ⏭  ${label} — price unchanged (Amazon £${amazonPrice}, OnBuy £${newOnBuyPrice}), skipping`);
-    await db.query(`UPDATE product_mappings SET last_checked_at = NOW() WHERE id = $1`, [id]);
-    return { success: true, skipped: true };
+  const alreadyCorrect  = !storedBelowFloor && last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
+  const priceUnchanged  = !hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect;
+  // Always enqueue — check-winning adjusts the price even when Amazon hasn't moved.
+  // noChangeEnqueue=true tells the batch to skip the PUT if check-winning also makes
+  // no adjustment, so unchanged-and-already-winning listings cost zero API calls.
+  if (priceUnchanged) {
+    ulog(userId, `[Worker] ↩  ${label} — Amazon £${amazonPrice} / OnBuy £${newOnBuyPrice} unchanged — check-winning will adjust if not winning`);
   }
 
   // ── Push to OnBuy (batched + rate-limited, fire-and-forget) ──
@@ -744,17 +770,19 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     [amazonPrice, id]
   );
 
-  const identifier = onbuy_sku || mapping.onbuy_listing_id || rawListingId;
-  onbuyUpdater.enqueue(token, siteId, identifier, !!onbuy_sku, newOnBuyPrice, {
+  const identifier = effectiveSku || mapping.onbuy_listing_id || rawListingId;
+  onbuyUpdater.enqueue(token, siteId, identifier, !!effectiveSku, newOnBuyPrice, {
     consumerKey, secretKey,
     amazonPrice,
-    mappingId:    id,
-    minPrice:     min_price ? parseFloat(min_price) : null,
-    feeRate:      effFeeRate !== _onbuyFeeRate  ? effFeeRate  : null,
-    minRoiPercent: effMinRoi !== _minRoiPercent ? effMinRoi   : null,
+    mappingId:      id,
+    minPrice:       min_price ? parseFloat(min_price) : null,
+    feeRate:        effFeeRate !== _onbuyFeeRate  ? effFeeRate  : null,
+    minRoiPercent:  effMinRoi !== _minRoiPercent ? effMinRoi   : null,
     userId,
+    noChangeEnqueue: priceUnchanged,  // skip the PUT if check-winning also makes no adjustment
   })
     .then(async (result) => {
+      if (result?._noChange) return; // check-winning confirmed no adjustment needed — nothing to log
       const finalPrice = result?._finalPrice ?? newOnBuyPrice;
       try {
         await db.query(
@@ -803,8 +831,10 @@ async function processFastJob(job) {
 
 async function _processFastJob(job, mapping, token, siteId, consumerKey, secretKey, userSettings, userId) {
 
-  // Resolve listing UID from OPC if we only have a raw URL/OPC
-  if (!mapping.onbuy_sku && !isValidListingUid(mapping.onbuy_listing_id)) {
+  // Resolve listing UID from OPC if we have neither a SKU nor a valid UID.
+  // primary_asin is treated as the OnBuy seller SKU when onbuy_sku is not explicitly set
+  // (sellers commonly use the ASIN as their OnBuy SKU), so skip OPC resolution in that case.
+  if (!mapping.onbuy_sku && !mapping.primary_asin && !isValidListingUid(mapping.onbuy_listing_id)) {
     const opc = mapping.onbuy_opc || extractOpcFromValue(mapping.onbuy_listing_id);
     if (!opc) {
       const msg = 'No SKU or valid UID — re-import with Seller SKU filled in';
