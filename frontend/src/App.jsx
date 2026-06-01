@@ -1718,12 +1718,12 @@ export default function App() {
     return () => clearInterval(iv);
   }, [authToken, pollQueue]);
 
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
+
   // ── Gate behind login ───────────────────────
   if (!authToken || !currentUser) {
     return <LoginPage onLogin={login} />;
   }
-
-  const [syncModalOpen, setSyncModalOpen] = useState(false);
 
   const triggerSync = async (onlyUnsynced) => {
     setSyncModalOpen(false);
