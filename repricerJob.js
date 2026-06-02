@@ -649,6 +649,20 @@ function extractOpcFromValue(val) {
   return m ? m[1] : null;
 }
 
+// Atomically increment today's per-user/account counters.
+// accountId=null maps to 0 (used when onbuy_account_id is not set on the mapping).
+function _incrDailyStats(userId, accountId, priceChanged = false) {
+  db.query(
+    `INSERT INTO daily_sync_stats (user_id, onbuy_account_id, date, synced_count, price_changes)
+     VALUES ($1, $2, CURRENT_DATE, 1, $3)
+     ON CONFLICT (user_id, onbuy_account_id, date)
+     DO UPDATE SET
+       synced_count  = daily_sync_stats.synced_count  + 1,
+       price_changes = daily_sync_stats.price_changes + EXCLUDED.price_changes`,
+    [userId, accountId ?? 0, priceChanged ? 1 : 0]
+  ).catch(() => {});
+}
+
 // ─────────────────────────────────────────────
 // SHARED RESULT HANDLER
 // Called by both workers after scraping completes
@@ -666,7 +680,8 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     amazon_in_stock,
     primary_asin,
     product_name,
-    user_id: userId,
+    user_id:          userId,
+    onbuy_account_id: accountId,
   } = mapping;
 
   const effFeeRate  = userSettings.feeRate      ?? _onbuyFeeRate;
@@ -711,6 +726,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
       `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
        VALUES ($1, 'skipped', 'Amazon OOS — OnBuy stock set to 0', NOW())`, [id]
     );
+    _incrDailyStats(userId, accountId);
     return { success: true, skipped: true, outOfStock: true };
   }
 
@@ -734,6 +750,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
        VALUES ($1, 'failed', $2, NOW())`,
       [id, `Scrape failed: ${scraped.error || 'no price returned'}`]
     );
+    _incrDailyStats(userId, accountId);
     return { success: false, error: scraped.error };
   }
 
@@ -787,7 +804,10 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     noChangeEnqueue: priceUnchanged,  // skip the PUT if check-winning also makes no adjustment
   })
     .then(async (result) => {
-      if (result?._noChange) return; // check-winning confirmed no adjustment needed — nothing to log
+      if (result?._noChange) {
+        _incrDailyStats(userId, accountId);
+        return;
+      }
       const finalPrice = result?._finalPrice ?? newOnBuyPrice;
       try {
         await db.query(
@@ -806,6 +826,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
             [id, finalPrice !== newOnBuyPrice ? `Price synced (winning adjustment: £${newOnBuyPrice} → £${finalPrice})` : 'Price synced', amazonPrice, finalPrice]
           ),
         ]);
+        _incrDailyStats(userId, accountId, true);
       } catch (dbErr) {
         ulog(userId, `[Worker] DB post-sync update failed for #${id}:`, dbErr.message);
       }
@@ -817,6 +838,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
          VALUES ($1, 'failed', $2, NOW())`,
         [id, `OnBuy API error: ${err.message}`]
       ).catch(() => {});
+      _incrDailyStats(userId, accountId);
     });
 
   return { success: true, amazonPrice, newOnBuyPrice };
@@ -848,6 +870,7 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`, [mapping.id, msg]
       );
+      _incrDailyStats(mapping.user_id, mapping.onbuy_account_id);
       return { success: false, error: 'no_identifier' };
     }
     const uid = await resolveUidFromOpc(opc, token, siteId);
@@ -857,6 +880,7 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
         `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
          VALUES ($1, 'failed', $2, NOW())`, [mapping.id, msg]
       );
+      _incrDailyStats(mapping.user_id, mapping.onbuy_account_id);
       return { success: false, error: 'opc_resolve_failed' };
     }
     await db.query(
@@ -924,6 +948,7 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
          VALUES ($1, 'failed', 'Scrape requires browser (puppeteer disabled for this OnBuy account)', NOW())`,
         [mapping.id]
       );
+      _incrDailyStats(mapping.user_id, mapping.onbuy_account_id);
       return { success: false, error: 'puppeteer_disabled' };
     }
 
@@ -1505,6 +1530,16 @@ export async function startScheduler() {
 }
 
 export { fastWorker, slowWorker };
+
+// Daily cleanup at 03:00 — remove sync_logs older than 3 days and daily_sync_stats older than 90 days.
+cron.schedule('0 3 * * *', () => {
+  db.query(`DELETE FROM sync_logs WHERE created_at < NOW() - INTERVAL '3 days'`)
+    .then(r => wlog(`[Cleanup] Removed ${r.rowCount} sync_logs older than 3 days`))
+    .catch(err => wlog('[Cleanup] sync_logs cleanup error:', err.message));
+  db.query(`DELETE FROM daily_sync_stats WHERE date < CURRENT_DATE - 90`)
+    .then(r => wlog(`[Cleanup] Removed ${r.rowCount} daily_sync_stats rows older than 90 days`))
+    .catch(err => wlog('[Cleanup] daily_sync_stats cleanup error:', err.message));
+});
 
 // Start the per-user scheduler.
 startScheduler();

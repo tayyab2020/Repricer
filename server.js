@@ -207,15 +207,18 @@ app.post('/api/admin/users/:id/impersonate', requireAuth, requireAdmin, async (r
 app.get('/api/stats', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
   try {
-    const [mappings, recentLogs, priceChanges] = await Promise.all([
+    const [mappings, syncStats] = await Promise.all([
       db.query('SELECT COUNT(*) FROM product_mappings WHERE is_active = true AND user_id = $1', [uid]),
-      db.query(`SELECT COUNT(*) FROM sync_logs sl JOIN product_mappings pm ON pm.id = sl.product_mapping_id WHERE pm.user_id = $1 AND sl.created_at > NOW() - INTERVAL '24 hours'`, [uid]),
-      db.query(`SELECT COUNT(*) FROM sync_logs sl JOIN product_mappings pm ON pm.id = sl.product_mapping_id WHERE pm.user_id = $1 AND sl.status = 'success' AND sl.created_at > NOW() - INTERVAL '24 hours'`, [uid]),
+      db.query(
+        `SELECT COALESCE(SUM(synced_count), 0) AS synced, COALESCE(SUM(price_changes), 0) AS changed
+         FROM daily_sync_stats WHERE user_id = $1 AND date = CURRENT_DATE`,
+        [uid]
+      ),
     ]);
     res.json({
-      activeListings: parseInt(mappings.rows[0].count),
-      syncedLast24h: parseInt(recentLogs.rows[0].count),
-      priceChangesLast24h: parseInt(priceChanges.rows[0].count),
+      activeListings:      parseInt(mappings.rows[0].count),
+      syncedLast24h:       parseInt(syncStats.rows[0].synced),
+      priceChangesLast24h: parseInt(syncStats.rows[0].changed),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1634,6 +1637,14 @@ async function runMigrations() {
       created_at    TIMESTAMP DEFAULT NOW()
     )`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS listings_updated INTEGER DEFAULT 0`,
+    `CREATE TABLE IF NOT EXISTS daily_sync_stats (
+       user_id          INT  NOT NULL,
+       onbuy_account_id INT  NOT NULL DEFAULT 0,
+       date             DATE NOT NULL DEFAULT CURRENT_DATE,
+       synced_count     INT  NOT NULL DEFAULT 0,
+       price_changes    INT  NOT NULL DEFAULT 0,
+       PRIMARY KEY (user_id, onbuy_account_id, date)
+     )`,
   ];
   for (const sql of steps) {
     try {

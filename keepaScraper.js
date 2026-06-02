@@ -348,8 +348,11 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
   );
   await _sleep(500);
 
-  // ── 5. Set CSV format, uncheck currency symbols ───────────────────────────
+  // ── 5. Select "All active columns", set CSV format, uncheck currency symbols ─
   await page.evaluate(() => {
+    // Ensure "All active columns" is selected (not "Only ASINs")
+    const allCols = document.querySelector('#allCh-radio');
+    if (allCols && !allCols.checked) allCols.click();
     const csv = document.querySelector('#csv-radio');
     if (csv && !csv.checked) csv.click();
     const sym = document.querySelector('#exportSymbols-checkbox');
