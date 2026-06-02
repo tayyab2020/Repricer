@@ -424,7 +424,7 @@ class OnBuyUpdater {
       return;
     }
 
-    const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2), stock: 5 }));
+    const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
 
     const doRequest = (authToken) => fetch(endpoint, {
       method: 'PUT',
@@ -714,14 +714,14 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     return { success: true, skipped: true, outOfStock: true };
   }
 
-  // ── Back in stock: restore stock=2 — only when we have a confirmed price ──
+  // ── Back in stock: restore stock=5 — only when we have a confirmed price ──
   // A missing price with no explicit inStock=false means the scrape failed (blocked/timeout),
   // not that the item is back in stock. Never restore from a failed scrape.
   if (amazon_in_stock === false && scraped.price) {
-    ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=2`);
+    ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=5`);
     if (effectiveSku) {
-      onbuyUpdater.enqueueStock(token, siteId, effectiveSku, true, 2, { consumerKey, secretKey, userId })
-        .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=2 failed: ${err.message}`));
+      onbuyUpdater.enqueueStock(token, siteId, effectiveSku, true, 5, { consumerKey, secretKey, userId })
+        .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=5 failed: ${err.message}`));
     }
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
