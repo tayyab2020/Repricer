@@ -424,7 +424,7 @@ class OnBuyUpdater {
       return;
     }
 
-    const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
+    const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2), stock: 5 }));
 
     const doRequest = (authToken) => fetch(endpoint, {
       method: 'PUT',
@@ -695,11 +695,12 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // ── OOS: set OnBuy stock=0 ──
   if (scraped.inStock === false) {
     const wasAlreadyOos = amazon_in_stock === false;
-    const identifier    = effectiveSku || mapping.onbuy_listing_id || rawListingId;
     if (!wasAlreadyOos) {
       ulog(userId, `[Worker] ⚠️  ${label} — OOS, setting stock=0`);
-      onbuyUpdater.enqueueStock(token, siteId, identifier, !!effectiveSku, 0, { consumerKey, secretKey, userId })
-        .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=0 failed: ${err.message}`));
+      if (effectiveSku) {
+        onbuyUpdater.enqueueStock(token, siteId, effectiveSku, true, 0, { consumerKey, secretKey, userId })
+          .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=0 failed: ${err.message}`));
+      }
     } else {
       ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
     }
@@ -717,10 +718,11 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // A missing price with no explicit inStock=false means the scrape failed (blocked/timeout),
   // not that the item is back in stock. Never restore from a failed scrape.
   if (amazon_in_stock === false && scraped.price) {
-    const identifier = effectiveSku || mapping.onbuy_listing_id || rawListingId;
     ulog(userId, `[Worker] ✅ ${label} — back in stock, restoring stock=2`);
-    onbuyUpdater.enqueueStock(token, siteId, identifier, !!effectiveSku, 2, { consumerKey, secretKey, userId })
-      .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=2 failed: ${err.message}`));
+    if (effectiveSku) {
+      onbuyUpdater.enqueueStock(token, siteId, effectiveSku, true, 2, { consumerKey, secretKey, userId })
+        .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=2 failed: ${err.message}`));
+    }
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
 
@@ -770,8 +772,11 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     [amazonPrice, id]
   );
 
-  const identifier = effectiveSku || mapping.onbuy_listing_id || rawListingId;
-  onbuyUpdater.enqueue(token, siteId, identifier, !!effectiveSku, newOnBuyPrice, {
+  if (!effectiveSku) {
+    ulog(userId, `[Worker] ⚠️  ${label} — no SKU (onbuy_sku and primary_asin both empty), skipping price update`);
+    return { success: false, error: 'no_sku' };
+  }
+  onbuyUpdater.enqueue(token, siteId, effectiveSku, true, newOnBuyPrice, {
     consumerKey, secretKey,
     amazonPrice,
     mappingId:      id,
@@ -1187,8 +1192,11 @@ keepaWorker.on('active', (job) => {
   wlog(`[DEBUG KeepaWorker active] job=${job?.id} userId=${userId} accountId=${accountId} asins=${displayCount} _keepaActive=${_keepaActive} _runUserIds=${_runUserIds.size}`);
   if (userId) {
     _runUserIds.add(userId);
-    // Show pending ASIN count as "jobs in queue" while browser session runs
-    redis.set(`repricer:running:${userId}`, displayCount, 'EX', 1800).catch(() => {});
+    // TTL covers the full remaining work: one hour per 1800-ASIN refill cycle plus 2 h buffer.
+    // Using EX 1800 (30 min) caused the key to expire when pm2 restarted mid-run, making
+    // the UI fall back to the BullMQ queue count instead of the Keepa-managed counter.
+    const activeTtl = (Math.ceil(displayCount / KEEPA_HOURLY_FILL) + 2) * 3600;
+    redis.set(`repricer:running:${userId}`, displayCount, 'EX', activeTtl).catch(() => {});
   }
 });
 keepaWorker.on('completed', (job, result) => {

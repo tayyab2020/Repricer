@@ -345,7 +345,8 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   const [pageSize, setPageSize] = useState(100);
   const [search, setSearch]     = useState("");
   const [searchInput, setSearchInput] = useState("");
-  const searchTimer = useRef(null);
+  const searchTimer  = useRef(null);
+  const opcSyncedRef = useRef(false);
   const [clearing, setClearing]   = useState(false);
   const [exporting, setExporting] = useState(false);
   const [form, setForm] = useState({
@@ -358,7 +359,17 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
     setLoading(true);
     const params = new URLSearchParams({ page: pg, limit: sz, ...(q ? { search: q } : {}) });
     api(`/mappings?${params}`)
-      .then(data => { setMappings(data.rows); setTotal(data.total); })
+      .then(data => {
+        setMappings(data.rows);
+        setTotal(data.total);
+        // Auto-fetch OPCs once per session for mappings that are missing them
+        if (!opcSyncedRef.current && data.rows?.some(m => !m.onbuy_opc && m.primary_asin)) {
+          opcSyncedRef.current = true;
+          api('/mappings/sync-opcs', { method: 'POST' })
+            .then(r => { if (r?.updated > 0) load(pg, sz, q); })
+            .catch(() => {});
+        }
+      })
       .catch(console.error)
       .finally(() => setLoading(false));
   }, [pageNum, pageSize, search]);
@@ -551,7 +562,11 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
                     <span style={{ color:C.muted, fontSize:11, marginLeft:6 }}>({m.supplier_count} suppliers)</span>
                   )}
                 </td>
-                <td style={{ padding:"10px 12px", color:C.muted, fontFamily:"monospace", fontSize:12 }}>{m.onbuy_listing_id}</td>
+                <td style={{ padding:"10px 12px", fontFamily:"monospace", fontSize:12 }}>
+                  {m.onbuy_opc
+                    ? <span style={{ color:C.blue }}>{m.onbuy_opc}</span>
+                    : <span style={{ color:C.muted }}>—</span>}
+                </td>
                 <td style={{ padding:"10px 12px", color:C.blue, fontFamily:"monospace", fontSize:12 }}>
                   <a href={`https://www.amazon.co.uk/dp/${m.primary_asin}`}
                     target="_blank" rel="noreferrer"

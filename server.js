@@ -13,7 +13,8 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, redis } from './jobProducer.js';
+import https from 'https';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, redis, getTokenForAccount } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { appendFile, appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -382,6 +383,79 @@ app.delete('/api/mappings', requireAuth, async (req, res) => {
   try {
     await db.query('DELETE FROM product_mappings WHERE user_id = $1', [req.effectiveUserId]);
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/mappings/sync-opcs — bulk-fetch OPCs from OnBuy for mappings that are missing them.
+// Uses GET /v2/listings with a JSON body of SKUs (OnBuy accepts GET with body for this endpoint).
+// Chunks into batches of 100 SKUs per request to minimise API calls.
+app.post('/api/mappings/sync-opcs', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows: accounts } = await db.query(
+      `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true ORDER BY id ASC`,
+      [uid]
+    );
+    if (!accounts.length) return res.json({ updated: 0 });
+
+    let totalUpdated = 0;
+
+    for (const account of accounts) {
+      const token = await getTokenForAccount(account);
+      if (!token) continue;
+      const siteId = parseInt(account.site_id) || 2000;
+
+      // Mappings for this account that have an ASIN/SKU but no OPC yet
+      const { rows: mappings } = await db.query(
+        `SELECT id, onbuy_sku, primary_asin
+         FROM product_mappings
+         WHERE user_id = $1 AND onbuy_account_id = $2 AND is_active = true
+           AND onbuy_opc IS NULL
+           AND (onbuy_sku IS NOT NULL OR primary_asin IS NOT NULL)`,
+        [uid, account.id]
+      );
+      if (!mappings.length) continue;
+
+      // Build SKU → [mapping id] map (effectiveSku = onbuy_sku || primary_asin)
+      const skuToIds = {};
+      for (const m of mappings) {
+        const sku = (m.onbuy_sku || m.primary_asin || '').trim();
+        if (!sku) continue;
+        if (!skuToIds[sku]) skuToIds[sku] = [];
+        skuToIds[sku].push(m.id);
+      }
+      const allSkus = Object.keys(skuToIds);
+      if (!allSkus.length) continue;
+
+      // Chunk into 1000-SKU batches — OnBuy GET /v2/listings accepts a JSON body with a `skus` array
+      const CHUNK = 1000;
+      for (let i = 0; i < allSkus.length; i += CHUNK) {
+        const skuChunk = allSkus.slice(i, i + CHUNK);
+        const listings = await fetchOnBuyListingsBySkus(token, siteId, skuChunk);
+        if (!listings) continue;
+
+        for (const listing of listings) {
+          const sku   = listing.sku;
+          const opc   = listing.opc || listing.product_encoded_id;
+          const title = listing.name || listing.product_name || listing.title || null;
+          if (!sku || !opc) continue;
+          const ids = skuToIds[sku] || [];
+          for (const id of ids) {
+            await db.query(
+              `UPDATE product_mappings
+               SET onbuy_opc = $1${title ? ', product_name = COALESCE(NULLIF(product_name,\'\'), $3)' : ''}
+               WHERE id = $2`,
+              title ? [opc, id, title] : [opc, id]
+            );
+            totalUpdated++;
+          }
+        }
+      }
+    }
+
+    res.json({ updated: totalUpdated });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -856,27 +930,6 @@ app.post('/api/accounts/:id/test', requireAuth, async (req, res) => {
 // EXCEL IMPORT
 // ─────────────────────────────────────────────
 
-// Fetch product title from Amazon meta/title tag (no browser needed)
-async function fetchAmazonTitle(asin) {
-  try {
-    const res = await fetch(`https://www.amazon.co.uk/dp/${asin}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-GB,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const meta = html.match(/<meta\s+name="title"\s+content="([^"]+)"/i);
-    if (meta) return meta[1].replace(/\s*:?\s*Amazon\.co\.uk.*$/i, '').trim();
-    const title = html.match(/<title>([^<]+)<\/title>/i);
-    if (title) return title[1].replace(/\s*:?\s*Amazon\.co\.uk.*$/i, '').trim();
-    return null;
-  } catch {
-    return null;
-  }
-}
 
 function extractAsin(input) {
   if (!input) return null;
@@ -985,6 +1038,34 @@ function extractOnBuyOpc(input) {
 function isListingUid(s) {
   if (!s) return false;
   return !/^https?:/i.test(s) && !/onbuy\.com/i.test(s);
+}
+
+// GET /v2/listings with a JSON body of SKUs — OnBuy accepts GET with body for this endpoint.
+// Returns the listings array or null on error.
+async function fetchOnBuyListingsBySkus(token, siteId, skus) {
+  const bodyBuf = Buffer.from(JSON.stringify({ site_id: parseInt(siteId) || 2000, skus }));
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: 'api.onbuy.com',
+      path:     `/v2/listings?site_id=${siteId}&limit=1000`,
+      method:   'GET',
+      headers:  { Authorization: token, 'Content-Type': 'application/json', 'Content-Length': bodyBuf.length },
+    };
+    const req2 = https.request(opts, (r2) => {
+      let raw = '';
+      r2.on('data', c => raw += c);
+      r2.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const list = Array.isArray(data) ? data : (data.payload ?? data.results ?? data.listings ?? []);
+          resolve(list);
+        } catch { resolve(null); }
+      });
+    });
+    req2.on('error', () => resolve(null));
+    req2.write(bodyBuf);
+    req2.end();
+  });
 }
 
 // Fetch account row from DB
@@ -1247,14 +1328,31 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
     }
   }
 
-  // ── 2. Auto-fetch missing titles (parallel, best-effort) ──
+  // ── 2. Auto-fetch missing titles + OPCs via OnBuy listings API ──
+  // GET /v2/listings returns both product name and OPC in one batch request — no Amazon scraping needed.
   const titleRows = bulkRows.filter(r => r.needs_title_fetch && r.primary_asin);
   if (titleRows.length > 0) {
-    console.log(`[Import] Fetching ${titleRows.length} title(s) from Amazon…`);
-    await Promise.all(titleRows.map(async row => {
-      const t = await fetchAmazonTitle(row.primary_asin);
-      if (t) row.product_name = t;
-    }));
+    if (!account) account = await getImportAccount(onbuy_account_id);
+    if (account && !onbuyToken) onbuyToken = await getOnBuyTokenForAccount(account);
+    if (onbuyToken && account) {
+      const siteId   = parseInt(account.site_id) || 2000;
+      const skuMap   = new Map(titleRows.map(r => [r.onbuy_sku || r.primary_asin, r]));
+      const allSkus2 = [...skuMap.keys()];
+      console.log(`[Import] Fetching ${allSkus2.length} title(s)/OPC(s) from OnBuy listings API…`);
+      for (let i = 0; i < allSkus2.length; i += 1000) {
+        const chunk    = allSkus2.slice(i, i + 1000);
+        const listings = await fetchOnBuyListingsBySkus(onbuyToken, siteId, chunk);
+        if (!listings) continue;
+        for (const listing of listings) {
+          const row   = skuMap.get(listing.sku);
+          if (!row) continue;
+          const title = listing.name || listing.product_name || listing.title || null;
+          const opc   = listing.opc || listing.product_encoded_id || null;
+          if (title && !row.product_name) row.product_name = title;
+          if (opc   && !row.onbuy_opc)   row.onbuy_opc    = opc;
+        }
+      }
+    }
   }
 
   // ── 3. One query to find ALL existing records by sku or listing_id ──
@@ -2158,6 +2256,13 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
           }
         } else {
           results.listing_created++;
+          // Persist OPC into product_mappings so the Mappings page can display it
+          if (m.opc && m.row.sku) {
+            db.query(
+              `UPDATE product_mappings SET onbuy_opc = $1 WHERE user_id = $2 AND (onbuy_sku = $3 OR primary_asin = $3)`,
+              [m.opc, req.user.userId, m.row.sku]
+            ).catch(() => {});
+          }
           db.query(
             `INSERT INTO onbuy_bulk_import_items
               (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
@@ -2204,6 +2309,13 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
             ).catch(() => {});
           } else {
             results.listing_updated++;
+            // Persist OPC into product_mappings so the Mappings page can display it
+            if (m.opc && m.row.sku) {
+              db.query(
+                `UPDATE product_mappings SET onbuy_opc = $1 WHERE user_id = $2 AND (onbuy_sku = $3 OR primary_asin = $3)`,
+                [m.opc, req.user.userId, m.row.sku]
+              ).catch(() => {});
+            }
             db.query(
               `INSERT INTO onbuy_bulk_import_items
                 (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
