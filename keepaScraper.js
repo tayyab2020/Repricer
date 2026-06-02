@@ -57,7 +57,6 @@ export async function createKeepaSession(email, password, log = console.log) {
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--window-size=1440,900',
-      '--disable-gpu', '--disable-software-rasterizer',
     ],
     ...(process.env.PUPPETEER_EXECUTABLE_PATH
       ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
@@ -305,13 +304,7 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
     log(`[Keepa] Table ready (signal: ${signal})`);
     await _sleep(2000);
   } else {
-    // Capture what the page looks like to help diagnose why rows never appeared
-    const screenshotPath = `/tmp/keepa-timeout-${Date.now()}.png`;
-    await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => {});
-    const pageTitle = await page.title().catch(() => '?');
-    const domSnap = await page.evaluate(() => document.querySelector('.ag-center-cols-container')?.innerHTML?.slice(0, 500) || 'no .ag-center-cols-container').catch(() => '?');
-    log(`[Keepa] Timeout — page title: "${pageTitle}" | screenshot: ${screenshotPath}`);
-    log(`[Keepa] DOM snap: ${domSnap}`);
+    log('[Keepa] Timeout — no data rows appeared after 5 min; retrying via caller');
     throw Object.assign(new Error('KEEPA_BATCH_TIMEOUT'), { isTimeout: true });
   }
 
