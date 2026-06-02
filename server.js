@@ -390,9 +390,11 @@ app.delete('/api/mappings', requireAuth, async (req, res) => {
 
 // POST /api/mappings/sync-opcs — bulk-fetch OPCs from OnBuy for mappings that are missing them.
 // Uses GET /v2/listings with a JSON body of SKUs (OnBuy accepts GET with body for this endpoint).
-// Chunks into batches of 100 SKUs per request to minimise API calls.
+// Accepts optional { ids: [...] } body — when provided, only those mapping IDs are processed
+// (used by the Mappings page for the current page and by import confirm for just-imported rows).
 app.post('/api/mappings/sync-opcs', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
+  const { ids } = req.body || {};
   try {
     const { rows: accounts } = await db.query(
       `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true ORDER BY id ASC`,
@@ -400,48 +402,58 @@ app.post('/api/mappings/sync-opcs', requireAuth, async (req, res) => {
     );
     if (!accounts.length) return res.json({ updated: 0 });
 
+    const { rows: mappings } = ids?.length
+      ? await db.query(
+          `SELECT id, onbuy_sku, primary_asin
+           FROM product_mappings
+           WHERE user_id = $1 AND id = ANY($2)
+             AND onbuy_opc IS NULL
+             AND (onbuy_sku IS NOT NULL OR primary_asin IS NOT NULL)`,
+          [uid, ids]
+        )
+      : await db.query(
+          `SELECT id, onbuy_sku, primary_asin
+           FROM product_mappings
+           WHERE user_id = $1 AND is_active = true
+             AND onbuy_opc IS NULL
+             AND (onbuy_sku IS NOT NULL OR primary_asin IS NOT NULL)`,
+          [uid]
+        );
+    if (!mappings.length) return res.json({ updated: 0 });
+
+    // SKU → [mapping id] map
+    const skuToIds = {};
+    for (const m of mappings) {
+      const sku = (m.onbuy_sku || m.primary_asin || '').trim();
+      if (!sku) continue;
+      if (!skuToIds[sku]) skuToIds[sku] = [];
+      skuToIds[sku].push(m.id);
+    }
+    if (!Object.keys(skuToIds).length) return res.json({ updated: 0 });
+
     let totalUpdated = 0;
+    const CHUNK = 1000;
 
     for (const account of accounts) {
+      const remaining = Object.keys(skuToIds);
+      if (!remaining.length) break; // all resolved
+
       const token = await getTokenForAccount(account);
       if (!token) continue;
       const siteId = parseInt(account.site_id) || 2000;
 
-      // Mappings for this account that have an ASIN/SKU but no OPC yet
-      const { rows: mappings } = await db.query(
-        `SELECT id, onbuy_sku, primary_asin
-         FROM product_mappings
-         WHERE user_id = $1 AND onbuy_account_id = $2 AND is_active = true
-           AND onbuy_opc IS NULL
-           AND (onbuy_sku IS NOT NULL OR primary_asin IS NOT NULL)`,
-        [uid, account.id]
-      );
-      if (!mappings.length) continue;
-
-      // Build SKU → [mapping id] map (effectiveSku = onbuy_sku || primary_asin)
-      const skuToIds = {};
-      for (const m of mappings) {
-        const sku = (m.onbuy_sku || m.primary_asin || '').trim();
-        if (!sku) continue;
-        if (!skuToIds[sku]) skuToIds[sku] = [];
-        skuToIds[sku].push(m.id);
-      }
-      const allSkus = Object.keys(skuToIds);
-      if (!allSkus.length) continue;
-
-      // Chunk into 1000-SKU batches — OnBuy GET /v2/listings accepts a JSON body with a `skus` array
-      const CHUNK = 1000;
-      for (let i = 0; i < allSkus.length; i += CHUNK) {
-        const skuChunk = allSkus.slice(i, i + CHUNK);
+      for (let i = 0; i < remaining.length; i += CHUNK) {
+        const skuChunk = remaining.slice(i, i + CHUNK);
         const listings = await fetchOnBuyListingsBySkus(token, siteId, skuChunk);
-        if (!listings) continue;
+        if (!listings?.length) continue;
 
         for (const listing of listings) {
           const sku   = listing.sku;
           const opc   = listing.opc || listing.product_encoded_id;
           const title = listing.name || listing.product_name || listing.title || null;
           if (!sku || !opc) continue;
-          const ids = skuToIds[sku] || [];
+          const ids = skuToIds[sku];
+          if (!ids) continue;
           for (const id of ids) {
             await db.query(
               `UPDATE product_mappings
@@ -451,6 +463,7 @@ app.post('/api/mappings/sync-opcs', requireAuth, async (req, res) => {
             );
             totalUpdated++;
           }
+          delete skuToIds[sku]; // resolved — skip on subsequent accounts
         }
       }
     }
@@ -1309,8 +1322,10 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
   const createRows = toImport.filter(r => r.action === 'create' && r.onbuy_opc);
   const bulkRows   = toImport.filter(r => !(r.action === 'create' && r.onbuy_opc));
 
+  // Eagerly fetch the account and token — needed for both listing-creation rows
+  // and the title/OPC fetch in Step 2 (which runs even on pure-update re-imports).
   let account = null, onbuyToken = null;
-  if (createRows.length > 0) {
+  if (onbuy_account_id) {
     account = await getImportAccount(onbuy_account_id);
     if (account) onbuyToken = await getOnBuyTokenForAccount(account);
   }
@@ -1461,6 +1476,44 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
       c.map(() => String(req.effectiveUserId)),
     ]);
     results.created += c.length;
+  }
+
+  // ── 6. Post-import OPC sync — fetch OPCs for just-imported rows still missing them ──
+  if (onbuyToken && account) {
+    const missingOpcSkus = [...new Set(
+      bulkRows
+        .filter(r => !r.onbuy_opc)
+        .map(r => (r.onbuy_sku || r.primary_asin || '').trim())
+        .filter(Boolean)
+    )];
+    if (missingOpcSkus.length > 0) {
+      const siteId = parseInt(account.site_id) || 2000;
+      console.log(`[Import] Post-import OPC sync for ${missingOpcSkus.length} SKU(s)…`);
+      for (let i = 0; i < missingOpcSkus.length; i += 1000) {
+        const chunk    = missingOpcSkus.slice(i, i + 1000);
+        const listings = await fetchOnBuyListingsBySkus(onbuyToken, siteId, chunk).catch(() => null);
+        if (!listings?.length) continue;
+        for (const listing of listings) {
+          const opc   = listing.opc || listing.product_encoded_id;
+          const title = listing.name || listing.product_name || listing.title || null;
+          if (!listing.sku || !opc) continue;
+          if (title) {
+            db.query(
+              `UPDATE product_mappings
+               SET onbuy_opc = $1, product_name = COALESCE(NULLIF(product_name,''), $3)
+               WHERE user_id = $2 AND (onbuy_sku = $4 OR primary_asin = $4) AND onbuy_opc IS NULL`,
+              [opc, req.effectiveUserId, title, listing.sku]
+            ).catch(() => {});
+          } else {
+            db.query(
+              `UPDATE product_mappings SET onbuy_opc = $1
+               WHERE user_id = $2 AND (onbuy_sku = $3 OR primary_asin = $3) AND onbuy_opc IS NULL`,
+              [opc, req.effectiveUserId, listing.sku]
+            ).catch(() => {});
+          }
+        }
+      }
+    }
   }
 
   // Audit log (best-effort)

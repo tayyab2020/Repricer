@@ -346,7 +346,6 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   const [search, setSearch]     = useState("");
   const [searchInput, setSearchInput] = useState("");
   const searchTimer  = useRef(null);
-  const opcSyncedRef = useRef(false);
   const [clearing, setClearing]   = useState(false);
   const [exporting, setExporting] = useState(false);
   const [form, setForm] = useState({
@@ -362,10 +361,9 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
       .then(data => {
         setMappings(data.rows);
         setTotal(data.total);
-        // Auto-fetch OPCs once per session for mappings that are missing them
-        if (!opcSyncedRef.current && data.rows?.some(m => !m.onbuy_opc && m.primary_asin)) {
-          opcSyncedRef.current = true;
-          api('/mappings/sync-opcs', { method: 'POST' })
+        const missingIds = (data.rows || []).filter(m => !m.onbuy_opc && m.primary_asin).map(m => m.id);
+        if (missingIds.length) {
+          api('/mappings/sync-opcs', { method: 'POST', body: JSON.stringify({ ids: missingIds }) })
             .then(r => { if (r?.updated > 0) load(pg, sz, q); })
             .catch(() => {});
         }
