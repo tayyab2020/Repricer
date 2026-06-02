@@ -1755,7 +1755,7 @@ export default function App() {
     { id:"current-prices", label:"💷 Current Prices" },
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
-    { id:"onbuy-bulk",     label:"📦 OnBuy Products" },
+    { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),

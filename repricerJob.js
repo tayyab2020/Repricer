@@ -1063,7 +1063,21 @@ async function processKeepaJob(job) {
         quotaExhaustedIdx = i;
         break;
       }
-      log(`[KeepaWorker] Sub-batch ${chunkNum} failed: ${err.message}`);
+      if (err.message === 'KEEPA_BATCH_TIMEOUT') {
+        log(`[KeepaWorker] Sub-batch ${chunkNum} timed out — retrying once (fresh session)…`);
+        try {
+          chunkPrices = await getKeepaPrice(chunk, { email: keepaEmail, password: keepaPassword, log });
+        } catch (retryErr) {
+          if (retryErr.message === 'KEEPA_QUOTA_EXHAUSTED') {
+            log(`[KeepaWorker] ⏸ Quota ${retryErr.quota ?? 0}% ≤5% at sub-batch ${chunkNum} retry — deferring ${thisBatch.length - i} ASINs for 1 h`);
+            quotaExhaustedIdx = i;
+            break;
+          }
+          log(`[KeepaWorker] Sub-batch ${chunkNum} retry failed: ${retryErr.message}`);
+        }
+      } else {
+        log(`[KeepaWorker] Sub-batch ${chunkNum} failed: ${err.message}`);
+      }
     }
 
     // Persist prices to Redis hash

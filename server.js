@@ -424,7 +424,8 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
                         (keepa.waiting + keepa.active + keepa.delayed);
 
       // Display total = all users' jobs (for the info counter).
-      // busy = only super-admin's OWN jobs — other users running should not block the button.
+      // busy = any jobs running globally — superadmin never enqueues under their own user ID
+      // so checking only their own Redis key always returns 0.
       const runningKeys = await redis.keys('repricer:running:*');
       let asinTotal = 0;
       if (runningKeys.length > 0) {
@@ -432,8 +433,7 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
         asinTotal = vals.reduce((sum, v) => sum + (parseInt(v) || 0), 0);
       }
       const total = Math.max(bullTotal, asinTotal);
-      const ownRunning = parseInt(await redis.get(`repricer:running:${req.user.id}`) || '0');
-      return res.json({ fast, slow, keepa, total, busy: ownRunning > 0 });
+      return res.json({ fast, slow, keepa, total, busy: total > 0 });
     }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
     res.json({ total: pending, busy: pending > 0 });

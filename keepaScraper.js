@@ -144,6 +144,7 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
         log(`[Keepa] Batch ${bi + 1} done — ${found}/${batches[bi].length} prices found`);
       } catch (err) {
         if (err.message === 'KEEPA_QUOTA_EXHAUSTED') throw err;
+        if (err.message === 'KEEPA_BATCH_TIMEOUT')   throw err;
         log(`[Keepa] Batch ${bi + 1} error: ${err.message}`);
       }
       if (bi < batches.length - 1) await _sleep(5000);
@@ -303,8 +304,8 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
     log(`[Keepa] Table ready (signal: ${signal})`);
     await _sleep(2000);
   } else {
-    log('[Keepa] Timeout — no data rows appeared after 5 min; skipping batch');
-    return {};
+    log('[Keepa] Timeout — no data rows appeared after 5 min; retrying via caller');
+    throw Object.assign(new Error('KEEPA_BATCH_TIMEOUT'), { isTimeout: true });
   }
 
   // ── 4. Open the Export dialog ─────────────────────────────────────────────
