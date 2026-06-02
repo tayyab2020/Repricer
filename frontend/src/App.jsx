@@ -556,6 +556,9 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
               <tr key={m.id} style={{ borderBottom:`1px solid ${C.border}20` }}>
                 <td style={{ padding:"10px 12px" }}>
                   <span style={{ color:C.text, fontWeight:500 }}>{m.product_name || "Unnamed"}</span>
+                  {m.amazon_in_stock === false && (
+                    <span title="Out of stock on Amazon" style={{ color:"#ef4444", fontSize:11, fontWeight:600, marginLeft:6, letterSpacing:"0.02em" }}>⊘ OOS</span>
+                  )}
                   {m.supplier_count > 0 && (
                     <span style={{ color:C.muted, fontSize:11, marginLeft:6 }}>({m.supplier_count} suppliers)</span>
                   )}
