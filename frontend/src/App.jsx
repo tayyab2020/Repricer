@@ -1772,6 +1772,7 @@ export default function App() {
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
     { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
+    { id:"sku-change",     label:"🔄 SKU Change" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
@@ -1957,6 +1958,7 @@ export default function App() {
             {page === "accounts"       && "Connect and manage your OnBuy seller accounts"}
             {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
             {page === "onbuy-bulk"     && "Create new products and listings directly on your OnBuy store"}
+            {page === "sku-change"     && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
             {page === "settings"       && "Configure proxies and global repricer options"}
             {page === "logs"           && "Real-time output from API server and job worker"}
             {page === "users"          && "Manage user accounts and impersonate users"}
@@ -1971,6 +1973,7 @@ export default function App() {
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
         {page === "onbuy-bulk"     && <OnBuyBulkPage />}
+        {page === "sku-change"     && <SkuChangePage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
@@ -2389,6 +2392,263 @@ function LiveLogsPage() {
   );
 }
 
+
+// ════════════════════════════════════════════
+//  SKU CHANGE PAGE
+// ════════════════════════════════════════════
+function SkuChangePage() {
+  const [step, setStep]           = useState(1);
+  const [accounts, setAccounts]   = useState([]);
+  const [accountId, setAccountId] = useState("");
+  const [file, setFile]           = useState(null);
+  const [preview, setPreview]     = useState(null);
+  const [result, setResult]       = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [err, setErr]             = useState("");
+  const [dragOver, setDragOver]   = useState(false);
+
+  useEffect(() => {
+    api("/accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  async function parseFile(f) {
+    setErr(""); setLoading(true);
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/sku-change/preview`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setPreview(data); setStep(2);
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  }
+
+  async function apply() {
+    if (!accountId) { setErr("Please select an OnBuy account"); return; }
+    setLoading(true); setErr("");
+    try {
+      const r = await api("/sku-change/apply", {
+        method: "POST",
+        body: JSON.stringify({ rows: preview.rows, onbuy_account_id: accountId }),
+      });
+      if (!r) { setLoading(false); return; } // 401 → page reloading
+      console.log("[SKU Change] apply response:", r);
+      setResult(r); setStep(3);
+    } catch (e) { setErr(e.message || "Connection failed — is the server running?"); }
+    setLoading(false);
+  }
+
+  const STEPS = ["Upload File", "Review Changes", "Results"];
+  const dropStyle = {
+    border: `2px dashed ${dragOver ? C.accent : C.border}`,
+    borderRadius: 12, padding: "40px 24px", textAlign: "center",
+    cursor: "pointer", background: dragOver ? C.accentDim : "transparent", transition: "all 0.2s",
+  };
+
+  return (
+    <div>
+      {/* Step indicator */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 28, alignItems: "center" }}>
+        {STEPS.map((label, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{
+              width: 24, height: 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+              background: step > i + 1 ? C.accent : step === i + 1 ? C.accentDim : "transparent",
+              border: `2px solid ${step >= i + 1 ? C.accent : C.border}`,
+              fontSize: 11, fontWeight: 700, color: step > i + 1 ? C.bg : step === i + 1 ? C.accent : C.muted,
+            }}>
+              {step > i + 1 ? "✓" : i + 1}
+            </div>
+            <span style={{ color: step === i + 1 ? C.text : C.muted, fontWeight: step === i + 1 ? 700 : 400, fontSize: 13 }}>{label}</span>
+            {i < STEPS.length - 1 && <span style={{ color: C.border, margin: "0 4px" }}>›</span>}
+          </div>
+        ))}
+      </div>
+
+      {err && (
+        <div style={{ background: "#ef444422", border: "1px solid #ef4444", borderRadius: 8,
+          padding: "10px 16px", color: "#ef4444", fontSize: 13, marginBottom: 16 }}>{err}</div>
+      )}
+
+      {/* Step 1: Upload */}
+      {step === 1 && (
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <h2 style={{ fontSize: 16, fontWeight: 700 }}>Upload SKU Change File</h2>
+            <a
+              href={`${API}/sku-change/template`}
+              style={{ color: C.accent, fontSize: 13, textDecoration: "none", fontWeight: 600 }}
+              onClick={e => { e.preventDefault(); window.open(`${API}/sku-change/template`, "_blank"); }}
+            >⬇ Download Template</a>
+          </div>
+          <p style={{ color: C.muted, fontSize: 13, marginBottom: 20 }}>
+            Upload an Excel file with <strong style={{ color: C.text }}>Seller SKU</strong> and{" "}
+            <strong style={{ color: C.text }}>New SKU</strong> columns.
+            SKUs are updated on OnBuy in batches of 1,000.
+          </p>
+          <div
+            style={dropStyle}
+            onClick={() => document.getElementById("sku-change-file-input").click()}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={e => {
+              e.preventDefault(); setDragOver(false);
+              const f = e.dataTransfer.files[0];
+              if (f) { setFile(f); parseFile(f); }
+            }}
+          >
+            <div style={{ fontSize: 36, marginBottom: 12 }}>📄</div>
+            <div style={{ color: C.text, fontWeight: 600, marginBottom: 6 }}>
+              {loading ? "Parsing file…" : "Drop Excel file here or click to browse"}
+            </div>
+            <div style={{ color: C.muted, fontSize: 12 }}>.xlsx or .xls files</div>
+            {file && <div style={{ color: C.accent, fontSize: 13, marginTop: 8 }}>{file.name}</div>}
+          </div>
+          <input
+            id="sku-change-file-input" type="file" accept=".xlsx,.xls"
+            style={{ display: "none" }}
+            onChange={e => { const f = e.target.files[0]; if (f) { setFile(f); parseFile(f); } }}
+          />
+        </div>
+      )}
+
+      {/* Step 2: Preview */}
+      {step === 2 && preview && (
+        <div>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28, marginBottom: 20 }}>
+            <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>Review SKU Changes</h2>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 20 }}>
+              <div style={{ background: C.bg, borderRadius: 8, padding: "12px 16px", textAlign: "center" }}>
+                <div style={{ color: C.accent, fontSize: 24, fontWeight: 700 }}>{preview.total.toLocaleString()}</div>
+                <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Valid Rows</div>
+              </div>
+              <div style={{ background: C.bg, borderRadius: 8, padding: "12px 16px", textAlign: "center" }}>
+                <div style={{ color: C.amber, fontSize: 24, fontWeight: 700 }}>{(preview.errors?.length || 0).toLocaleString()}</div>
+                <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Skipped Rows</div>
+              </div>
+              <div style={{ background: C.bg, borderRadius: 8, padding: "12px 16px", textAlign: "center" }}>
+                <div style={{ color: C.blue, fontSize: 24, fontWeight: 700 }}>{Math.ceil(preview.total / 1000)}</div>
+                <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>API Batches</div>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ color: C.textDim, fontSize: 13, display: "block", marginBottom: 6 }}>OnBuy Account *</label>
+              <select
+                value={accountId} onChange={e => setAccountId(e.target.value)}
+                style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+                  color: C.text, padding: "9px 14px", fontSize: 13, width: 320 }}
+              >
+                <option value="">Select account…</option>
+                {accounts.map(a => (
+                  <option key={a.id} value={a.id}>{a.account_name || a.email || `Account #${a.id}`}</option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ overflowX: "auto", maxHeight: 360, overflowY: "auto", borderRadius: 8, border: `1px solid ${C.border}` }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: C.bg, position: "sticky", top: 0 }}>
+                    {["#", "Current Seller SKU", "New SKU"].map(h => (
+                      <th key={h} style={{ padding: "10px 14px", textAlign: "left", color: C.muted,
+                        fontWeight: 600, borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {preview.rows.slice(0, 200).map((row, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                      <td style={{ padding: "8px 14px", color: C.muted }}>{i + 1}</td>
+                      <td style={{ padding: "8px 14px", color: C.text, fontFamily: "monospace" }}>{row.sellerSku}</td>
+                      <td style={{ padding: "8px 14px", color: C.accent, fontFamily: "monospace" }}>{row.newSku}</td>
+                    </tr>
+                  ))}
+                  {preview.rows.length > 200 && (
+                    <tr>
+                      <td colSpan={3} style={{ padding: "10px 14px", color: C.muted, fontSize: 12, textAlign: "center" }}>
+                        … and {(preview.rows.length - 200).toLocaleString()} more rows
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {preview.errors?.length > 0 && (
+              <div style={{ marginTop: 16, padding: "12px 16px", background: "#f59e0b11",
+                borderRadius: 8, border: "1px solid #f59e0b44" }}>
+                <div style={{ color: C.amber, fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                  {preview.errors.length} row(s) skipped in parse:
+                </div>
+                {preview.errors.slice(0, 5).map((e, i) => (
+                  <div key={i} style={{ color: C.textDim, fontSize: 12 }}>Row {e.row}: {e.error}</div>
+                ))}
+                {preview.errors.length > 5 && (
+                  <div style={{ color: C.muted, fontSize: 12 }}>…and {preview.errors.length - 5} more</div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 12 }}>
+            <Btn variant="secondary" onClick={() => { setStep(1); setPreview(null); setFile(null); }}>← Back</Btn>
+            <Btn onClick={apply} disabled={loading || preview.total === 0}>
+              {loading ? "Updating SKUs…" : `Apply ${preview.total.toLocaleString()} SKU Changes`}
+            </Btn>
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Results */}
+      {step === 3 && result && (
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 28 }}>
+          {result.error ? (
+            <div style={{ color: C.red, fontSize: 14, marginBottom: 20 }}>Error: {result.error}</div>
+          ) : (
+          <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 20 }}>SKU Update Complete</h2>
+          )}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 20 }}>
+            <div style={{ background: C.bg, borderRadius: 8, padding: 16, textAlign: "center" }}>
+              <div style={{ color: C.accent, fontSize: 28, fontWeight: 700 }}>{(result.updated ?? 0).toLocaleString()}</div>
+              <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Updated</div>
+            </div>
+            <div style={{ background: C.bg, borderRadius: 8, padding: 16, textAlign: "center" }}>
+              <div style={{ color: C.amber, fontSize: 28, fontWeight: 700 }}>{(result.skipped ?? 0).toLocaleString()}</div>
+              <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Skipped</div>
+            </div>
+            <div style={{ background: C.bg, borderRadius: 8, padding: 16, textAlign: "center" }}>
+              <div style={{ color: C.red, fontSize: 28, fontWeight: 700 }}>{(result.errors?.length || 0).toLocaleString()}</div>
+              <div style={{ color: C.muted, fontSize: 12, marginTop: 4 }}>Errors</div>
+            </div>
+          </div>
+          {result.errors?.length > 0 && (
+            <div style={{ maxHeight: 200, overflowY: "auto", background: C.bg, borderRadius: 8, padding: 16, marginBottom: 20 }}>
+              {result.errors.map((e, i) => (
+                <div key={i} style={{ fontSize: 12, color: C.textDim, marginBottom: 4 }}>
+                  <span style={{ color: C.red }}>✗</span> {e.sellerSku}: {typeof e.error === "string" ? e.error : JSON.stringify(e.error)}
+                </div>
+              ))}
+            </div>
+          )}
+          <Btn variant="secondary" onClick={() => {
+            setStep(1); setPreview(null); setResult(null); setFile(null); setAccountId(""); setErr("");
+          }}>
+            Start New Import
+          </Btn>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ImportPage() {
   const [step, setStep]           = useState(1);

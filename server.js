@@ -2440,6 +2440,184 @@ app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res
   }
 });
 
+// ─────────────────────────────────────────────
+// SKU CHANGE
+// ─────────────────────────────────────────────
+
+// GET /api/sku-change/template
+app.get('/api/sku-change/template', requireAuth, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['Seller SKU', 'New SKU'],
+    ['OLD-SKU-001', 'NEW-SKU-001'],
+    ['OLD-SKU-002', 'NEW-SKU-002'],
+  ]);
+  ws['!cols'] = [{ wch: 30 }, { wch: 30 }];
+  XLSX.utils.book_append_sheet(wb, ws, 'SKU Change');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="sku-change-template.xlsx"');
+  res.send(buf);
+});
+
+// POST /api/sku-change/preview — parse uploaded Excel, return rows for review
+app.post('/api/sku-change/preview', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (allRows.length < 2) return res.json({ total: 0, rows: [], errors: [] });
+
+    const headerRow = allRows[0].map(h => normalizeKey(String(h || '')));
+
+    const sellerSkuAliases = ['seller_sku', 'sellersku', 'current_sku', 'old_sku', 'sku'];
+    const newSkuAliases    = ['new_sku', 'newsku', 'updated_sku'];
+
+    const sellerSkuIdx = headerRow.findIndex(h => sellerSkuAliases.includes(h));
+    const newSkuIdx    = headerRow.findIndex(h => newSkuAliases.includes(h));
+
+    if (sellerSkuIdx === -1) return res.status(400).json({ error: 'Could not find "Seller SKU" column' });
+    if (newSkuIdx === -1)    return res.status(400).json({ error: 'Could not find "New SKU" column' });
+
+    const rows = [];
+    const errors = [];
+    allRows.slice(1).forEach((row, i) => {
+      const sellerSku = String(row[sellerSkuIdx] || '').trim();
+      const newSku    = String(row[newSkuIdx]    || '').trim();
+      if (!sellerSku && !newSku) return;
+      if (!sellerSku) { errors.push({ row: i + 2, error: 'Missing Seller SKU' }); return; }
+      if (!newSku)    { errors.push({ row: i + 2, error: 'Missing New SKU' }); return; }
+      if (sellerSku === newSku) { errors.push({ row: i + 2, sellerSku, newSku, error: 'New SKU is same as current' }); return; }
+      rows.push({ sellerSku, newSku });
+    });
+
+    res.json({ total: rows.length, rows, errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sku-change/apply — update OnBuy SKUs in batches of 1000
+app.post('/api/sku-change/apply', requireAuth, async (req, res) => {
+  const { rows, onbuy_account_id } = req.body;
+  console.log(`[SKU Change] apply called — rows:${rows?.length} account:${onbuy_account_id}`);
+  if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'No rows provided' });
+
+  const userId  = req.effectiveUserId;
+  const results = { updated: 0, skipped: 0, errors: [] };
+
+  try {
+    const account = await getImportAccount(onbuy_account_id);
+    if (!account) return res.status(400).json({ error: 'OnBuy account not found or inactive' });
+
+    const token = await getOnBuyTokenForAccount(account);
+    if (!token)  return res.status(400).json({ error: 'Failed to get OnBuy auth token' });
+    const siteId = account.site_id || 2000;
+
+    // Step 1: Fetch listing UIDs from OnBuy in batches of 1000 by current SKU
+    const allSkus  = [...new Set(rows.map(r => r.sellerSku))];
+    const uidBySku = new Map();
+    const BATCH    = 1000;
+
+    for (let i = 0; i < allSkus.length; i += BATCH) {
+      const batch    = allSkus.slice(i, i + BATCH);
+      const listings = await fetchOnBuyListingsBySkus(token, siteId, batch);
+      console.log(`[SKU Change] GET /v2/listings returned ${Array.isArray(listings) ? listings.length : 'null'} listings`);
+      if (Array.isArray(listings) && listings.length > 0) {
+        console.log('[SKU Change] First listing sample:', JSON.stringify(listings[0]).slice(0, 300));
+      }
+      if (Array.isArray(listings)) {
+        for (const listing of listings) {
+          const listingUid = listing.uid || listing.listing_uid || listing.id || listing.product_listing_id;
+          const listingSku = listing.sku || listing.seller_sku;
+          if (listingUid && listingSku) uidBySku.set(String(listingSku), String(listingUid));
+        }
+      }
+    }
+    console.log(`[SKU Change] UID map size: ${uidBySku.size}`);
+
+    // Step 2: Batch PUT /v2/listings by UID to change the SKU
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const chunk = rows.slice(i, i + BATCH);
+
+      // Separate rows with a resolved UID from those without
+      const withUid    = [];
+      const withoutUid = [];
+      for (const r of chunk) {
+        const uid = uidBySku.get(r.sellerSku);
+        if (uid) withUid.push({ uid, sellerSku: r.sellerSku, newSku: r.newSku });
+        else     withoutUid.push(r);
+      }
+
+      for (const r of withoutUid) {
+        results.skipped++;
+        results.errors.push({ sellerSku: r.sellerSku, error: 'Listing not found on OnBuy' });
+      }
+
+      if (withUid.length === 0) continue;
+
+      let data;
+      try {
+        const resp = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
+          method:  'PUT',
+          headers: { Authorization: token, 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ listings: withUid.map(r => ({ uid: r.uid, sku: r.newSku })) }),
+        });
+        const raw = await resp.text();
+        console.log(`[SKU Change] PUT /v2/listings status:${resp.status} body:${raw.slice(0, 500)}`);
+        try { data = JSON.parse(raw); } catch { data = null; }
+
+        if (!resp.ok) {
+          const rawMsg = data?.message || data?.error || raw.slice(0, 200);
+          const msg = typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg);
+          withUid.forEach(r => results.errors.push({ sellerSku: r.sellerSku, error: msg }));
+          results.skipped += withUid.length;
+          continue;
+        }
+      } catch (err) {
+        withUid.forEach(r => results.errors.push({ sellerSku: r.sellerSku, error: String(err.message) }));
+        results.skipped += withUid.length;
+        continue;
+      }
+
+      // Check per-item success flags
+      const resultItems = Array.isArray(data?.results) ? data.results
+                        : Array.isArray(data?.payload)  ? data.payload
+                        : Array.isArray(data)            ? data
+                        : null;
+
+      const failedUids = new Set();
+      if (resultItems) {
+        resultItems.forEach((item, idx) => {
+          if (item?.success === false) {
+            failedUids.add(withUid[idx]?.uid);
+            const rawErr = item.message || 'Rejected by OnBuy';
+            results.errors.push({ sellerSku: withUid[idx]?.sellerSku, error: typeof rawErr === 'string' ? rawErr : JSON.stringify(rawErr) });
+            results.skipped++;
+          }
+        });
+      }
+
+      // Update DB for successful rows
+      const successful = withUid.filter(r => !failedUids.has(r.uid));
+      if (successful.length > 0) {
+        await db.query(
+          `UPDATE product_mappings SET onbuy_sku = v.new_sku, updated_at = NOW()
+           FROM unnest($1::text[], $2::text[]) AS v(old_sku, new_sku)
+           WHERE product_mappings.onbuy_sku = v.old_sku AND product_mappings.user_id = $3`,
+          [successful.map(r => r.sellerSku), successful.map(r => r.newSku), userId]
+        );
+        results.updated += successful.length;
+      }
+    }
+
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/import/logs — import history (scoped to current user; super admin sees all)
 app.get('/api/import/logs', requireAuth, async (req, res) => {
   try {
