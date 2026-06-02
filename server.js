@@ -432,7 +432,12 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
         const vals = await redis.mget(...runningKeys);
         asinTotal = vals.reduce((sum, v) => sum + (parseInt(v) || 0), 0);
       }
-      const total = Math.max(bullTotal, asinTotal);
+      // Prefer the Redis counter: it's managed by the Keepa worker as the authoritative
+      // "remaining ASINs" figure, decremented per sub-batch. The BullMQ count grows as
+      // Keepa flushes pricing jobs to the fast queue and can exceed the Redis counter —
+      // Math.max would show an inflated number. Fall back to bullTotal only when Redis
+      // has nothing (non-Keepa runs, or all Keepa work is done and only fast jobs remain).
+      const total = asinTotal > 0 ? asinTotal : bullTotal;
       return res.json({ fast, slow, keepa, total, busy: total > 0 });
     }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
