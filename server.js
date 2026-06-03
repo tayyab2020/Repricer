@@ -1915,7 +1915,7 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
     return categoryCache[name];
   }
 
-  async function pollProductQueue(queueId, maxWaitMs = 90000) {
+  async function pollProductQueue(queueId, maxWaitMs = 300000) {
     const start = Date.now();
     while (Date.now() - start < maxWaitMs) {
       await new Promise(r => setTimeout(r, 4000));
@@ -1939,7 +1939,7 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
       }
     }
     blog(`Queue ${queueId} timed out after ${maxWaitMs / 1000}s`);
-    return null;
+    throw new Error(`Product queue timed out after ${maxWaitMs / 1000}s — product may have been created on OnBuy but OPC is unknown`);
   }
 
   // ── Phase 1a: Batch EAN search — up to 50 EANs per GET (600/hr GET limit) ──
