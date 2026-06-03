@@ -2185,6 +2185,14 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
     }
   }
 
+  // Give OnBuy time to propagate newly created products before trying to use their OPCs.
+  // The queue returns "success" before the OPC is fully indexed — using it immediately
+  // returns "OPC does not yet exist for the site id provided".
+  if (queueItems.length > 0 && results.product_created > 0) {
+    blog(`Waiting 15 s for OnBuy to propagate ${results.product_created} newly created product(s)…`);
+    await new Promise(r => setTimeout(r, 15_000));
+  }
+
   // ── Phase 3.5: Batch update existing products with fresh data (images, descriptions, etc.) ──
   // Covers all items in existingMeta that have an OPC — Phase 1 EAN matches + Phase 3 newly created / recovered products.
   // Uses PUT /v2/products (batch, synchronous) so images and metadata are refreshed before listings go live.
@@ -2256,13 +2264,23 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
       }));
 
       blog(`Listing batch ${Math.floor(i / CHUNK) + 1}: ${chunk.length} listing(s)`);
-      const listingRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
-        method: 'POST',
-        headers: { Authorization: token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ site_id: parseInt(siteId) || 2000, listings }),
-      });
-      const listingData = await listingRes.json();
-      blog(`Batch listing HTTP ${listingRes.status}: ${JSON.stringify(listingData)}`);
+      let listingRes, listingData;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        listingRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
+          method: 'POST',
+          headers: { Authorization: token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_id: parseInt(siteId) || 2000, listings }),
+        });
+        listingData = await listingRes.json();
+        blog(`Batch listing HTTP ${listingRes.status} (attempt ${attempt}): ${JSON.stringify(listingData)}`);
+        // Retry if OnBuy says OPC not yet propagated
+        const opcNotReady = /does not yet exist for the site/i.test(JSON.stringify(listingData));
+        if (!opcNotReady) break;
+        if (attempt < 3) {
+          blog(`OPC not yet propagated — waiting 15 s before retry ${attempt + 1}/3…`);
+          await new Promise(r => setTimeout(r, 15_000));
+        }
+      }
 
       const listingResults = listingData?.results ?? listingData?.payload ?? [];
       const updateNeeded   = []; // items that already exist — retry with PUT
