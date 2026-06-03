@@ -2467,7 +2467,7 @@ app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
        WHERE user_id = $1
        ORDER BY created_at DESC
        LIMIT 50`,
-      [req.user.userId]
+      [req.effectiveUserId]
     );
     res.json(rows);
   } catch (err) {
@@ -2484,7 +2484,7 @@ app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res
        FROM onbuy_bulk_import_items
        WHERE session_id = $1 AND user_id = $2
        ORDER BY row_number ASC`,
-      [req.params.sessionId, req.user.userId]
+      [req.params.sessionId, req.effectiveUserId]
     );
     res.json(rows);
   } catch (err) {
