@@ -496,40 +496,12 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/queue-status — job counts scoped to the requesting user.
-// Super-admin (not impersonating) sees global counts across both queues.
-// All other users see only their own running job count via a Redis key
-// written by jobProducer when their jobs are enqueued.
+// GET /api/queue-status — job counts scoped to the effective user.
+// All users (including superadmin) see only their own running job count via a Redis key
+// written by jobProducer when their jobs are enqueued. Superadmin impersonating a user
+// sees that user's count via effectiveUserId.
 app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
-    const isSuperAdmin = req.user.role === 'super_admin' && !req.isImpersonating;
-    if (isSuperAdmin) {
-      const [fast, slow, keepa] = await Promise.all([
-        fastQueue.getJobCounts('waiting', 'active', 'delayed'),
-        slowQueue.getJobCounts('waiting', 'active', 'delayed'),
-        keepaQueue.getJobCounts('waiting', 'active', 'delayed'),
-      ]);
-      const bullTotal = (fast.waiting + fast.active + fast.delayed) +
-                        (slow.waiting  + slow.active  + slow.delayed) +
-                        (keepa.waiting + keepa.active + keepa.delayed);
-
-      // Display total = all users' jobs (for the info counter).
-      // busy = any jobs running globally — superadmin never enqueues under their own user ID
-      // so checking only their own Redis key always returns 0.
-      const runningKeys = await redis.keys('repricer:running:*');
-      let asinTotal = 0;
-      if (runningKeys.length > 0) {
-        const vals = await redis.mget(...runningKeys);
-        asinTotal = vals.reduce((sum, v) => sum + (parseInt(v) || 0), 0);
-      }
-      // Prefer the Redis counter: it's managed by the Keepa worker as the authoritative
-      // "remaining ASINs" figure, decremented per sub-batch. The BullMQ count grows as
-      // Keepa flushes pricing jobs to the fast queue and can exceed the Redis counter —
-      // Math.max would show an inflated number. Fall back to bullTotal only when Redis
-      // has nothing (non-Keepa runs, or all Keepa work is done and only fast jobs remain).
-      const total = asinTotal > 0 ? asinTotal : bullTotal;
-      return res.json({ fast, slow, keepa, total, busy: total > 0 });
-    }
     const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
     res.json({ total: pending, busy: pending > 0 });
   } catch (err) {
