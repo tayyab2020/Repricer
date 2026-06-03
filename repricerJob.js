@@ -1193,23 +1193,30 @@ async function processKeepaJob(job) {
 
   _retryPendingFor.clear();
 
-  // ── Schedule quota-refill run for ASINs that exceeded the current cycle limit ──
+  // ── Schedule next run for remaining ASINs ──
   if (leftover.length > 0) {
-    const nextRun = runNumber + 1;
-    const ttlSecs = (Math.ceil(leftover.length / KEEPA_HOURLY_FILL) + 2) * 3600;
-    const fetched = thisBatch.length - (quotaExhaustedIdx >= 0 ? thisBatch.length - quotaExhaustedIdx : 0);
-    log(`[KeepaWorker] Quota exhausted (${fetched} fetched this run). Scheduling run #${nextRun} in 1 h for ${leftover.length} remaining ASINs.`);
-    redis.set(`repricer:running:${userId}`,     leftover.length, 'EX', ttlSecs).catch(() => {});
-    redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
+    const nextRun       = runNumber + 1;
+    const realExhausted = quotaExhaustedIdx >= 0;
+    const delayMs       = realExhausted ? 60 * 60 * 1000 : 30_000; // 1 h if quota ran out, 30 s otherwise
+    const delayLabel    = realExhausted ? '1 h (quota exhausted)' : '30 s (continuing)';
+    const ttlSecs       = realExhausted
+      ? (Math.ceil(leftover.length / KEEPA_HOURLY_FILL) + 2) * 3600
+      : (Math.ceil(leftover.length / KEEPA_HOURLY_FILL) + 2) * 3600;
+    const fetched = thisBatch.length - (realExhausted ? thisBatch.length - quotaExhaustedIdx : 0);
+    log(`[KeepaWorker] ${realExhausted ? 'Quota exhausted' : 'Batch complete'} (${fetched} fetched this run). Scheduling run #${nextRun} in ${delayLabel} for ${leftover.length} remaining ASINs.`);
+    if (realExhausted) {
+      redis.set(`repricer:running:${userId}`,     leftover.length, 'EX', ttlSecs).catch(() => {});
+      redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
+    }
     await keepaQueue.add('prefetch', {
       userId, accountId, asins, asinToMappingIds,
       pendingAsins: leftover, runNumber: nextRun,
     }, {
       jobId:            `keepa-${accountId}-r${nextRun}`,
-      delay:            60 * 60 * 1000,
+      delay:            delayMs,
       removeOnComplete: true, removeOnFail: true, attempts: 1,
     });
-    log(`[KeepaWorker] ✅ Refill job #${nextRun} scheduled — ${leftover.length} ASINs in ~1 h`);
+    log(`[KeepaWorker] ✅ Next job #${nextRun} scheduled — ${leftover.length} ASINs in ${delayLabel}`);
   } else {
     redis.del(`keepa:refill-pending:${userId}`).catch(() => {});
     if (runNumber > 1) log(`[KeepaWorker] All ASINs processed across ${runNumber} quota cycles`);
