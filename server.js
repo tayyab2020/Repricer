@@ -1920,8 +1920,10 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   }
 
   async function lookupCategoryId(name) {
+    const trimmed = String(name).trim();
+    if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
     if (categoryCache[name] !== undefined) return categoryCache[name];
-    const leafName = name.includes('>') ? name.split('>').pop().trim() : name.trim();
+    const leafName = name.includes('>') ? name.split('>').pop().trim() : trimmed;
     try {
       const r = await fetch(
         `https://api.onbuy.com/v2/categories?filter[name]=${encodeURIComponent(leafName)}&site_id=${siteId}`,
