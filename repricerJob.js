@@ -1031,12 +1031,27 @@ try {
 
 async function processKeepaJob(job) {
   const {
-    userId, accountId, asins, keepaEmail, keepaPassword,
+    userId, accountId, asins,
     pendingAsins    = null,  // set on quota-refill runs; null on the initial run
     runNumber       = 1,     // which quota cycle this is (1 = initial, 2+ = hourly refill)
     asinToMappingIds = {},   // ASIN → [mappingId, ...] built by jobProducer for incremental flush
   } = job.data;
   const log = (...args) => ulog(userId, ...args);
+
+  // Always fetch keepa credentials fresh from DB so changing credentials mid-run takes effect
+  let keepaEmail    = job.data.keepaEmail;
+  let keepaPassword = job.data.keepaPassword;
+  if (accountId) {
+    const { rows: acctRows } = await db.query(
+      `SELECT keepa_email, keepa_password FROM onbuy_accounts WHERE id = $1 LIMIT 1`,
+      [accountId]
+    ).catch(() => ({ rows: [] }));
+    if (acctRows[0]?.keepa_email) {
+      keepaEmail    = acctRows[0].keepa_email;
+      keepaPassword = acctRows[0].keepa_password;
+      log(`[Keepa] Using credentials from DB for account ${accountId}: ${keepaEmail}`);
+    }
+  }
 
   const toFetch   = pendingAsins ?? asins;
   const quota     = runNumber === 1 ? KEEPA_QUOTA_FULL : KEEPA_HOURLY_FILL;
@@ -1188,7 +1203,7 @@ async function processKeepaJob(job) {
     redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
     await keepaQueue.add('prefetch', {
       userId, accountId, asins, asinToMappingIds,
-      pendingAsins: leftover, keepaEmail, keepaPassword, runNumber: nextRun,
+      pendingAsins: leftover, runNumber: nextRun,
     }, {
       jobId:            `keepa-${accountId}-r${nextRun}`,
       delay:            60 * 60 * 1000,
