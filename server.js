@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import https from 'https';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, redis, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, redis, getTokenForAccount } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { appendFile, appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -1609,6 +1609,26 @@ async function runMigrations() {
       created_at    TIMESTAMP DEFAULT NOW()
     )`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS listings_updated INTEGER DEFAULT 0`,
+    `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS pending_queues INTEGER DEFAULT 0`,
+    `CREATE TABLE IF NOT EXISTS onbuy_bulk_pending_queues (
+       id           SERIAL PRIMARY KEY,
+       session_id   INTEGER,
+       user_id      INTEGER NOT NULL,
+       account_id   INTEGER NOT NULL,
+       site_id      INTEGER NOT NULL DEFAULT 2000,
+       queue_id     TEXT    NOT NULL UNIQUE,
+       uid          TEXT,
+       row_meta     JSONB   NOT NULL,
+       status       TEXT    NOT NULL DEFAULT 'pending',
+       opc          TEXT,
+       attempts     INTEGER NOT NULL DEFAULT 0,
+       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       last_polled_at TIMESTAMPTZ,
+       error_message TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_bpq_user_status    ON onbuy_bulk_pending_queues(user_id, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_bpq_account_status ON onbuy_bulk_pending_queues(account_id, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_bpq_session        ON onbuy_bulk_pending_queues(session_id)`,
     `CREATE TABLE IF NOT EXISTS daily_sync_stats (
        user_id          INT  NOT NULL,
        onbuy_account_id INT  NOT NULL DEFAULT 0,
@@ -1915,31 +1935,22 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
     return categoryCache[name];
   }
 
-  async function pollProductQueue(queueId, maxWaitMs = 300000) {
-    const start = Date.now();
-    while (Date.now() - start < maxWaitMs) {
-      await new Promise(r => setTimeout(r, 4000));
-      let data;
-      try {
-        const r = await fetch(
-          `https://api.onbuy.com/v2/queues/${queueId}?site_id=${siteId}`,
-          { headers: { Authorization: token } }
-        );
-        data = await r.json();
-      } catch (e) {
-        blog(`Queue poll fetch error: ${e.message} — retrying`);
-        continue;
-      }
-      blog(`Queue ${queueId}: ${JSON.stringify(data)}`);
-      const status = data?.results?.status ?? '';
-      const opc    = data?.results?.opc ?? null;
-      if (status === 'success' && opc) return opc;
-      if (status === 'failed' || status === 'error') {
-        throw new Error(data?.results?.error_message || 'Product queue failed');
-      }
+  // Batch-polls a set of queue IDs via GET /v2/queues?filter[queue_ids]=...
+  // Returns a Map of queueId → { status, opc, error_message, uid }
+  async function batchPollQueues(queueIds) {
+    const ids = queueIds.join(',');
+    try {
+      const r = await fetch(
+        `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
+        { headers: { Authorization: token } }
+      );
+      const data = await r.json();
+      const list = data?.results ?? [];
+      return new Map(list.map(q => [q.queue_id, q]));
+    } catch (e) {
+      blog(`Batch poll error: ${e.message}`);
+      return new Map();
     }
-    blog(`Queue ${queueId} timed out after ${maxWaitMs / 1000}s`);
-    throw new Error(`Product queue timed out after ${maxWaitMs / 1000}s — product may have been created on OnBuy but OPC is unknown`);
   }
 
   // ── Phase 1a: Batch EAN search — up to 50 EANs per GET (600/hr GET limit) ──
@@ -2020,7 +2031,22 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
       ).catch(() => {});
     }
   }
-  const toCreate = newMeta.filter(m => m.row.images?.[0]);
+  let toCreate = newMeta.filter(m => m.row.images?.[0]);
+
+  // Guard: skip SKUs already being tracked in the background queue poller
+  const candidateSkus = toCreate.map(m => m.row.sku).filter(Boolean);
+  if (candidateSkus.length > 0) {
+    const { rows: alreadyPending } = await db.query(
+      `SELECT uid FROM onbuy_bulk_pending_queues WHERE uid = ANY($1) AND status = 'pending' AND user_id = $2`,
+      [candidateSkus, req.user.userId]
+    ).catch(() => ({ rows: [] }));
+    if (alreadyPending.length > 0) {
+      const pendingSkus = new Set(alreadyPending.map(r => r.uid));
+      blog(`Phase 2: ${pendingSkus.size} SKU(s) already pending in background poller — skipping: ${[...pendingSkus].join(', ')}`);
+      results.already_queued = (results.already_queued || 0) + pendingSkus.size;
+      toCreate = toCreate.filter(m => !pendingSkus.has(m.row.sku));
+    }
+  }
 
   for (let i = 0; i < toCreate.length; i += CHUNK) {
     const chunk    = toCreate.slice(i, i + CHUNK);
@@ -2100,52 +2126,75 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
     }
   }
 
-  // ── Phase 3: Poll all product queues concurrently ──
+  // ── Phase 3: Batch poll queues 15 s after product creation ──
+  // Uses GET /v2/queues?filter[queue_ids]=... (up to 1000 IDs per request).
+  // Queues that resolve immediately → OPC known → proceed to Phase 4 inline.
+  // Queues still pending → saved to onbuy_bulk_pending_queues for background polling every 15 min.
   if (queueItems.length > 0) {
-    blog(`Phase 3: polling ${queueItems.length} product queue(s) concurrently`);
-    const pollOutcomes = await Promise.all(queueItems.map(async ({ meta, queueId }) => {
-      try   { return { meta, opc: await pollProductQueue(queueId), error: null }; }
-      catch (err) { return { meta, opc: null, error: err.message }; }
-    }));
+    blog(`Phase 3: waiting 15 s before batch polling ${queueItems.length} queue(s)…`);
+    await new Promise(r => setTimeout(r, 15_000));
 
-    for (const { meta, opc, error } of pollOutcomes) {
-      if (!error) {
-        // Product created — push to existingMeta so Phase 4 sets price/stock via POST /v2/listings.
-        // Embedded listings in POST /v2/products don't reliably apply price or stock.
-        results.product_created++;
-        existingMeta.push({ ...meta, opc });
-        db.query(
-          `INSERT INTO onbuy_bulk_import_items
-            (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'product_created')`,
-          [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
-           meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
-           parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), opc]
-        ).catch(() => {});
-      } else {
-        const dupEan     = (error.match(/Duplicate entry '(\d+)'/) || [])[1];
-        const brandOwned = /brand is owned by another seller/i.test(error);
+    const pendingToSave = [];
 
-        if (dupEan) {
-          // Duplicate EAN: search for the existing product, add to listing batch
-          blog(`Duplicate EAN "${dupEan}" — searching for existing product...`);
-          try {
-            const sr    = await fetch(
-              `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`,
-              { headers: { Authorization: token } }
-            );
-            const sd    = await sr.json();
-            const prods = sd?.results ?? sd?.payload ?? [];
-            const existingOpc = Array.isArray(prods) && prods.length
-              ? (prods[0]?.opc ?? prods[0]?.product_code ?? null) : null;
-            if (existingOpc) {
-              blog(`Found OPC=${existingOpc} for duplicate EAN "${dupEan}" — adding to listing batch`);
-              existingMeta.push({ ...meta, opc: existingOpc });
-            } else {
-              throw new Error(`EAN "${dupEan}" already registered on OnBuy but matching product not found — list it manually`);
+    for (let i = 0; i < queueItems.length; i += 1000) {
+      const batch  = queueItems.slice(i, i + 1000);
+      const pollMap = await batchPollQueues(batch.map(q => q.queueId));
+      blog(`Phase 3 batch ${Math.floor(i / 1000) + 1}: polled ${batch.length} queue(s) → ${pollMap.size} result(s)`);
+
+      for (const { meta, queueId } of batch) {
+        const qr     = pollMap.get(queueId) ?? {};
+        const status = qr.status ?? 'pending';
+        const opc    = qr.opc   ?? null;
+        blog(`Queue ${queueId}: status=${status}${opc ? ' opc='+opc : ''}`);
+
+        if (status === 'success' && opc) {
+          results.product_created++;
+          existingMeta.push({ ...meta, opc });
+          db.query(
+            `INSERT INTO onbuy_bulk_import_items
+              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'product_created')`,
+            [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+             meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+             parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), opc]
+          ).catch(() => {});
+
+        } else if (status === 'failed' || status === 'error') {
+          const error     = qr.error_message || 'Product queue failed on OnBuy';
+          const dupEan    = (error.match(/Duplicate entry '(\d+)'/) || [])[1];
+          const brandOwned = /brand is owned by another seller/i.test(error);
+
+          if (dupEan) {
+            blog(`Duplicate EAN "${dupEan}" — searching for existing product…`);
+            try {
+              const sr   = await fetch(
+                `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`,
+                { headers: { Authorization: token } }
+              );
+              const sd   = await sr.json();
+              const prods = sd?.results ?? sd?.payload ?? [];
+              const existingOpc = Array.isArray(prods) && prods.length
+                ? (prods[0]?.opc ?? prods[0]?.product_code ?? null) : null;
+              if (existingOpc) {
+                blog(`Found OPC=${existingOpc} for duplicate EAN "${dupEan}" — adding to listing batch`);
+                existingMeta.push({ ...meta, opc: existingOpc });
+              } else {
+                throw new Error(`EAN "${dupEan}" already registered on OnBuy but matching product not found — list it manually`);
+              }
+            } catch (searchErr) {
+              results.errors.push({ row: meta.row._row, product: meta.row.name, error: searchErr.message });
+              results.skipped++;
+              db.query(
+                `INSERT INTO onbuy_bulk_import_items
+                  (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+                [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+                 meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+                 parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), searchErr.message]
+              ).catch(() => {});
             }
-          } catch (searchErr) {
-            results.errors.push({ row: meta.row._row, product: meta.row.name, error: searchErr.message });
+          } else if (brandOwned) {
+            results.errors.push({ row: meta.row._row, product: meta.row.name, error: 'The supplied brand is owned by another seller — skipped' });
             results.skipped++;
             db.query(
               `INSERT INTO onbuy_bulk_import_items
@@ -2153,44 +2202,57 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
               [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
                meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
-               parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), searchErr.message]
+               parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition),
+               'The supplied brand is owned by another seller — skipped']
+            ).catch(() => {});
+          } else {
+            results.errors.push({ row: meta.row._row, product: meta.row.name, error });
+            results.skipped++;
+            db.query(
+              `INSERT INTO onbuy_bulk_import_items
+                (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+              [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
+               meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
+               parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), error]
             ).catch(() => {});
           }
-        } else if (brandOwned) {
-          // Brand is protected on OnBuy — skip this product
-          results.errors.push({ row: meta.row._row, product: meta.row.name, error: 'The supplied brand is owned by another seller — skipped' });
-          results.skipped++;
-          db.query(
-            `INSERT INTO onbuy_bulk_import_items
-              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
-             meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
-             parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition),
-             'The supplied brand is owned by another seller — skipped']
-          ).catch(() => {});
+
         } else {
-          results.errors.push({ row: meta.row._row, product: meta.row.name, error });
-          results.skipped++;
-          db.query(
-            `INSERT INTO onbuy_bulk_import_items
-              (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId, req.user.userId, meta.row._row, meta.row.name, meta.row.sku, meta.row.ean,
-             meta.row.category, meta.row.brand, meta.sourcePrice, meta.sellingPrice,
-             parseInt(meta.row.stock)||0, normalizeCondition(meta.row.condition), error]
-          ).catch(() => {});
+          // Still pending — save to DB for background processing
+          pendingToSave.push({ queueId, meta, uid: qr.uid ?? meta.row.uid ?? null });
         }
       }
     }
-  }
 
-  // Give OnBuy time to propagate newly created products before trying to use their OPCs.
-  // The queue returns "success" before the OPC is fully indexed — using it immediately
-  // returns "OPC does not yet exist for the site id provided".
-  if (queueItems.length > 0 && results.product_created > 0) {
-    blog(`Waiting 15 s for OnBuy to propagate ${results.product_created} newly created product(s)…`);
-    await new Promise(r => setTimeout(r, 15_000));
+    if (pendingToSave.length > 0) {
+      blog(`Phase 3: ${pendingToSave.length} queue(s) still pending → saved for background polling every 15 min`);
+      for (const { queueId, meta, uid } of pendingToSave) {
+        await db.query(
+          `INSERT INTO onbuy_bulk_pending_queues
+             (session_id, user_id, account_id, site_id, queue_id, uid, row_meta)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (queue_id) DO NOTHING`,
+          [sessionId, req.user.userId, account.id, siteId, queueId, uid,
+           JSON.stringify({ row: meta.row, sourcePrice: meta.sourcePrice, sellingPrice: meta.sellingPrice })]
+        ).catch(e => blog(`Failed to save pending queue ${queueId}: ${e.message}`));
+      }
+      results.pending_queues = pendingToSave.length;
+
+      // Update session record with pending count
+      db.query(
+        `UPDATE onbuy_bulk_import_sessions SET pending_queues = $1 WHERE id = $2`,
+        [pendingToSave.length, sessionId]
+      ).catch(() => {});
+
+      // Schedule background poller (deduped by jobId so only one runs at a time)
+      await queuePollerQueue.add('poll', {}, {
+        jobId: 'queue-poller',
+        delay: 15 * 60 * 1000,
+        removeOnComplete: true,
+        removeOnFail: true,
+        attempts: 1,
+      }).catch(() => {});
+    }
   }
 
   // ── Phase 3.5: Batch update existing products with fresh data (images, descriptions, etc.) ──
@@ -2428,6 +2490,42 @@ app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/onbuy-bulk/pending-queue-status — global pending queue counts for the user
+app.get('/api/onbuy-bulk/pending-queue-status', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending')         AS pending,
+         COUNT(*) FILTER (WHERE status = 'success')         AS success,
+         COUNT(*) FILTER (WHERE status = 'listing_created') AS listing_created,
+         COUNT(*) FILTER (WHERE status = 'failed')          AS failed,
+         COUNT(*)                                           AS total
+       FROM onbuy_bulk_pending_queues
+       WHERE user_id = $1`,
+      [req.effectiveUserId]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/onbuy-bulk/pending-queue-status/:sessionId — pending queue counts for one session
+app.get('/api/onbuy-bulk/pending-queue-status/:sessionId', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending')         AS pending,
+         COUNT(*) FILTER (WHERE status = 'success')         AS success,
+         COUNT(*) FILTER (WHERE status = 'listing_created') AS listing_created,
+         COUNT(*) FILTER (WHERE status = 'failed')          AS failed,
+         COUNT(*)                                           AS total
+       FROM onbuy_bulk_pending_queues
+       WHERE user_id = $1 AND session_id = $2`,
+      [req.effectiveUserId, req.params.sessionId]
+    );
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────

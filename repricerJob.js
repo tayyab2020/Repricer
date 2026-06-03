@@ -34,7 +34,7 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, getTokenForAccount } from './jobProducer.js';
 import { getKeepaPrice, createKeepaSession } from './keepaScraper.js';
 
 dotenv.config();
@@ -1236,6 +1236,197 @@ keepaWorker.on('failed', (job, err) => {
   wlog(`[DEBUG KeepaWorker failed] _keepaActive=${_keepaActive} _runUserIds=${_runUserIds.size}`);
   _checkAllDone();
 });
+
+// ─────────────────────────────────────────────
+// QUEUE POLLER WORKER
+// Polls OnBuy product creation queues that were
+// still pending after the initial 15 s check.
+// Runs every 15 min until all queues resolve.
+// ─────────────────────────────────────────────
+
+function _normalizeCondition(c) {
+  if (!c) return 'new';
+  const v = String(c).trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return ['new','used','refurbished','like_new'].includes(v) ? v : 'new';
+}
+
+const queuePollerWorker = new Worker('queue-poller', async (job) => {
+  const plog = (...a) => {
+    const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`;
+    console.log(line.trimEnd());
+    try { appendFileSync(join(LOGS_DIR, 'queue-poller.log'), line, 'utf8'); } catch {}
+  };
+  plog('[QueuePoller] Starting poll run');
+
+  const { rows: pending } = await db.query(
+    `SELECT pq.*, oa.consumer_key, oa.secret_key,
+            COALESCE(oa.site_id, '2000')::int AS acct_site_id
+     FROM   onbuy_bulk_pending_queues pq
+     JOIN   onbuy_accounts oa ON oa.id = pq.account_id
+     WHERE  pq.status = 'pending' AND pq.attempts < 96
+     ORDER  BY pq.created_at ASC`
+  ).catch(e => { plog(`[QueuePoller] DB query error: ${e.message}`); return { rows: [] }; });
+
+  if (!pending.length) { plog('[QueuePoller] No pending queues — done'); return; }
+  plog(`[QueuePoller] ${pending.length} pending queue(s) across ${new Set(pending.map(r => r.account_id)).size} account(s)`);
+
+  // Group by account
+  const byAccount = new Map();
+  for (const q of pending) {
+    if (!byAccount.has(q.account_id)) byAccount.set(q.account_id, []);
+    byAccount.get(q.account_id).push(q);
+  }
+
+  let stillPending = 0;
+
+  for (const [accountId, queues] of byAccount) {
+    const sample  = queues[0];
+    const token   = await getTokenForAccount({ consumer_key: sample.consumer_key, secret_key: sample.secret_key });
+    const siteId  = sample.acct_site_id;
+
+    if (!token) { plog(`[QueuePoller] No token for account ${accountId} — skipping`); continue; }
+
+    for (let i = 0; i < queues.length; i += 1000) {
+      const batch  = queues.slice(i, i + 1000);
+      const ids    = batch.map(q => q.queue_id).join(',');
+
+      let pollMap = new Map();
+      try {
+        const pr   = await fetch(
+          `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
+          { headers: { Authorization: token } }
+        );
+        const pd   = await pr.json();
+        const list = pd?.results ?? [];
+        pollMap    = new Map(list.map(q => [q.queue_id, q]));
+      } catch (e) { plog(`[QueuePoller] Batch poll error: ${e.message}`); }
+
+      plog(`[QueuePoller] Account ${accountId} batch: ${batch.length} polled → ${pollMap.size} results`);
+
+      const successItems = [];
+
+      for (const q of batch) {
+        const userId    = q.user_id;
+        const sessionId = q.session_id;
+        const ilog = (msg) => {
+          const line = `[${new Date().toISOString()}] [QueuePoller][session=${sessionId}] ${msg}\n`;
+          try { appendFileSync(join(LOGS_DIR, `user-${userId}-import.log`), line, 'utf8'); } catch {}
+        };
+
+        const qr     = pollMap.get(q.queue_id) ?? {};
+        const status = qr.status ?? 'pending';
+        const opc    = qr.opc   ?? null;
+
+        const sku = q.row_meta?.row?.sku ?? q.uid ?? '?';
+        ilog(`Queue ${q.queue_id} [${sku}]: status=${status}${opc ? ' opc='+opc : ''} (attempt ${q.attempts + 1})`);
+
+        if (status === 'success' && opc) {
+          await db.query(
+            `UPDATE onbuy_bulk_pending_queues SET status='success', opc=$1, last_polled_at=NOW() WHERE queue_id=$2`,
+            [opc, q.queue_id]
+          ).catch(() => {});
+          successItems.push({ ...q, opc, ilog });
+        } else if (status === 'failed' || status === 'error') {
+          const msg = typeof qr.error_message === 'string' ? qr.error_message : JSON.stringify(qr.error_message || 'Queue failed');
+          ilog(`Queue ${q.queue_id}: failed — ${msg}`);
+          await db.query(
+            `UPDATE onbuy_bulk_pending_queues SET status='failed', error_message=$1, last_polled_at=NOW(), attempts=attempts+1 WHERE queue_id=$2`,
+            [msg, q.queue_id]
+          ).catch(() => {});
+        } else {
+          stillPending++;
+          await db.query(
+            `UPDATE onbuy_bulk_pending_queues SET attempts=attempts+1, last_polled_at=NOW() WHERE queue_id=$1`,
+            [q.queue_id]
+          ).catch(() => {});
+        }
+      }
+
+      // Create listings for resolved queues
+      if (successItems.length > 0) {
+        const ilog = successItems[0].ilog;
+        ilog(`Creating listings for ${successItems.length} resolved queue(s)`);
+
+        for (let li = 0; li < successItems.length; li += 100) {
+          const lchunk   = successItems.slice(li, li + 100);
+          const listings = lchunk.map(q => {
+            const m = q.row_meta;
+            return {
+              opc:       q.opc,
+              condition: _normalizeCondition(m.row?.condition),
+              price:     m.sellingPrice,
+              stock:     parseInt(m.row?.stock) || 0,
+              ...(m.row?.sku             ? { sku: m.row.sku }                             : {}),
+              ...(m.row?.delivery_weight ? { delivery_weight: parseFloat(m.row.delivery_weight) } : {}),
+            };
+          });
+
+          try {
+            const lr  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
+              method:  'POST',
+              headers: { Authorization: token, 'Content-Type': 'application/json' },
+              body:    JSON.stringify({ site_id: siteId, listings }),
+            });
+            const ld  = await lr.json();
+            ilog(`Listing POST ${lr.status}: ${JSON.stringify(ld).slice(0, 300)}`);
+
+            const lrs = ld?.results ?? ld?.payload ?? [];
+            for (let j = 0; j < lchunk.length; j++) {
+              const q   = lchunk[j];
+              const res = Array.isArray(lrs) ? lrs[j] : null;
+              const ok  = !res || res.success !== false;
+              const m   = q.row_meta;
+
+              await db.query(
+                `UPDATE onbuy_bulk_pending_queues SET status=$1, last_polled_at=NOW() WHERE queue_id=$2`,
+                [ok ? 'listing_created' : 'failed', q.queue_id]
+              ).catch(() => {});
+
+              if (ok) {
+                q.ilog(`Listing created — OPC=${q.opc} SKU=${m.row?.sku}`);
+                db.query(
+                  `INSERT INTO onbuy_bulk_import_items
+                    (session_id,user_id,row_number,product_name,sku,ean,category,brand,
+                     source_price,selling_price,stock,condition,opc,status)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'listing_created')`,
+                  [q.session_id, q.user_id, m.row?._row, m.row?.name, m.row?.sku, m.row?.ean,
+                   m.row?.category, m.row?.brand, m.sourcePrice, m.sellingPrice,
+                   parseInt(m.row?.stock)||0, _normalizeCondition(m.row?.condition), q.opc]
+                ).catch(() => {});
+              } else {
+                const errMsg = res?.message || 'Listing rejected';
+                q.ilog(`Listing failed — OPC=${q.opc}: ${errMsg}`);
+                await db.query(
+                  `UPDATE onbuy_bulk_pending_queues SET status='failed', error_message=$1 WHERE queue_id=$2`,
+                  [typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg), q.queue_id]
+                ).catch(() => {});
+              }
+            }
+          } catch (e) {
+            ilog(`Listing creation error: ${e.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  if (stillPending > 0) {
+    plog(`[QueuePoller] ${stillPending} queue(s) still pending — next poll in 15 min`);
+    await queuePollerQueue.add('poll', {}, {
+      jobId:            `queue-poller-${Date.now()}`,
+      delay:            15 * 60 * 1000,
+      removeOnComplete: true,
+      removeOnFail:     true,
+      attempts:         1,
+    }).catch(() => {});
+  } else {
+    plog('[QueuePoller] All queues resolved');
+  }
+}, { connection: redis, concurrency: 1 });
+
+queuePollerWorker.on('failed', (job, err) =>
+  console.error(`[QueuePoller] ❌ job ${job?.id} failed: ${err.message}`)
+);
 
 // ─────────────────────────────────────────────
 // START WORKERS

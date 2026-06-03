@@ -3067,6 +3067,10 @@ function OnBuyBulkPage() {
   const [err, setErr]             = useState("");
   const [dragOver, setDragOver]   = useState(false);
 
+  // Pending queue tracking
+  const [pendingStatus, setPendingStatus] = useState(null); // { pending, listing_created, failed, total }
+  const pendingPollRef = useRef(null);
+
   // History state
   const [history, setHistory]           = useState([]);
   const [histLoading, setHistLoading]   = useState(false);
@@ -3075,11 +3079,35 @@ function OnBuyBulkPage() {
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
+    // Load global pending queue status on mount
+    api("/onbuy-bulk/pending-queue-status").then(s => {
+      if (s && parseInt(s.pending) > 0) setPendingStatus(s);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
     if (tab === "history") loadHistory();
   }, [tab]);
+
+  // Start polling pending queue status every 30 s when there are pending queues
+  function startPendingPoll() {
+    if (pendingPollRef.current) return;
+    pendingPollRef.current = setInterval(async () => {
+      try {
+        const s = await api("/onbuy-bulk/pending-queue-status");
+        if (!s) return;
+        setPendingStatus(s);
+        if (parseInt(s.pending) === 0) {
+          clearInterval(pendingPollRef.current);
+          pendingPollRef.current = null;
+        }
+      } catch {}
+    }, 30_000);
+  }
+
+  useEffect(() => {
+    return () => { if (pendingPollRef.current) clearInterval(pendingPollRef.current); };
+  }, []);
 
   async function loadHistory() {
     setHistLoading(true);
@@ -3129,6 +3157,10 @@ function OnBuyBulkPage() {
         body: JSON.stringify({ rows: preview.rows, account_id: accountId }),
       });
       setResult(r); setStep(3);
+      if (r?.pending_queues > 0) {
+        setPendingStatus({ pending: r.pending_queues, listing_created: 0, failed: 0, total: r.pending_queues });
+        startPendingPoll();
+      }
     } catch (e) { setErr(String(e.message || e)); }
     setImporting(false); setLoading(false);
   }
@@ -3146,6 +3178,38 @@ function OnBuyBulkPage() {
 
   return (
     <div>
+      {/* Pending queue banner — shown whenever OnBuy is still processing product creation queues */}
+      {pendingStatus && parseInt(pendingStatus.pending) > 0 && (
+        <div style={{
+          background: "#f59e0b18", border: `1px solid ${C.amber}`, borderRadius: 10,
+          padding: "10px 16px", marginBottom: 16,
+          display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 18 }}>⏳</span>
+            <div>
+              <div style={{ color: C.amber, fontWeight: 700, fontSize: 13 }}>
+                {parseInt(pendingStatus.pending).toLocaleString()} product queue{parseInt(pendingStatus.pending) !== 1 ? "s" : ""} pending on OnBuy
+              </div>
+              <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
+                Background worker polls every 15 min and creates listings automatically when queues resolve.
+                {parseInt(pendingStatus.listing_created) > 0 && ` ${parseInt(pendingStatus.listing_created)} listed so far.`}
+                {parseInt(pendingStatus.failed) > 0 && ` ${parseInt(pendingStatus.failed)} failed.`}
+              </div>
+            </div>
+          </div>
+          <button onClick={() => {
+            api("/onbuy-bulk/pending-queue-status").then(s => {
+              if (s) setPendingStatus(s);
+              if (s && parseInt(s.pending) > 0) startPendingPoll();
+            }).catch(() => {});
+          }} style={{ background: "none", border: `1px solid ${C.amber}`, borderRadius: 6,
+            color: C.amber, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
+            ↻ Refresh
+          </button>
+        </div>
+      )}
+
       {/* Tab switcher */}
       <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 0 }}>
         {[["import","📦 Import"], ["history","📋 History"]].map(([t, label]) => (
@@ -3493,6 +3557,12 @@ function OnBuyBulkPage() {
               {result.product_created > 0 && (
                 <div style={{ color: C.blue, fontSize: 14, marginBottom: 6 }}>
                   {result.product_created} new product{result.product_created !== 1 ? "s" : ""} created
+                </div>
+              )}
+              {result.pending_queues > 0 && (
+                <div style={{ color: C.amber, fontSize: 14, marginBottom: 6 }}>
+                  {result.pending_queues} product queue{result.pending_queues !== 1 ? "s" : ""} still pending —
+                  background worker will create their listings automatically (check every 15 min)
                 </div>
               )}
               {result.skipped > 0 && (

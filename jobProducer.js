@@ -25,9 +25,10 @@ export const redis = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:637
   maxRetriesPerRequest: null,
 });
 
-export const fastQueue  = new Queue('repricer-fast',  { connection: redis });
-export const slowQueue  = new Queue('repricer-slow',  { connection: redis });
-export const keepaQueue = new Queue('keepa-scrape',   { connection: redis });
+export const fastQueue        = new Queue('repricer-fast',  { connection: redis });
+export const slowQueue        = new Queue('repricer-slow',  { connection: redis });
+export const keepaQueue       = new Queue('keepa-scrape',   { connection: redis });
+export const queuePollerQueue = new Queue('queue-poller',   { connection: redis });
 
 export async function getTokenForAccount(account) {
   try {
