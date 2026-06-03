@@ -1413,20 +1413,22 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
                 ).catch(() => {});
               } else {
                 const errMsg = res?.message || 'Listing rejected';
-                q.ilog(`Listing failed — OPC=${q.opc}: ${errMsg}`);
+                const isSuspended = typeof errMsg === 'string' && errMsg.toLowerCase().includes('suspended');
+                const itemStatus  = isSuspended ? 'suspended' : 'error';
+                q.ilog(`Listing ${isSuspended ? 'suspended' : 'failed'} — OPC=${q.opc}: ${errMsg}`);
                 await db.query(
-                  `UPDATE onbuy_bulk_pending_queues SET status='failed', error_message=$1 WHERE queue_id=$2`,
-                  [typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg), q.queue_id]
+                  `UPDATE onbuy_bulk_pending_queues SET status=$1, error_message=$2 WHERE queue_id=$3`,
+                  [itemStatus, typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg), q.queue_id]
                 ).catch(() => {});
                 db.query(
                   `INSERT INTO onbuy_bulk_import_items
                     (session_id,user_id,row_number,product_name,sku,ean,category,brand,
                      source_price,selling_price,stock,condition,opc,status,error_message)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error',$14)`,
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
                   [q.session_id, q.user_id, m.row?._row, m.row?.name, m.row?.sku, m.row?.ean,
                    m.row?.category, m.row?.brand, m.sourcePrice, m.sellingPrice,
                    parseInt(m.row?.stock)||0, _normalizeCondition(m.row?.condition), q.opc,
-                   typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg)]
+                   itemStatus, typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg)]
                 ).catch(() => {});
                 db.query(
                   `UPDATE onbuy_bulk_import_sessions SET errors_count = errors_count + 1, pending_queues = GREATEST(pending_queues - 1, 0) WHERE id = $1`,

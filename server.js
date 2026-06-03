@@ -2066,14 +2066,6 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
         ...(row.description        ? { description: row.description }        : {}),
         ...(row.ean                ? { product_codes: [row.ean] }            : {}),
         ...(row.mpn                ? { mpn: row.mpn }                        : {}),
-        listings: {
-          [conditionVal]: {
-            price: sellingPrice,
-            stock: parseInt(row.stock) || 0,
-            ...(row.sku             ? { sku: row.sku }                             : {}),
-            ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
-          },
-        },
       };
     });
 
