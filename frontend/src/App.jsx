@@ -3103,6 +3103,8 @@ function OnBuyBulkPage() {
         const s = await api("/onbuy-bulk/pending-queue-status");
         if (!s) return;
         setPendingStatus(s);
+        // Reload history so session badges show the same up-to-date pending counts
+        api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
         if (parseInt(s.pending) === 0) {
           clearInterval(pendingPollRef.current);
           pendingPollRef.current = null;
@@ -3226,9 +3228,16 @@ function OnBuyBulkPage() {
                 {parseInt(pendingStatus.pending).toLocaleString()} product queue{parseInt(pendingStatus.pending) !== 1 ? "s" : ""} pending on OnBuy
               </div>
               <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
-                Background worker polls every 15 min and creates listings automatically when queues resolve.
-                {parseInt(pendingStatus.listing_created) > 0 && ` ${parseInt(pendingStatus.listing_created)} listed so far.`}
-                {parseInt(pendingStatus.failed) > 0 && ` ${parseInt(pendingStatus.failed)} failed.`}
+                Background worker polls every 15 min and creates listings when queues resolve.
+                {parseInt(pendingStatus.listing_created) > 0 && (
+                  <span style={{ color: C.blue }}> {parseInt(pendingStatus.listing_created).toLocaleString()} listed so far.</span>
+                )}
+                {parseInt(pendingStatus.failed) > 0 && (
+                  <span style={{ color: C.red }}> {parseInt(pendingStatus.failed).toLocaleString()} rejected by OnBuy (product queue failed).</span>
+                )}
+                {parseInt(pendingStatus.failed) > 0 && (
+                  <span style={{ color: C.muted, fontStyle: "italic" }}> Note: session ERRORS count is higher — it also includes listing creation failures.</span>
+                )}
               </div>
             </div>
           </div>
@@ -3237,6 +3246,7 @@ function OnBuyBulkPage() {
               if (s) setPendingStatus(s);
               if (s && parseInt(s.pending) > 0) startPendingPoll();
             }).catch(() => {});
+            api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
           }} style={{ background: "none", border: `1px solid ${C.amber}`, borderRadius: 6,
             color: C.amber, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
             ↻ Refresh
