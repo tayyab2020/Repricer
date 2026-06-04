@@ -3080,9 +3080,8 @@ function OnBuyBulkPage() {
   const [history, setHistory]           = useState([]);
   const [histLoading, setHistLoading]   = useState(false);
   const [expandedSession, setExpandedSession] = useState(null);
-  const [sessionItems, setSessionItems] = useState({});
-  const [sessionPage, setSessionPage]     = useState({});
-  const [sessionSearch, setSessionSearch] = useState({});
+  // sessionData[id] = { items, total, page, totalPages, search, loading }
+  const [sessionData, setSessionData] = useState({});
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
@@ -3144,20 +3143,21 @@ function OnBuyBulkPage() {
     setHistLoading(false);
   }
 
-  async function loadSessionItems(sessionId) {
-    if (sessionItems[sessionId]?.length > 0) { setExpandedSession(sessionId); return; }
+  async function fetchSessionPage(sessionId, { page = 1, search = "" } = {}) {
+    setSessionData(p => ({ ...p, [sessionId]: { ...(p[sessionId] || {}), loading: true } }));
     try {
-      const items = await api(`/onbuy-bulk/history/${sessionId}/items`);
-      setSessionItems(p => ({ ...p, [sessionId]: items }));
-      setSessionPage(p => ({ ...p, [sessionId]: 1 }));
-      setSessionSearch(p => ({ ...p, [sessionId]: "" }));
-      setExpandedSession(sessionId);
-    } catch {}
+      const qs = new URLSearchParams({ page, ...(search ? { search } : {}) }).toString();
+      const data = await api(`/onbuy-bulk/history/${sessionId}/items?${qs}`);
+      setSessionData(p => ({ ...p, [sessionId]: { items: data.items, total: data.total, page: data.page, totalPages: data.totalPages, search, loading: false } }));
+    } catch {
+      setSessionData(p => ({ ...p, [sessionId]: { ...(p[sessionId] || {}), loading: false } }));
+    }
   }
 
   function toggleSession(id) {
     if (expandedSession === id) { setExpandedSession(null); return; }
-    loadSessionItems(id);
+    setExpandedSession(id);
+    if (!sessionData[id]?.items) fetchSessionPage(id, { page: 1, search: "" });
   }
 
   async function parseFile(f) {
@@ -3351,19 +3351,12 @@ function OnBuyBulkPage() {
                     </div>
                   </div>
 
-                  {expandedSession === s.id && sessionItems[s.id] && (() => {
-                    const PAGE_SIZE = 100;
-                    const search = (sessionSearch[s.id] || "").toLowerCase();
-                    const filtered = search
-                      ? sessionItems[s.id].filter(item =>
-                          [item.product_name, item.sku, item.ean, item.brand, item.category, item.opc, item.status, item.error_message]
-                            .some(v => v && String(v).toLowerCase().includes(search))
-                        )
-                      : sessionItems[s.id];
-                    const page = sessionPage[s.id] || 1;
-                    const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-                    const safePage = Math.min(page, totalPages);
-                    const pageItems = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+                  {expandedSession === s.id && (() => {
+                    const sd = sessionData[s.id] || {};
+                    const { items = [], total = 0, page: curPage = 1, totalPages = 1, search = "", loading = false } = sd;
+
+                    const gotoPage = (p) => fetchSessionPage(s.id, { page: p, search });
+                    const doSearch = (q) => fetchSessionPage(s.id, { page: 1, search: q });
 
                     return (
                       <div style={{ borderTop: `1px solid ${C.border}` }}>
@@ -3374,10 +3367,12 @@ function OnBuyBulkPage() {
                           <input
                             type="text"
                             placeholder="Search product, SKU, EAN, status…"
-                            value={sessionSearch[s.id] || ""}
+                            defaultValue={search}
+                            key={s.id}
                             onChange={e => {
-                              setSessionSearch(p => ({ ...p, [s.id]: e.target.value }));
-                              setSessionPage(p => ({ ...p, [s.id]: 1 }));
+                              clearTimeout(window[`_srch_${s.id}`]);
+                              const q = e.target.value;
+                              window[`_srch_${s.id}`] = setTimeout(() => doSearch(q), 350);
                             }}
                             style={{
                               flex: 1, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6,
@@ -3385,99 +3380,101 @@ function OnBuyBulkPage() {
                             }}
                           />
                           <span style={{ color: C.muted, fontSize: 11, whiteSpace: "nowrap" }}>
-                            {filtered.length} / {sessionItems[s.id].length} rows
+                            {loading ? "Loading…" : `${total.toLocaleString()} rows`}
                           </span>
                         </div>
 
-                        <div style={{ overflowX: "auto" }}>
-                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                            <thead>
-                              <tr style={{ background: "#ffffff06" }}>
-                                {["Row","Product","SKU","EAN","Brand","Category","Source £","Selling £","Stock","Condition","OPC","Status"].map(h => (
-                                  <th key={h} style={{ padding: "7px 10px", color: C.muted, textAlign: "left",
-                                    fontSize: 10, textTransform: "uppercase", whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}` }}>{h}</th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {pageItems.map((item, i) => (
-                                <tr key={i} style={{ borderBottom: `1px solid ${C.border}22`,
-                                  background: item.status === "error" ? "#ef444406" : "transparent" }}>
-                                  <td style={{ padding: "6px 10px", color: C.muted }}>{item.row_number}</td>
-                                  <td style={{ padding: "6px 10px", color: C.text, maxWidth: 180,
-                                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                                    title={item.product_name}>{item.product_name}</td>
-                                  <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.sku || "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.muted, fontFamily: "monospace" }}>{item.ean || "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.textDim }}>{item.brand || "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.muted, maxWidth: 120,
-                                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                                    title={item.category}>{item.category || "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.muted }}>
-                                    {item.source_price ? `£${parseFloat(item.source_price).toFixed(2)}` : "—"}
-                                  </td>
-                                  <td style={{ padding: "6px 10px", color: C.blue, fontWeight: 600 }}>
-                                    {item.selling_price ? `£${parseFloat(item.selling_price).toFixed(2)}` : "—"}
-                                  </td>
-                                  <td style={{ padding: "6px 10px", color: C.text }}>{item.stock ?? "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.textDim }}>{item.condition || "—"}</td>
-                                  <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.opc || "—"}</td>
-                                  <td style={{ padding: "6px 10px" }}>
-                                    <span style={{
-                                      background: item.status === "error" ? "#ef444422" : item.status === "product_created" ? "#00d4aa22" : "#3b82f622",
-                                      color: statusColor(item.status), borderRadius: 5,
-                                      padding: "2px 7px", fontSize: 10, fontWeight: 600, whiteSpace: "nowrap",
-                                    }}>{statusLabel(item.status)}</span>
-                                    {item.error_message && (
-                                      <div style={{ color: C.red, fontSize: 10, marginTop: 3, maxWidth: 200 }}
-                                        title={item.error_message}>
-                                        {item.error_message.slice(0, 60)}{item.error_message.length > 60 ? "…" : ""}
-                                      </div>
-                                    )}
-                                  </td>
+                        {loading && !items.length ? (
+                          <div style={{ padding: "24px", textAlign: "center", color: C.muted, fontSize: 13 }}>Loading…</div>
+                        ) : (
+                          <div style={{ overflowX: "auto" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                              <thead>
+                                <tr style={{ background: "#ffffff06" }}>
+                                  {["Row","Product","SKU","EAN","Brand","Category","Source £","Selling £","Stock","Condition","OPC","Status"].map(h => (
+                                    <th key={h} style={{ padding: "7px 10px", color: C.muted, textAlign: "left",
+                                      fontSize: 10, textTransform: "uppercase", whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                                  ))}
                                 </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
+                              </thead>
+                              <tbody>
+                                {items.map((item, i) => (
+                                  <tr key={i} style={{ borderBottom: `1px solid ${C.border}22`,
+                                    background: item.status === "error" ? "#ef444406" : "transparent" }}>
+                                    <td style={{ padding: "6px 10px", color: C.muted }}>{item.row_number}</td>
+                                    <td style={{ padding: "6px 10px", color: C.text, maxWidth: 180,
+                                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                      title={item.product_name}>{item.product_name}</td>
+                                    <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.sku || "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.muted, fontFamily: "monospace" }}>{item.ean || "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.textDim }}>{item.brand || "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.muted, maxWidth: 120,
+                                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                      title={item.category}>{item.category || "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.muted }}>
+                                      {item.source_price ? `£${parseFloat(item.source_price).toFixed(2)}` : "—"}
+                                    </td>
+                                    <td style={{ padding: "6px 10px", color: C.blue, fontWeight: 600 }}>
+                                      {item.selling_price ? `£${parseFloat(item.selling_price).toFixed(2)}` : "—"}
+                                    </td>
+                                    <td style={{ padding: "6px 10px", color: C.text }}>{item.stock ?? "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.textDim }}>{item.condition || "—"}</td>
+                                    <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.opc || "—"}</td>
+                                    <td style={{ padding: "6px 10px" }}>
+                                      <span style={{
+                                        background: item.status === "error" ? "#ef444422" : item.status === "product_created" ? "#00d4aa22" : "#3b82f622",
+                                        color: statusColor(item.status), borderRadius: 5,
+                                        padding: "2px 7px", fontSize: 10, fontWeight: 600, whiteSpace: "nowrap",
+                                      }}>{statusLabel(item.status)}</span>
+                                      {item.error_message && (
+                                        <div style={{ color: C.red, fontSize: 10, marginTop: 3, maxWidth: 200 }}
+                                          title={item.error_message}>
+                                          {item.error_message.slice(0, 60)}{item.error_message.length > 60 ? "…" : ""}
+                                        </div>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
 
                         {/* Pagination */}
                         {totalPages > 1 && (
                           <div onClick={e => e.stopPropagation()}
                             style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-                              padding: "10px 12px", borderTop: `1px solid ${C.border}` }}>
-                            <button
-                              onClick={() => setSessionPage(p => ({ ...p, [s.id]: Math.max(1, safePage - 1) }))}
-                              disabled={safePage === 1}
-                              style={{ background: C.border, border: "none", borderRadius: 5, color: safePage === 1 ? C.muted : C.text,
-                                cursor: safePage === 1 ? "default" : "pointer", padding: "4px 10px", fontSize: 12 }}>
+                              padding: "10px 12px", borderTop: `1px solid ${C.border}`, flexWrap: "wrap" }}>
+                            <button onClick={() => gotoPage(curPage - 1)} disabled={curPage === 1 || loading}
+                              style={{ background: C.border, border: "none", borderRadius: 5,
+                                color: curPage === 1 ? C.muted : C.text,
+                                cursor: curPage === 1 ? "default" : "pointer", padding: "4px 10px", fontSize: 12 }}>
                               ← Prev
                             </button>
                             {Array.from({ length: totalPages }, (_, i) => i + 1)
-                              .filter(p => p === 1 || p === totalPages || Math.abs(p - safePage) <= 2)
+                              .filter(p => p === 1 || p === totalPages || Math.abs(p - curPage) <= 2)
                               .reduce((acc, p, idx, arr) => {
                                 if (idx > 0 && p - arr[idx - 1] > 1) acc.push("…");
                                 acc.push(p); return acc;
                               }, [])
                               .map((p, i) => p === "…"
                                 ? <span key={`e${i}`} style={{ color: C.muted, fontSize: 12 }}>…</span>
-                                : <button key={p}
-                                    onClick={() => setSessionPage(prev => ({ ...prev, [s.id]: p }))}
-                                    style={{ background: p === safePage ? C.accent : C.border, border: "none",
-                                      borderRadius: 5, color: p === safePage ? C.bg : C.text,
-                                      cursor: "pointer", padding: "4px 9px", fontSize: 12, fontWeight: p === safePage ? 700 : 400 }}>
+                                : <button key={p} onClick={() => gotoPage(p)} disabled={loading}
+                                    style={{ background: p === curPage ? C.accent : C.border, border: "none",
+                                      borderRadius: 5, color: p === curPage ? C.bg : C.text,
+                                      cursor: loading ? "default" : "pointer", padding: "4px 9px", fontSize: 12,
+                                      fontWeight: p === curPage ? 700 : 400 }}>
                                     {p}
                                   </button>
                               )}
-                            <button
-                              onClick={() => setSessionPage(p => ({ ...p, [s.id]: Math.min(totalPages, safePage + 1) }))}
-                              disabled={safePage === totalPages}
-                              style={{ background: C.border, border: "none", borderRadius: 5, color: safePage === totalPages ? C.muted : C.text,
-                                cursor: safePage === totalPages ? "default" : "pointer", padding: "4px 10px", fontSize: 12 }}>
+                            <button onClick={() => gotoPage(curPage + 1)} disabled={curPage === totalPages || loading}
+                              style={{ background: C.border, border: "none", borderRadius: 5,
+                                color: curPage === totalPages ? C.muted : C.text,
+                                cursor: curPage === totalPages ? "default" : "pointer", padding: "4px 10px", fontSize: 12 }}>
                               Next →
                             </button>
                             <span style={{ color: C.muted, fontSize: 11, marginLeft: 4 }}>
-                              Page {safePage} of {totalPages} ({filtered.length} rows)
+                              Page {curPage} of {totalPages} · {total.toLocaleString()} rows
                             </span>
                           </div>
                         )}

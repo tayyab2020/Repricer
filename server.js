@@ -1985,18 +1985,41 @@ app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/onbuy-bulk/history/:sessionId/items — rows for a specific import session
+// GET /api/onbuy-bulk/history/:sessionId/items — rows for a specific import session (paginated)
 app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res) => {
   try {
+    const PAGE_SIZE = 100;
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const search = (req.query.search || '').trim();
+
+    const params = [req.params.sessionId, req.effectiveUserId];
+    let whereExtra = '';
+    if (search) {
+      params.push(`%${search}%`);
+      const n = params.length;
+      whereExtra = ` AND (product_name ILIKE $${n} OR sku ILIKE $${n} OR ean ILIKE $${n}
+                       OR brand ILIKE $${n} OR category ILIKE $${n} OR opc ILIKE $${n}
+                       OR status ILIKE $${n} OR error_message ILIKE $${n})`;
+    }
+
+    const { rows: [{ count }] } = await db.query(
+      `SELECT COUNT(*) FROM onbuy_bulk_import_items WHERE session_id=$1 AND user_id=$2${whereExtra}`,
+      params
+    );
+    const total = parseInt(count);
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const safePage = Math.min(page, totalPages);
+
     const { rows } = await db.query(
       `SELECT row_number, product_name, sku, ean, brand, category,
               source_price, selling_price, stock, condition, opc, status, error_message, created_at
        FROM onbuy_bulk_import_items
-       WHERE session_id = $1 AND user_id = $2
-       ORDER BY row_number ASC`,
-      [req.params.sessionId, req.effectiveUserId]
+       WHERE session_id = $1 AND user_id = $2${whereExtra}
+       ORDER BY row_number ASC
+       LIMIT ${PAGE_SIZE} OFFSET ${(safePage - 1) * PAGE_SIZE}`,
+      params
     );
-    res.json(rows);
+    res.json({ items: rows, total, page: safePage, totalPages });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
