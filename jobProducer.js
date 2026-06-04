@@ -29,6 +29,7 @@ export const fastQueue        = new Queue('repricer-fast',  { connection: redis 
 export const slowQueue        = new Queue('repricer-slow',  { connection: redis });
 export const keepaQueue       = new Queue('keepa-scrape',   { connection: redis });
 export const queuePollerQueue = new Queue('queue-poller',   { connection: redis });
+export const bulkImportQueue  = new Queue('bulk-import',    { connection: redis });
 
 export async function getTokenForAccount(account) {
   try {
