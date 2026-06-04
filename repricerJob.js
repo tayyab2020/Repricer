@@ -1548,31 +1548,111 @@ async function processBulkImportJob(job) {
     console.log(`[BulkImport][s=${sessionId}]`, msg);
   }
 
+  async function syncCategoriesIfNeeded() {
+    // Re-sync if no rows exist or last sync is older than 24 h
+    const { rows: [{ last_sync }] } = await db.query(
+      `SELECT MAX(synced_at) AS last_sync FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
+      [accountId, siteId]
+    );
+    if (last_sync && (Date.now() - new Date(last_sync).getTime()) < 24 * 60 * 60 * 1000) {
+      const { rows: [{ cnt }] } = await db.query(
+        `SELECT COUNT(*) AS cnt FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
+        [accountId, siteId]
+      );
+      blog(`Category DB cache is fresh (${cnt} categories, synced ${Math.round((Date.now() - new Date(last_sync).getTime()) / 60000)} min ago) — skipping sync`);
+      return;
+    }
+
+    blog('Syncing OnBuy categories into DB…');
+    const limit = 100;
+    let   offset = 0, total = null, synced = 0;
+
+    while (true) {
+      let data;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const r = await fetch(
+            `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
+            { headers: { Authorization: token } }
+          );
+          if (r.status === 429) {
+            blog(`Category sync rate-limited at offset ${offset} — waiting ${attempt} min`);
+            await new Promise(res => setTimeout(res, attempt * 60_000));
+            continue;
+          }
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          data = await r.json();
+          break;
+        } catch (e) {
+          if (attempt === 3) throw new Error(`Category sync failed at offset ${offset}: ${e.message}`);
+          await new Promise(res => setTimeout(res, 2000));
+        }
+      }
+
+      const items = data?.payload ?? data?.results ?? (Array.isArray(data) ? data : []);
+      if (total === null) total = data?.metadata?.total_rows ?? data?.total ?? items.length;
+
+      if (!items.length) break;
+
+      // Upsert batch
+      const vals   = [];
+      const params = [];
+      let   p = 1;
+      for (const cat of items) {
+        const catId = cat.category_id ?? cat.id;
+        if (!catId) continue;
+        vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
+        params.push(catId, accountId, siteId, cat.name ?? '', cat.tree ?? null, cat.level ?? null);
+      }
+      if (vals.length) {
+        await db.query(
+          `INSERT INTO onbuy_categories (category_id,account_id,site_id,name,tree,level,synced_at)
+           VALUES ${vals.join(',')}
+           ON CONFLICT (category_id,account_id,site_id)
+           DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
+          params
+        );
+      }
+
+      synced += items.length;
+      offset += limit;
+      blog(`Category sync: ${synced}/${total} categories stored`);
+
+      if (synced >= total) break;
+      await new Promise(res => setTimeout(res, 150)); // small gap between pages
+    }
+    blog(`Category sync complete — ${synced} categories in DB`);
+  }
+
   async function lookupCategoryId(name) {
     const trimmed = String(name).trim();
     if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
     if (categoryCache[name] !== undefined) return categoryCache[name];
+
+    // Try leaf name first (after last '>'), then full trimmed name
     const leafName = name.includes('>') ? name.split('>').pop().trim() : trimmed;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const r = await fetch(
-          `https://api.onbuy.com/v2/categories?filter[name]=${encodeURIComponent(leafName)}&site_id=${siteId}`,
-          { headers: { Authorization: token } }
-        );
-        if (r.status === 429) {
-          blog(`Category "${leafName}" rate-limited — waiting ${attempt} min`);
-          await new Promise(res => setTimeout(res, attempt * 60_000));
-          continue;
-        }
-        if (!r.ok) { blog(`Category "${leafName}" HTTP ${r.status} — skipping`); break; }
-        const data = await r.json();
-        const cats = data?.payload ?? data?.results ?? data ?? [];
-        categoryCache[name] = Array.isArray(cats) ? (cats[0]?.category_id ?? cats[0]?.id ?? null) : null;
-        blog(`Category "${leafName}" → id=${categoryCache[name]}`);
-        return categoryCache[name];
-      } catch (e) { blog(`Category "${leafName}" error: ${e.message}`); break; }
+    const { rows } = await db.query(
+      `SELECT category_id FROM onbuy_categories
+       WHERE account_id=$1 AND site_id=$2 AND lower(name)=lower($3)
+       LIMIT 1`,
+      [accountId, siteId, leafName]
+    );
+    if (rows[0]) {
+      categoryCache[name] = rows[0].category_id;
+      blog(`Category "${leafName}" → id=${categoryCache[name]} (DB)`);
+      return categoryCache[name];
     }
-    if (categoryCache[name] === undefined) categoryCache[name] = null;
+
+    // Partial match fallback
+    const { rows: fuzzy } = await db.query(
+      `SELECT category_id FROM onbuy_categories
+       WHERE account_id=$1 AND site_id=$2 AND lower(name) LIKE lower($3)
+       LIMIT 1`,
+      [accountId, siteId, `%${leafName}%`]
+    );
+    categoryCache[name] = fuzzy[0]?.category_id ?? null;
+    if (categoryCache[name]) blog(`Category "${leafName}" → id=${categoryCache[name]} (DB fuzzy)`);
+    else                      blog(`Category "${leafName}" not found in DB`);
     return categoryCache[name];
   }
 
@@ -1624,10 +1704,11 @@ async function processBulkImportJob(job) {
     }));
   }
 
-  // ── Phase 1b: Pre-fetch categories sequentially (300 ms gap) ──
+  // ── Phase 1b: Sync category DB then warm in-memory cache ──
+  await syncCategoriesIfNeeded();
   const uniqueCats = [...new Set(validRows.map(r => r.category).filter(Boolean))];
-  blog(`Phase 1b: pre-fetching ${uniqueCats.length} unique categories`);
-  for (const cat of uniqueCats) { await lookupCategoryId(cat); await new Promise(res => setTimeout(res, 300)); }
+  blog(`Phase 1b: resolving ${uniqueCats.length} unique categories from DB`);
+  for (const cat of uniqueCats) await lookupCategoryId(cat); // pure DB lookups — no delay needed
 
   const existingMeta = [], newMeta = [];
   for (const row of validRows) {

@@ -1611,6 +1611,17 @@ async function runMigrations() {
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS listings_updated INTEGER DEFAULT 0`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS pending_queues INTEGER DEFAULT 0`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS rows_data JSONB`,
+    `CREATE TABLE IF NOT EXISTS onbuy_categories (
+       category_id  INTEGER      NOT NULL,
+       account_id   INTEGER      NOT NULL,
+       site_id      INTEGER      NOT NULL DEFAULT 2000,
+       name         TEXT         NOT NULL,
+       tree         TEXT,
+       level        INTEGER,
+       synced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (category_id, account_id, site_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_cats_name ON onbuy_categories(account_id, site_id, lower(name))`,
     `CREATE TABLE IF NOT EXISTS onbuy_bulk_pending_queues (
        id           SERIAL PRIMARY KEY,
        session_id   INTEGER,
