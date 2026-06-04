@@ -1772,7 +1772,7 @@ async function processBulkImportJob(job) {
         ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
         default_image: row.images[0],
         ...(addImgs.length      ? { additional_images: addImgs }     : {}),
-        ...(row.description     ? { description: row.description }   : {}),
+        ...(row.description     ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
         ...(row.ean             ? { product_codes: [row.ean] }       : {}),
         ...(row.mpn             ? { mpn: row.mpn }                   : {}),
         ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
@@ -1791,12 +1791,16 @@ async function processBulkImportJob(job) {
       });
     }
     const createData = await createRes.json();
-    blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 120)}`);
+    blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 1000)}`);
     for (let j = 0; j < chunk.length; j++) {
       const m  = chunk[j];
       const br = (createData?.results ?? [])[j];
       if (!br?.queue_id) {
-        const msg = br?.message || 'No queue_id returned';
+        const baseMsg   = br?.message || 'No queue_id returned';
+        const fieldErrs = br?.messages && typeof br.messages === 'object'
+          ? Object.entries(br.messages).map(([f, v]) => `${f}: ${Array.isArray(v) ? v.join(', ') : v}`).join('; ')
+          : null;
+        const msg = fieldErrs ? `${baseMsg} — ${fieldErrs}` : baseMsg;
         results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
         db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
           [sessionId,userId,m.row._row,m.row.name,m.row.sku,m.row.ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),msg]).catch(() => {});
@@ -1884,7 +1888,7 @@ async function processBulkImportJob(job) {
           ...(brandVal ? { brand_name: brandVal } : {}),
           ...(row.images?.[0]   ? { default_image: row.images[0] }   : {}),
           ...(addImgs.length    ? { additional_images: addImgs }      : {}),
-          ...(row.description   ? { description: row.description }    : {}),
+          ...(row.description   ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
           ...(row.mpn           ? { mpn: row.mpn }                    : {}),
         };
       });

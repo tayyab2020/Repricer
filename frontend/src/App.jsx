@@ -3094,9 +3094,9 @@ function OnBuyBulkPage() {
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
-    // Load global pending queue status on mount
+    // Load global pending queue status on mount and start live poll if queues exist
     api("/onbuy-bulk/pending-queue-status").then(s => {
-      if (s && parseInt(s.pending) > 0) setPendingStatus(s);
+      if (s && parseInt(s.pending) > 0) { setPendingStatus(s); startPendingPoll(); }
     }).catch(() => {});
     // Restore running import state across page reloads
     api("/onbuy-bulk/active-session").then(s => {
@@ -3127,7 +3127,7 @@ function OnBuyBulkPage() {
           pendingPollRef.current = null;
         }
       } catch {}
-    }, 30_000);
+    }, 15_000);
   }
 
   useEffect(() => {
