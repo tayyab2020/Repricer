@@ -3082,6 +3082,7 @@ function OnBuyBulkPage() {
   const [expandedSession, setExpandedSession] = useState(null);
   // sessionData[id] = { items, total, page, totalPages, search, loading }
   const [sessionData, setSessionData] = useState({});
+  const [exportMenuOpen, setExportMenuOpen] = useState(null); // sessionId with open menu
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
@@ -3120,6 +3121,13 @@ function OnBuyBulkPage() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const close = () => setExportMenuOpen(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [exportMenuOpen]);
+
   function startImportPoll(sessionId) {
     if (importPollRef.current) clearInterval(importPollRef.current);
     importPollRef.current = setInterval(async () => {
@@ -3145,6 +3153,26 @@ function OnBuyBulkPage() {
     setHistLoading(false);
   }
 
+  async function exportSession(sessionId, type) {
+    setExportMenuOpen(null);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/onbuy-bulk/history/${sessionId}/export?type=${type}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const blob = await r.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href = url;
+      a.download = `bulk-import-${sessionId}-${type}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) { alert("Export failed: " + e.message); }
+  }
+
   async function fetchSessionPage(sessionId, { page = 1, search = "" } = {}) {
     setSessionData(p => ({ ...p, [sessionId]: { ...(p[sessionId] || {}), loading: true } }));
     try {
@@ -3157,6 +3185,7 @@ function OnBuyBulkPage() {
   }
 
   function toggleSession(id) {
+    setExportMenuOpen(null);
     if (expandedSession === id) { setExpandedSession(null); return; }
     setExpandedSession(id);
     if (!sessionData[id]?.items) fetchSessionPage(id, { page: 1, search: "" });
@@ -3336,26 +3365,66 @@ function OnBuyBulkPage() {
                         <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase" }}>{label}</div>
                       </div>
                     ))}
-                    {(parseInt(s.pending_queues) > 0 || s.status === 'processing') && s.status !== 'cancelled' ? (
-                      <button
-                        onClick={async e => {
-                          e.stopPropagation();
-                          if (!confirm(`Cancel this import? This will stop background queue polling for all ${parseInt(s.pending_queues) || 0} pending queues.`)) return;
-                          try {
-                            await api(`/onbuy-bulk/sessions/${s.id}/cancel`, { method: "POST" });
-                            loadHistory();
-                          } catch (err) { alert("Cancel failed: " + err.message); }
-                        }}
-                        style={{
-                          background: "#ef444422", border: `1px solid ${C.red}44`, borderRadius: 6,
-                          color: C.red, cursor: "pointer", padding: "5px 10px", fontSize: 11, fontWeight: 600,
-                          whiteSpace: "nowrap",
-                        }}>
-                        ✕ Cancel
-                      </button>
-                    ) : (
-                      <div />
-                    )}
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={e => e.stopPropagation()}>
+                      {/* Export dropdown */}
+                      <div style={{ position: "relative" }}>
+                        <button
+                          onClick={e => { e.stopPropagation(); setExportMenuOpen(exportMenuOpen === s.id ? null : s.id); }}
+                          style={{
+                            background: "#3b82f622", border: `1px solid ${C.blue}44`, borderRadius: 6,
+                            color: C.blue, cursor: "pointer", padding: "5px 10px", fontSize: 11, fontWeight: 600,
+                            whiteSpace: "nowrap",
+                          }}>
+                          ↓ Export
+                        </button>
+                        {exportMenuOpen === s.id && (
+                          <div style={{
+                            position: "absolute", right: 0, top: "calc(100% + 4px)", zIndex: 100,
+                            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8,
+                            boxShadow: "0 8px 24px #0008", minWidth: 210, overflow: "hidden",
+                          }}>
+                            {[
+                              ["failed",  C.red,   "✕ Export failed results"],
+                              ["success", C.accent, "✓ Export successful listings"],
+                              ["all",     C.text,   "⊞ Export all results"],
+                            ].map(([type, color, label]) => (
+                              <button key={type}
+                                onClick={() => exportSession(s.id, type)}
+                                style={{
+                                  display: "block", width: "100%", textAlign: "left",
+                                  background: "none", border: "none", cursor: "pointer",
+                                  padding: "10px 14px", fontSize: 12, color, fontWeight: 500,
+                                  borderBottom: type !== "all" ? `1px solid ${C.border}` : "none",
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.background = "#ffffff0a"}
+                                onMouseLeave={e => e.currentTarget.style.background = "none"}>
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Cancel button — only when pending/processing */}
+                      {(parseInt(s.pending_queues) > 0 || s.status === 'processing') && s.status !== 'cancelled' && (
+                        <button
+                          onClick={async e => {
+                            e.stopPropagation();
+                            if (!confirm(`Cancel this import? This will stop background queue polling for all ${parseInt(s.pending_queues) || 0} pending queues.`)) return;
+                            try {
+                              await api(`/onbuy-bulk/sessions/${s.id}/cancel`, { method: "POST" });
+                              loadHistory();
+                            } catch (err) { alert("Cancel failed: " + err.message); }
+                          }}
+                          style={{
+                            background: "#ef444422", border: `1px solid ${C.red}44`, borderRadius: 6,
+                            color: C.red, cursor: "pointer", padding: "5px 10px", fontSize: 11, fontWeight: 600,
+                            whiteSpace: "nowrap",
+                          }}>
+                          ✕ Cancel
+                        </button>
+                      )}
+                    </div>
                     <div style={{ color: C.muted, fontSize: 18 }}>
                       {expandedSession === s.id ? "▲" : "▼"}
                     </div>

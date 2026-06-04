@@ -2000,6 +2000,53 @@ app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/onbuy-bulk/history/:sessionId/export — download session items as CSV
+app.get('/api/onbuy-bulk/history/:sessionId/export', requireAuth, async (req, res) => {
+  try {
+    const type = req.query.type || 'all'; // 'all' | 'success' | 'failed'
+    const sid  = req.params.sessionId;
+    const uid  = req.effectiveUserId;
+
+    let whereStatus = '';
+    if (type === 'success') whereStatus = `AND status IN ('listing_created','product_created')`;
+    if (type === 'failed')  whereStatus = `AND status = 'error'`;
+
+    const { rows } = await db.query(
+      `SELECT row_number, product_name, sku, ean, brand, category,
+              source_price, selling_price, stock, condition, opc, status, error_message
+       FROM onbuy_bulk_import_items
+       WHERE session_id = $1 AND user_id = $2 ${whereStatus}
+       ORDER BY row_number ASC`,
+      [sid, uid]
+    );
+
+    const escape = v => {
+      if (v == null) return '';
+      const s = String(v);
+      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    const headers = ['Row','Product','SKU','EAN','Brand','Category','Source Price','Selling Price','Stock','Condition','OPC','Status','Error'];
+    const lines   = [
+      headers.join(','),
+      ...rows.map(r => [
+        r.row_number, r.product_name, r.sku, r.ean, r.brand, r.category,
+        r.source_price, r.selling_price, r.stock, r.condition, r.opc,
+        r.status, r.error_message,
+      ].map(escape).join(',')),
+    ];
+
+    const filename = `bulk-import-${sid}-${type}.csv`;
+    // UTF-8 BOM prevents Excel from misreading £ and other non-ASCII chars as latin-1
+    const bom = '﻿';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(bom + lines.join('\r\n'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/onbuy-bulk/history/:sessionId/items — rows for a specific import session (paginated)
 app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res) => {
   try {
