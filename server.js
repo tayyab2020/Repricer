@@ -2536,7 +2536,7 @@ app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, account_name, total_rows, products_created, listings_created,
-              listings_updated, skipped, errors_count, status, created_at, completed_at
+              listings_updated, skipped, errors_count, pending_queues, status, created_at, completed_at
        FROM onbuy_bulk_import_sessions
        WHERE user_id = $1
        ORDER BY created_at DESC
