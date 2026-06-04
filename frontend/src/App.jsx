@@ -3143,13 +3143,19 @@ function OnBuyBulkPage() {
         const s = await api(`/onbuy-bulk/sessions/${sessionId}`);
         if (!s) return;
         setResult(s);
+        // Show banner + start pending poll as soon as queues appear (don't wait for job to finish)
+        if (parseInt(s.pending_queues) > 0) {
+          setPendingStatus(p => ({
+            pending: s.pending_queues,
+            listing_created: p?.listing_created || 0,
+            failed: p?.failed || 0,
+            total: p?.total || s.pending_queues,
+          }));
+          startPendingPoll();
+        }
         if (s.status === 'completed' || s.status === 'failed') {
           clearInterval(importPollRef.current);
           importPollRef.current = null;
-          if (parseInt(s.pending_queues) > 0) {
-            setPendingStatus({ pending: s.pending_queues, listing_created: 0, failed: 0, total: s.pending_queues });
-            startPendingPoll();
-          }
         }
       } catch {}
     }, 3000);

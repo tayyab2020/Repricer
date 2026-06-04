@@ -1862,6 +1862,11 @@ async function processBulkImportJob(job) {
       await queuePollerQueue.add('poll', {}, { jobId: `queue-poller-${Date.now()}`, delay: 15*60*1000, removeOnComplete: true, removeOnFail: true, attempts: 1 }).catch(() => {});
     }
   }
+  // Update counters after Phase 3 so the UI shows live progress while processing
+  db.query(
+    `UPDATE onbuy_bulk_import_sessions SET products_created=$1, skipped=$2, errors_count=$3 WHERE id=$4`,
+    [results.product_created, results.skipped, results.errors.length, sessionId]
+  ).catch(() => {});
 
   // ── Phase 3.5: Update existing products ──
   const toUpdate = existingMeta.filter(m => m.opc);
@@ -1971,6 +1976,11 @@ async function processBulkImportJob(job) {
           }
         }
       }
+      // Update counters after each Phase 4 chunk so the UI reflects live progress
+      db.query(
+        `UPDATE onbuy_bulk_import_sessions SET products_created=$1, listings_created=$2, listings_updated=$3, skipped=$4, errors_count=$5 WHERE id=$6`,
+        [results.product_created, results.listing_created, results.listing_updated, results.skipped, results.errors.length, sessionId]
+      ).catch(() => {});
     }
   }
 
