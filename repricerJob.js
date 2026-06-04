@@ -1935,7 +1935,9 @@ async function processBulkImportJob(job) {
         const lr  = Array.isArray(listingResults) ? listingResults[j] : null;
         const cnd = _bulkNormCond(m.row.condition);
         if (!listingRes.ok || lr?.success === false) {
-          const msg = lr?.message || listingData?.message || listingData?.error?.message || `Listing rejected by OnBuy (HTTP ${listingRes.status})`;
+          const baseMsg    = lr?.message || listingData?.message || listingData?.error?.message || `Listing rejected by OnBuy (HTTP ${listingRes.status})`;
+          const fieldErrs  = Array.isArray(lr?.errors) ? lr.errors.map(e => `${e.field}: ${e.message}`).join('; ') : null;
+          const msg        = fieldErrs ? `${baseMsg} — ${fieldErrs}` : baseMsg;
           if (/already have a listing|listing already exist|duplicate listing/i.test(msg) && m.row.sku) {
             updateNeeded.push(m);
           } else {

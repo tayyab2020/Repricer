@@ -3272,15 +3272,6 @@ function OnBuyBulkPage() {
               </div>
               <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
                 Background worker polls every 15 min and creates listings when queues resolve.
-                {parseInt(pendingStatus.listing_created) > 0 && (
-                  <span style={{ color: C.blue }}> {parseInt(pendingStatus.listing_created).toLocaleString()} listed so far.</span>
-                )}
-                {parseInt(pendingStatus.failed) > 0 && (
-                  <span style={{ color: C.red }}> {parseInt(pendingStatus.failed).toLocaleString()} rejected by OnBuy (product queue failed).</span>
-                )}
-                {parseInt(pendingStatus.failed) > 0 && (
-                  <span style={{ color: C.muted, fontStyle: "italic" }}> Note: session ERRORS count is higher — it also includes listing creation failures.</span>
-                )}
               </div>
             </div>
           </div>
