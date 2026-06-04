@@ -2484,6 +2484,37 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/onbuy-bulk/sessions/:sessionId/cancel — cancel pending queues for a session
+app.post('/api/onbuy-bulk/sessions/:sessionId/cancel', requireAuth, async (req, res) => {
+  try {
+    const sid = parseInt(req.params.sessionId);
+    const uid = req.effectiveUserId;
+
+    // Verify session belongs to this user
+    const { rows: [sess] } = await db.query(
+      `SELECT id FROM onbuy_bulk_import_sessions WHERE id=$1 AND user_id=$2`,
+      [sid, uid]
+    );
+    if (!sess) return res.status(404).json({ error: 'Session not found' });
+
+    // Delete pending queues — queue poller will simply not find them on next run
+    const { rowCount } = await db.query(
+      `DELETE FROM onbuy_bulk_pending_queues WHERE session_id=$1 AND user_id=$2 AND status='pending'`,
+      [sid, uid]
+    );
+
+    // Mark session cancelled
+    await db.query(
+      `UPDATE onbuy_bulk_import_sessions SET status='cancelled', pending_queues=0, completed_at=NOW() WHERE id=$1`,
+      [sid]
+    );
+
+    res.json({ cancelled: rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/onbuy-bulk/sessions/:sessionId — live status for a background import
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {

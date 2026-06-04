@@ -3270,17 +3270,40 @@ function OnBuyBulkPage() {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {history.map(s => (
-                <div key={s.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+                <div key={s.id} style={{
+                  border: `1px solid ${s.status === 'cancelled' ? C.border : s.status === 'processing' ? C.amber+'44' : C.border}`,
+                  borderRadius: 10, overflow: "hidden"
+                }}>
                   <div
                     onClick={() => toggleSession(s.id)}
                     style={{
-                      display: "grid", gridTemplateColumns: "1fr auto auto auto auto auto auto",
+                      display: "grid", gridTemplateColumns: "1fr auto auto auto auto auto auto auto",
                       gap: 16, padding: "12px 16px", cursor: "pointer", alignItems: "center",
                       background: expandedSession === s.id ? "#ffffff08" : "transparent",
                     }}>
                     <div>
-                      <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>
-                        {s.account_name || "—"}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>
+                          {s.account_name || "—"}
+                        </span>
+                        {s.status === 'processing' && (
+                          <span style={{ background: C.amber+'22', color: C.amber, borderRadius: 4,
+                            padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>PROCESSING</span>
+                        )}
+                        {s.status === 'cancelled' && (
+                          <span style={{ background: "#ef444422", color: C.red, borderRadius: 4,
+                            padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>CANCELLED</span>
+                        )}
+                        {s.status === 'failed' && (
+                          <span style={{ background: "#ef444422", color: C.red, borderRadius: 4,
+                            padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>FAILED</span>
+                        )}
+                        {parseInt(s.pending_queues) > 0 && s.status !== 'cancelled' && (
+                          <span style={{ background: "#f59e0b22", color: C.amber, borderRadius: 4,
+                            padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>
+                            {parseInt(s.pending_queues)} pending
+                          </span>
+                        )}
                       </div>
                       <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
                         {new Date(s.created_at).toLocaleString()}
@@ -3298,6 +3321,26 @@ function OnBuyBulkPage() {
                         <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase" }}>{label}</div>
                       </div>
                     ))}
+                    {(parseInt(s.pending_queues) > 0 || s.status === 'processing') && s.status !== 'cancelled' ? (
+                      <button
+                        onClick={async e => {
+                          e.stopPropagation();
+                          if (!confirm(`Cancel this import? This will stop background queue polling for all ${parseInt(s.pending_queues) || 0} pending queues.`)) return;
+                          try {
+                            await api(`/onbuy-bulk/sessions/${s.id}/cancel`, { method: "POST" });
+                            loadHistory();
+                          } catch (err) { alert("Cancel failed: " + err.message); }
+                        }}
+                        style={{
+                          background: "#ef444422", border: `1px solid ${C.red}44`, borderRadius: 6,
+                          color: C.red, cursor: "pointer", padding: "5px 10px", fontSize: 11, fontWeight: 600,
+                          whiteSpace: "nowrap",
+                        }}>
+                        ✕ Cancel
+                      </button>
+                    ) : (
+                      <div />
+                    )}
                     <div style={{ color: C.muted, fontSize: 18 }}>
                       {expandedSession === s.id ? "▲" : "▼"}
                     </div>
