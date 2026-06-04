@@ -1986,6 +1986,31 @@ app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => 
   }
 });
 
+// GET /api/onbuy-bulk/active-session — most recent processing session for this user (used to restore UI on reload)
+app.get('/api/onbuy-bulk/active-session', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
+              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at,
+              COALESCE(pq.pending_count, 0) AS pending_queues
+       FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id, COUNT(*) AS pending_count
+         FROM onbuy_bulk_pending_queues
+         WHERE status = 'pending'
+         GROUP BY session_id
+       ) pq ON pq.session_id = s.id
+       WHERE s.user_id = $1 AND s.status = 'processing'
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [req.effectiveUserId]
+    );
+    res.json(rows[0] || null);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/onbuy-bulk/history — import sessions for the current user
 app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   try {

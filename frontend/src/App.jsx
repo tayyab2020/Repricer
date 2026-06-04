@@ -3090,6 +3090,14 @@ function OnBuyBulkPage() {
     api("/onbuy-bulk/pending-queue-status").then(s => {
       if (s && parseInt(s.pending) > 0) setPendingStatus(s);
     }).catch(() => {});
+    // Restore running import state across page reloads
+    api("/onbuy-bulk/active-session").then(s => {
+      if (s && s.status === 'processing') {
+        setResult(s);
+        setStep(3);
+        startImportPoll(s.id);
+      }
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {

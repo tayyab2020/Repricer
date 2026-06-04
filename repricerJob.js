@@ -1539,6 +1539,14 @@ async function processBulkImportJob(job) {
   const results = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
   const categoryCache = {};
   const CHUNK = 1000;
+  let currentToken = token; // mutable so we can refresh mid-job
+
+  async function refreshToken() {
+    const newTok = await getTokenForAccount(account);
+    if (newTok) { currentToken = newTok; blog('Token refreshed mid-job'); }
+    else blog('Token refresh failed — continuing with old token');
+    return !!newTok;
+  }
 
   function blog(...args) {
     const msg  = args.join(' ');
@@ -1573,7 +1581,7 @@ async function processBulkImportJob(job) {
         try {
           const r = await fetch(
             `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
-            { headers: { Authorization: token } }
+            { headers: { Authorization: currentToken } }
           );
           if (r.status === 429) {
             blog(`Category sync rate-limited at offset ${offset} — waiting ${attempt} min`);
@@ -1663,7 +1671,7 @@ async function processBulkImportJob(job) {
       try {
         const r    = await fetch(
           `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(chunk.join(','))}`,
-          { headers: { Authorization: token } }
+          { headers: { Authorization: currentToken } }
         );
         const text = await r.text();
         let data; try { data = JSON.parse(text); } catch {
@@ -1689,7 +1697,7 @@ async function processBulkImportJob(job) {
         try {
           const r = await fetch(
             `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(eans)}`,
-            { headers: { Authorization: token } }
+            { headers: { Authorization: currentToken } }
           );
           if (r.status === 429) { blog(`EAN batch ${batchNum} rate-limited — waiting ${attempt} min`); await new Promise(res => setTimeout(res, attempt * 60_000)); continue; }
           const data = await r.json();
@@ -1771,10 +1779,17 @@ async function processBulkImportJob(job) {
       };
     });
     blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CHUNK)+1} of ${Math.ceil(toCreate.length/CHUNK)})`);
-    const createRes  = await fetch('https://api.onbuy.com/v2/products', {
-      method: 'POST', headers: { Authorization: token, 'Content-Type': 'application/json' },
+    let createRes = await fetch('https://api.onbuy.com/v2/products', {
+      method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
     });
+    if (createRes.status === 401) {
+      await refreshToken();
+      createRes = await fetch('https://api.onbuy.com/v2/products', {
+        method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
+      });
+    }
     const createData = await createRes.json();
     blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 120)}`);
     for (let j = 0; j < chunk.length; j++) {
@@ -1814,7 +1829,7 @@ async function processBulkImportJob(job) {
           const dupEan = (error.match(/Duplicate entry '(\d+)'/) || [])[1];
           if (dupEan) {
             try {
-              const sr = await fetch(`https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`, { headers: { Authorization: token } });
+              const sr = await fetch(`https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`, { headers: { Authorization: currentToken } });
               const sd = await sr.json();
               const existingOpc = (sd?.results ?? sd?.payload ?? [])[0]?.opc ?? null;
               if (existingOpc) { existingMeta.push({ ...meta, opc: existingOpc }); }
@@ -1868,10 +1883,17 @@ async function processBulkImportJob(job) {
           ...(row.mpn           ? { mpn: row.mpn }                    : {}),
         };
       });
-      const p35Res  = await fetch('https://api.onbuy.com/v2/products', {
-        method: 'PUT', headers: { Authorization: token, 'Content-Type': 'application/json' },
+      let p35Res = await fetch('https://api.onbuy.com/v2/products', {
+        method: 'PUT', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
         body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
       });
+      if (p35Res.status === 401) {
+        await refreshToken();
+        p35Res = await fetch('https://api.onbuy.com/v2/products', {
+          method: 'PUT', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
+        });
+      }
       blog(`Phase 3.5 HTTP ${p35Res.status}: chunk ${Math.floor(i/CHUNK)+1}`);
     }
   }
@@ -1889,12 +1911,17 @@ async function processBulkImportJob(job) {
       let listingRes, listingData;
       for (let attempt = 1; attempt <= 3; attempt++) {
         listingRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, {
-          method: 'POST', headers: { Authorization: token, 'Content-Type': 'application/json' },
+          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
           body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings }),
         });
+        if (listingRes.status === 401) { await refreshToken(); continue; }
         listingData = await listingRes.json();
         if (!/does not yet exist for the site/i.test(JSON.stringify(listingData))) break;
         if (attempt < 3) { blog(`OPC not propagated — waiting 15 s`); await new Promise(res => setTimeout(res, 15_000)); }
+      }
+      if (!listingData) listingData = {};
+      if (!listingRes.ok && !listingData?.results) {
+        blog(`Phase 4 listing chunk HTTP ${listingRes.status}: ${JSON.stringify(listingData).slice(0, 300)}`);
       }
       const listingResults = listingData?.results ?? listingData?.payload ?? [];
       const updateNeeded   = [];
@@ -1903,7 +1930,7 @@ async function processBulkImportJob(job) {
         const lr  = Array.isArray(listingResults) ? listingResults[j] : null;
         const cnd = _bulkNormCond(m.row.condition);
         if (!listingRes.ok || lr?.success === false) {
-          const msg = lr?.message || listingData?.message || 'Listing rejected by OnBuy';
+          const msg = lr?.message || listingData?.message || listingData?.error?.message || `Listing rejected by OnBuy (HTTP ${listingRes.status})`;
           if (/already have a listing|listing already exist|duplicate listing/i.test(msg) && m.row.sku) {
             updateNeeded.push(m);
           } else {
@@ -1920,7 +1947,11 @@ async function processBulkImportJob(job) {
       }
       if (updateNeeded.length > 0) {
         const upd     = updateNeeded.map(({ row, sellingPrice }) => ({ sku: row.sku, price: sellingPrice, stock: parseInt(row.stock)||0, ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}) }));
-        const updRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, { method: 'PUT', headers: { Authorization: token, 'Content-Type': 'application/json' }, body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings: upd }) });
+        let updRes  = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, { method: 'PUT', headers: { Authorization: currentToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings: upd }) });
+        if (updRes.status === 401) {
+          await refreshToken();
+          updRes = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, { method: 'PUT', headers: { Authorization: currentToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings: upd }) });
+        }
         const updData = await updRes.json();
         const updResults = updData?.results ?? updData?.payload ?? [];
         for (let j = 0; j < updateNeeded.length; j++) {
@@ -1928,7 +1959,7 @@ async function processBulkImportJob(job) {
           const ur  = Array.isArray(updResults) ? updResults[j] : null;
           const cnd = _bulkNormCond(m.row.condition);
           if (!updRes.ok || ur?.success === false) {
-            const msg = ur?.message || updData?.message || 'Listing update rejected';
+            const msg = ur?.message || updData?.message || updData?.error?.message || 'Listing update rejected';
             results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
             db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'error',$14)`,
               [sessionId,userId,m.row._row,m.row.name,m.row.sku,m.row.ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,cnd,m.opc,msg]).catch(() => {});
