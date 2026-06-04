@@ -2093,7 +2093,7 @@ function AccountsPage() {
             </div>
             <div>
               <label style={labelStyle}>Secret Key</label>
-              <input style={fieldStyle} type="password" placeholder="••••••••••••"
+              <input style={fieldStyle} placeholder="••••••••••••"
                 value={form.secret_key} onChange={e => setForm(f => ({ ...f, secret_key:e.target.value }))} />
             </div>
             <div>
@@ -2212,13 +2212,21 @@ function AccountsPage() {
                     <div style={{ display:"flex", gap:6, flexShrink:0, alignItems:"center" }}>
                       <Btn small variant="secondary" loading={testing[a.id]}
                         onClick={() => testAccount(a.id)}>Test</Btn>
-                      <Btn small variant="secondary" onClick={() => {
+                      <Btn small variant="secondary" onClick={async () => {
                         setEditId(a.id);
-                        setForm({ account_name:a.account_name, consumer_key:"", secret_key:"", site_id:a.site_id,
+                        setForm({ account_name:a.account_name, consumer_key:"Loading…", secret_key:"Loading…", site_id:a.site_id,
                           keepa_email:a.keepa_email||"", keepa_password:"",
                           enable_puppeteer:a.enable_puppeteer===true,
                           enable_twister:a.enable_twister===true,
                           enable_cheerio:a.enable_cheerio===true });
+                        try {
+                          const full = await api(`/accounts/${a.id}`);
+                          if (full) setForm(f => ({ ...f,
+                            consumer_key: full.consumer_key || "",
+                            secret_key:   full.secret_key   || "",
+                            keepa_password: full.keepa_password || "",
+                          }));
+                        } catch {}
                       }}>Edit</Btn>
                       <button onClick={() => toggleActive(a)} title={a.is_active ? "Disable account" : "Enable account"} style={{
                         background: a.is_active ? "#00d4aa18" : "#ef444418",

@@ -821,6 +821,20 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/accounts/:id — fetch full credentials for edit form
+app.get('/api/accounts/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, account_name, consumer_key, secret_key, site_id, is_active,
+              keepa_email, keepa_password, enable_puppeteer, enable_twister, enable_cheerio
+       FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.effectiveUserId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Account not found' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // POST /api/accounts — create account
 app.post('/api/accounts', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id = '2000', keepa_email, keepa_password,
