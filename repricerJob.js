@@ -1227,7 +1227,7 @@ async function processKeepaJob(job) {
 
 const keepaWorker = new Worker('keepa-scrape', processKeepaJob, {
   connection:  redis,
-  concurrency: 1,          // only one Keepa browser session at a time
+  concurrency: parseInt(process.env.KEEPA_CONCURRENCY) || 3,
 });
 
 keepaWorker.on('active', (job) => {
@@ -1309,19 +1309,28 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
     if (!token) { plog(`[QueuePoller] No token for account ${accountId} — skipping`); continue; }
 
     for (let i = 0; i < queues.length; i += 1000) {
-      const batch  = queues.slice(i, i + 1000);
-      const ids    = batch.map(q => q.queue_id).join(',');
-
-      let pollMap = new Map();
-      try {
-        const pr   = await fetch(
-          `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
-          { headers: { Authorization: token } }
-        );
-        const pd   = await pr.json();
-        const list = pd?.results ?? [];
-        pollMap    = new Map(list.map(q => [q.queue_id, q]));
-      } catch (e) { plog(`[QueuePoller] Batch poll error: ${e.message}`); }
+      const batch   = queues.slice(i, i + 1000);
+      // Poll in sub-batches of 100 to stay under URL length limits
+      // (1000 IDs × 27 encoded chars ≈ 27 KB URL — gateways reject above ~8 KB)
+      const pollMap = new Map();
+      for (let j = 0; j < batch.length; j += 100) {
+        const subBatch = batch.slice(j, j + 100);
+        const ids      = subBatch.map(q => q.queue_id).join(',');
+        try {
+          const pr   = await fetch(
+            `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
+            { headers: { Authorization: token } }
+          );
+          const text = await pr.text();
+          let pd;
+          try { pd = JSON.parse(text); } catch {
+            plog(`[QueuePoller] Sub-batch poll error: not valid JSON (HTTP ${pr.status}) — skipping`);
+            continue;
+          }
+          const list = pd?.results ?? [];
+          for (const q of list) pollMap.set(q.queue_id, q);
+        } catch (e) { plog(`[QueuePoller] Sub-batch poll error: ${e.message}`); }
+      }
 
       plog(`[QueuePoller] Account ${accountId} batch: ${batch.length} polled → ${pollMap.size} results`);
 

@@ -1908,6 +1908,12 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   );
   const sessionId = session.id;
 
+  // Respond immediately — all phases run as background work to prevent nginx 504 on large imports
+  res.json({ sessionId, status: 'processing', total_rows: validRows.length });
+
+  // ── Background import phases ──────────────────────────────────────────────
+  try {
+
   // Per-session logger: writes to logs/bulk-import.log AND console
   const categoryCache = {};
 
@@ -1938,21 +1944,31 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   }
 
   // Batch-polls a set of queue IDs via GET /v2/queues?filter[queue_ids]=...
-  // Returns a Map of queueId → { status, opc, error_message, uid }
+  // Internally splits into sub-batches of 100 to stay under URL length limits
+  // (1000 × 27 chars per encoded ID ≈ 27 KB URL — most gateways reject above ~8 KB)
   async function batchPollQueues(queueIds) {
-    const ids = queueIds.join(',');
-    try {
-      const r = await fetch(
-        `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
-        { headers: { Authorization: token } }
-      );
-      const data = await r.json();
-      const list = data?.results ?? [];
-      return new Map(list.map(q => [q.queue_id, q]));
-    } catch (e) {
-      blog(`Batch poll error: ${e.message}`);
-      return new Map();
+    const resultMap = new Map();
+    for (let i = 0; i < queueIds.length; i += 100) {
+      const chunk = queueIds.slice(i, i + 100);
+      const ids   = chunk.join(',');
+      try {
+        const r = await fetch(
+          `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
+          { headers: { Authorization: token } }
+        );
+        const text = await r.text();
+        let data;
+        try { data = JSON.parse(text); } catch {
+          blog(`Batch poll sub-batch ${Math.floor(i/100)+1} error: not valid JSON (HTTP ${r.status}) — skipping`);
+          continue;
+        }
+        const list = data?.results ?? [];
+        for (const q of list) resultMap.set(q.queue_id, q);
+      } catch (e) {
+        blog(`Batch poll sub-batch ${Math.floor(i/100)+1} error: ${e.message}`);
+      }
     }
+    return resultMap;
   }
 
   // ── Phase 1a: Batch EAN search — up to 50 EANs per GET (600/hr GET limit) ──
@@ -1960,29 +1976,39 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   const rowsWithEan = validRows.filter(r => r.ean);
   const eanOpcMap   = new Map(); // EAN string → opc
 
-  blog(`Phase 1: batch EAN search — ${rowsWithEan.length} row(s) with EAN, ${validRows.length - rowsWithEan.length} without`);
-  for (let i = 0; i < rowsWithEan.length; i += 50) {
-    const chunk = rowsWithEan.slice(i, i + 50);
-    const eans  = chunk.map(r => r.ean).join(',');
-    try {
-      const r = await fetch(
-        `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(eans)}`,
-        { headers: { Authorization: token } }
-      );
-      const data     = await r.json();
-      const products = data?.results ?? data?.payload ?? [];
-      for (const p of products) {
-        const opc   = p.opc ?? p.product_code ?? null;
-        const codes = Array.isArray(p.product_codes) ? p.product_codes : [];
-        for (const code of codes) eanOpcMap.set(String(code).trim(), opc);
+  blog(`Phase 1: batch EAN search — ${rowsWithEan.length} row(s) with EAN (10 parallel batches of 50)`);
+  const eanBatches = [];
+  for (let i = 0; i < rowsWithEan.length; i += 50)
+    eanBatches.push({ chunk: rowsWithEan.slice(i, i + 50), batchNum: Math.floor(i / 50) + 1 });
+  for (let i = 0; i < eanBatches.length; i += 10) {
+    await Promise.all(eanBatches.slice(i, i + 10).map(async ({ chunk, batchNum }) => {
+      const eans = chunk.map(r => r.ean).join(',');
+      try {
+        const r = await fetch(
+          `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(eans)}`,
+          { headers: { Authorization: token } }
+        );
+        const data     = await r.json();
+        const products = data?.results ?? data?.payload ?? [];
+        for (const p of products) {
+          const opc   = p.opc ?? p.product_code ?? null;
+          const codes = Array.isArray(p.product_codes) ? p.product_codes : [];
+          for (const code of codes) eanOpcMap.set(String(code).trim(), opc);
+        }
+        blog(`EAN batch ${batchNum}: searched ${chunk.length} EAN(s) → ${products.length} match(es)`);
+      } catch (e) {
+        blog(`EAN batch ${batchNum} error: ${e.message} — treating these rows as new products`);
       }
-      blog(`EAN batch ${Math.floor(i / 50) + 1}: searched ${chunk.length} EAN(s) → ${products.length} match(es)`);
-    } catch (e) {
-      blog(`EAN batch ${Math.floor(i / 50) + 1} error: ${e.message} — treating these rows as new products`);
-    }
+    }));
   }
 
   // ── Phase 1b: Category lookup + distribute into existingMeta / newMeta ──
+  // Pre-fetch all unique category names in parallel so the loop below only hits cache
+  const uniqueCats = [...new Set(validRows.map(r => r.category).filter(Boolean))];
+  for (let i = 0; i < uniqueCats.length; i += 5)
+    await Promise.all(uniqueCats.slice(i, i + 5).map(cat => lookupCategoryId(cat)));
+  blog(`Phase 1b: pre-fetched ${uniqueCats.length} unique category name(s)`);
+
   const existingMeta = []; // OPC known from EAN search — listing only
   const newMeta      = []; // no OPC — needs product creation
 
@@ -2447,8 +2473,31 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
      WHERE id=$6`,
     [results.product_created, results.listing_created, results.listing_updated, results.skipped, results.errors.length, sessionId]
   );
+  blog(`Import complete — products:${results.product_created} listings:${results.listing_created} skipped:${results.skipped} errors:${results.errors.length}`);
 
-  res.json({ ...results, session_id: sessionId });
+  } catch (bgErr) {
+    console.error(`[BulkImport] session=${sessionId} fatal background error:`, bgErr.message);
+    db.query(
+      `UPDATE onbuy_bulk_import_sessions SET status='failed', completed_at=NOW() WHERE id=$1`,
+      [sessionId]
+    ).catch(() => {});
+  }
+});
+
+// GET /api/onbuy-bulk/sessions/:sessionId — live status for a background import
+app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, account_name, total_rows, products_created, listings_created,
+              listings_updated, skipped, errors_count, pending_queues, status, created_at, completed_at
+       FROM onbuy_bulk_import_sessions WHERE id = $1 AND user_id = $2`,
+      [req.params.sessionId, req.effectiveUserId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/onbuy-bulk/history — import sessions for the current user
@@ -2709,6 +2758,84 @@ app.get('/api/import/logs', requireAuth, async (req, res) => {
       : await db.query(`SELECT * FROM import_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`, [req.effectiveUserId]);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────
+// DELETE LISTINGS
+// ─────────────────────────────────────────────
+
+// POST /api/delete-listings/preview — parse uploaded Excel, return SKUs from "Seller SKU" column
+app.post('/api/delete-listings/preview', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb      = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws      = wb.Sheets[wb.SheetNames[0]];
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (allRows.length < 2) return res.json({ total: 0, rows: [] });
+
+    const headerRow = allRows[0].map(h => String(h || '').trim().toLowerCase());
+    const skuColIdx = headerRow.findIndex(h =>
+      ['seller sku', 'seller_sku', 'sellersku', 'sku'].includes(h)
+    );
+    if (skuColIdx === -1) return res.status(400).json({ error: 'Could not find a "Seller SKU" column in the file' });
+
+    const rows = allRows.slice(1)
+      .map((row, i) => ({
+        _row: i + 2,
+        sku:  String(row[skuColIdx] || '').trim(),
+        name: String(row[1] || '').trim(),
+      }))
+      .filter(r => r.sku);
+
+    res.json({ total: rows.length, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/delete-listings/delete — delete listings in batches of 1000
+app.post('/api/delete-listings/delete', requireAuth, async (req, res) => {
+  const { skus, onbuy_account_id } = req.body;
+  if (!skus?.length)      return res.status(400).json({ error: 'No SKUs provided' });
+  if (!onbuy_account_id) return res.status(400).json({ error: 'No account selected' });
+
+  try {
+    const { rows: acctRows } = await db.query(
+      `SELECT * FROM onbuy_accounts WHERE id = $1 LIMIT 1`,
+      [onbuy_account_id]
+    );
+    if (!acctRows[0]) return res.status(404).json({ error: 'Account not found' });
+
+    const account = acctRows[0];
+    const token   = await getTokenForAccount(account);
+    if (!token) return res.status(500).json({ error: 'Could not obtain auth token for account' });
+
+    const siteId = parseInt(account.site_id) || 2000;
+    const BATCH  = 1000;
+    const perSku = {};
+    let deleted = 0, notFound = 0, failed = 0;
+
+    for (let i = 0; i < skus.length; i += BATCH) {
+      const batch = skus.slice(i, i + BATCH);
+      const r     = await fetch('https://api.onbuy.com/v2/listings/by-sku', {
+        method:  'DELETE',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ site_id: siteId, skus: batch }),
+      });
+      const data        = await r.json();
+      const batchResult = data?.results ?? {};
+      for (const [sku, outcome] of Object.entries(batchResult)) {
+        perSku[sku] = outcome;
+        if (outcome.status === 'ok')                deleted++;
+        else if (outcome.error === 'SKU not found') notFound++;
+        else                                        failed++;
+      }
+    }
+
+    res.json({ total: skus.length, deleted, notFound, failed, results: perSku });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────

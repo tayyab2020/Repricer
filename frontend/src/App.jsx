@@ -1772,7 +1772,8 @@ export default function App() {
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
     { id:"import",         label:"📥 Import Listings" },
     { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
-    { id:"sku-change",     label:"🔄 SKU Change" },
+    // { id:"sku-change",     label:"🔄 SKU Change" },
+    { id:"delete-listings", label:"🗑️ Delete Listings" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
@@ -1958,7 +1959,8 @@ export default function App() {
             {page === "accounts"       && "Connect and manage your OnBuy seller accounts"}
             {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
             {page === "onbuy-bulk"     && "Create new products and listings directly on your OnBuy store"}
-            {page === "sku-change"     && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
+            {page === "sku-change"       && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
+            {page === "delete-listings" && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
             {page === "settings"       && "Configure proxies and global repricer options"}
             {page === "logs"           && "Real-time output from API server and job worker"}
             {page === "users"          && "Manage user accounts and impersonate users"}
@@ -1973,7 +1975,8 @@ export default function App() {
         {page === "accounts"       && <AccountsPage />}
         {page === "import"         && <ImportPage />}
         {page === "onbuy-bulk"     && <OnBuyBulkPage />}
-        {page === "sku-change"     && <SkuChangePage />}
+        {page === "sku-change"       && <SkuChangePage />}
+        {page === "delete-listings"  && <DeleteListingsPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
@@ -3070,6 +3073,8 @@ function OnBuyBulkPage() {
   // Pending queue tracking
   const [pendingStatus, setPendingStatus] = useState(null); // { pending, listing_created, failed, total }
   const pendingPollRef = useRef(null);
+  // Import background polling
+  const importPollRef = useRef(null);
 
   // History state
   const [history, setHistory]           = useState([]);
@@ -3106,8 +3111,30 @@ function OnBuyBulkPage() {
   }
 
   useEffect(() => {
-    return () => { if (pendingPollRef.current) clearInterval(pendingPollRef.current); };
+    return () => {
+      if (pendingPollRef.current) clearInterval(pendingPollRef.current);
+      if (importPollRef.current) clearInterval(importPollRef.current);
+    };
   }, []);
+
+  function startImportPoll(sessionId) {
+    if (importPollRef.current) clearInterval(importPollRef.current);
+    importPollRef.current = setInterval(async () => {
+      try {
+        const s = await api(`/onbuy-bulk/sessions/${sessionId}`);
+        if (!s) return;
+        setResult(s);
+        if (s.status === 'completed' || s.status === 'failed') {
+          clearInterval(importPollRef.current);
+          importPollRef.current = null;
+          if (parseInt(s.pending_queues) > 0) {
+            setPendingStatus({ pending: s.pending_queues, listing_created: 0, failed: 0, total: s.pending_queues });
+            startPendingPoll();
+          }
+        }
+      } catch {}
+    }, 3000);
+  }
 
   async function loadHistory() {
     setHistLoading(true);
@@ -3156,16 +3183,18 @@ function OnBuyBulkPage() {
         method: "POST",
         body: JSON.stringify({ rows: preview.rows, account_id: accountId }),
       });
-      setResult(r); setStep(3);
-      if (r?.pending_queues > 0) {
-        setPendingStatus({ pending: r.pending_queues, listing_created: 0, failed: 0, total: r.pending_queues });
-        startPendingPoll();
-      }
+      // Server responds immediately with { sessionId, status: 'processing', total_rows }
+      setResult({ ...r, products_created: 0, listings_created: 0, listings_updated: 0, skipped: 0, errors_count: 0 });
+      setStep(3);
+      startImportPoll(r.sessionId);
     } catch (e) { setErr(String(e.message || e)); }
     setImporting(false); setLoading(false);
   }
 
-  const reset = () => { setStep(1); setFile(null); setPreview(null); setResult(null); setErr(""); };
+  const reset = () => {
+    if (importPollRef.current) { clearInterval(importPollRef.current); importPollRef.current = null; }
+    setStep(1); setFile(null); setPreview(null); setResult(null); setErr("");
+  };
 
   const dropStyle = {
     border: `2px dashed ${dragOver ? C.accent : C.border}`,
@@ -3336,26 +3365,6 @@ function OnBuyBulkPage() {
 
       {/* ── Import Tab ── */}
       {tab === "import" && <>
-      {importing && (
-        <div style={{
-          position: "fixed", inset: 0, zIndex: 9999,
-          background: "rgba(5,8,18,0.92)", backdropFilter: "blur(6px)",
-          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 28,
-        }}>
-          <div style={{ position: "relative", width: 80, height: 80 }}>
-            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid ${C.border}` }} />
-            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid transparent`,
-              borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
-            <div style={{ position: "absolute", inset: 10, borderRadius: "50%", border: `3px solid transparent`,
-              borderTopColor: C.blue, animation: "spin 1.4s linear infinite reverse" }} />
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ color: C.text, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Creating OnBuy Products</div>
-            <div style={{ color: C.accent, fontSize: 14 }}>Searching, creating products and listings…</div>
-            <div style={{ color: C.muted, fontSize: 12, marginTop: 16 }}>Please don't close this window</div>
-          </div>
-        </div>
-      )}
 
       <div style={{ display: "flex", gap: 0, marginBottom: 28 }}>
         {[["1","Upload File"],["2","Review Rows"],["3","Done"]].map(([n, label], i) => (
@@ -3542,61 +3551,301 @@ function OnBuyBulkPage() {
         </div>
       )}
 
-      {/* Step 3 — Results */}
-      {step === 3 && result && (
-        <Section title="Import Complete">
+      {/* Step 3 — Processing / Results */}
+      {step === 3 && result && result.status === 'processing' && (
+        <Section title="Import Running">
+          <div style={{ padding: "28px 24px", textAlign: "center" }}>
+            <div style={{ position: "relative", width: 64, height: 64, margin: "0 auto 20px" }}>
+              <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid ${C.border}` }} />
+              <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid transparent`,
+                borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
+            </div>
+            <div style={{ color: C.accent, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>
+              Processing {(result.total_rows || 0).toLocaleString()} products…
+            </div>
+            <div style={{ color: C.muted, fontSize: 13, marginBottom: 24 }}>
+              Searching EANs, creating products and listings on OnBuy. This can take a few minutes for large files.
+            </div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap", marginBottom: 16 }}>
+              {[
+                ["Products Created", result.products_created, C.blue],
+                ["Listings Created", result.listings_created, C.accent],
+                ["Pending Queues",   result.pending_queues,   C.amber],
+                ["Skipped",          result.skipped,          C.red],
+              ].map(([label, val, color]) => (
+                <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`,
+                  borderRadius: 10, padding: "12px 20px", minWidth: 110 }}>
+                  <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase", marginBottom: 4 }}>{label}</div>
+                  <div style={{ color, fontSize: 22, fontWeight: 700 }}>{parseInt(val) || 0}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ color: C.muted, fontSize: 11 }}>Updating every 3 s…</div>
+          </div>
+        </Section>
+      )}
+
+      {step === 3 && result && result.status !== 'processing' && (
+        <Section title={result.status === 'failed' ? "Import Failed" : "Import Complete"}>
           <div style={{ padding: "28px 24px" }}>
-            <div style={{ textAlign: "center", marginBottom: result.errors?.length ? 24 : 0 }}>
+            <div style={{ textAlign: "center", marginBottom: 24 }}>
               <div style={{ fontSize: 48, marginBottom: 12 }}>
-                {result.listing_created > 0 ? "🎉" : "⚠️"}
+                {result.status === 'failed' ? "❌" : parseInt(result.listings_created) > 0 ? "🎉" : "⚠️"}
               </div>
-              <div style={{ color: result.listing_created > 0 ? C.accent : C.amber,
-                fontSize: 26, fontWeight: 700, marginBottom: 8 }}>
-                {result.listing_created} listing{result.listing_created !== 1 ? "s" : ""} created on OnBuy
-              </div>
-              {result.product_created > 0 && (
+              {result.status === 'failed' ? (
+                <div style={{ color: C.red, fontSize: 22, fontWeight: 700, marginBottom: 8 }}>
+                  Import failed — check server logs for details
+                </div>
+              ) : (
+                <div style={{ color: parseInt(result.listings_created) > 0 ? C.accent : C.amber,
+                  fontSize: 22, fontWeight: 700, marginBottom: 8 }}>
+                  {parseInt(result.listings_created)} listing{parseInt(result.listings_created) !== 1 ? "s" : ""} created on OnBuy
+                </div>
+              )}
+              {parseInt(result.products_created) > 0 && (
                 <div style={{ color: C.blue, fontSize: 14, marginBottom: 6 }}>
-                  {result.product_created} new product{result.product_created !== 1 ? "s" : ""} created
+                  {parseInt(result.products_created)} new product{parseInt(result.products_created) !== 1 ? "s" : ""} created
                 </div>
               )}
-              {result.pending_queues > 0 && (
+              {parseInt(result.pending_queues) > 0 && (
                 <div style={{ color: C.amber, fontSize: 14, marginBottom: 6 }}>
-                  {result.pending_queues} product queue{result.pending_queues !== 1 ? "s" : ""} still pending —
-                  background worker will create their listings automatically (check every 15 min)
+                  {parseInt(result.pending_queues)} product queue{parseInt(result.pending_queues) !== 1 ? "s" : ""} still pending —
+                  background worker will create listings automatically every 15 min
                 </div>
               )}
-              {result.skipped > 0 && (
+              {parseInt(result.skipped) > 0 && (
                 <div style={{ color: C.red, fontSize: 14 }}>
-                  {result.skipped} row{result.skipped !== 1 ? "s" : ""} skipped due to errors
+                  {parseInt(result.skipped)} row{parseInt(result.skipped) !== 1 ? "s" : ""} skipped due to errors
+                </div>
+              )}
+              {parseInt(result.errors_count) > 0 && (
+                <div style={{ color: C.muted, fontSize: 13, marginTop: 8 }}>
+                  {parseInt(result.errors_count)} error{parseInt(result.errors_count) !== 1 ? "s" : ""} — see History tab for details
                 </div>
               )}
             </div>
-
-            {result.errors?.length > 0 && (
-              <div style={{ marginTop: 20 }}>
-                <div style={{ color: C.amber, fontWeight: 600, fontSize: 13, marginBottom: 8 }}>
-                  Error details:
-                </div>
-                <div style={{ maxHeight: 280, overflowY: "auto" }}>
-                  {result.errors.map((e, i) => (
-                    <div key={i} style={{ background: "#ef444411", border: `1px solid #ef444433`,
-                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
-                      <span style={{ color: C.red, fontWeight: 600 }}>Row {e.row}</span>
-                      {e.product && <span style={{ color: C.textDim }}> — {e.product}</span>}
-                      <div style={{ color: C.muted, marginTop: 2 }}>{e.error}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div style={{ textAlign: "center", marginTop: 24 }}>
+            <div style={{ textAlign: "center", marginTop: 24, display: "flex", gap: 12, justifyContent: "center" }}>
               <Btn onClick={reset}>Import More</Btn>
+              <Btn variant="secondary" onClick={() => setTab("history")}>View History</Btn>
             </div>
           </div>
         </Section>
       )}
       </>}
+    </div>
+  );
+}
+
+function DeleteListingsPage() {
+  const [step, setStep]           = useState(1);
+  const [accounts, setAccounts]   = useState([]);
+  const [accountId, setAccountId] = useState("");
+  const [file, setFile]           = useState(null);
+  const [preview, setPreview]     = useState(null);
+  const [result, setResult]       = useState(null);
+  const [loading, setLoading]     = useState(false);
+  const [err, setErr]             = useState("");
+  const [dragOver, setDragOver]   = useState(false);
+
+  useEffect(() => {
+    api("/accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  async function parseFile(f) {
+    setErr(""); setLoading(true); setFile(f);
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/delete-listings/preview`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
+      if (!r.ok) throw new Error((await r.json()).error || await r.text());
+      const data = await r.json();
+      if (!data.total) throw new Error("No SKUs found — make sure the file has a 'Seller SKU' column");
+      setPreview(data); setStep(2);
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  }
+
+  async function runDelete() {
+    if (!accountId) { setErr("Please select an OnBuy account"); return; }
+    setLoading(true); setErr("");
+    try {
+      const r = await api("/delete-listings/delete", {
+        method: "POST",
+        body: JSON.stringify({ skus: preview.rows.map(r => r.sku), onbuy_account_id: accountId }),
+      });
+      if (!r) { setLoading(false); return; }
+      setResult(r); setStep(3);
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  }
+
+  function reset() { setStep(1); setFile(null); setPreview(null); setResult(null); setErr(""); }
+
+  const STEPS = ["Upload File", "Review SKUs", "Results"];
+  const dropStyle = {
+    border: `2px dashed ${dragOver ? "#ef4444" : C.border}`,
+    borderRadius: 12, padding: "40px 24px", textAlign: "center",
+    cursor: "pointer", background: dragOver ? "#ef444411" : "transparent", transition: "all 0.2s",
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 28, alignItems: "center" }}>
+        {STEPS.map((label, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{
+              width: 24, height: 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+              background: step > i + 1 ? C.accent : step === i + 1 ? C.accentDim : "transparent",
+              border: `2px solid ${step >= i + 1 ? C.accent : C.border}`,
+              fontSize: 11, fontWeight: 700, color: step > i + 1 ? C.bg : step === i + 1 ? C.accent : C.muted,
+            }}>
+              {step > i + 1 ? "✓" : i + 1}
+            </div>
+            <span style={{ color: step === i + 1 ? C.text : C.muted, fontWeight: step === i + 1 ? 700 : 400, fontSize: 13 }}>{label}</span>
+            {i < STEPS.length - 1 && <span style={{ color: C.border, margin: "0 4px" }}>›</span>}
+          </div>
+        ))}
+      </div>
+
+      {err && (
+        <div style={{ background: "#ef444422", border: "1px solid #ef4444", borderRadius: 8,
+          padding: "10px 16px", color: "#ef4444", fontSize: 13, marginBottom: 16 }}>{err}</div>
+      )}
+
+      {step === 1 && (
+        <Section>
+          <div
+            style={dropStyle}
+            onClick={() => document.getElementById("del-file-input").click()}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) parseFile(f); }}
+          >
+            <div style={{ fontSize: 32, marginBottom: 8 }}>🗑️</div>
+            <div style={{ color: C.text, fontWeight: 600, fontSize: 15 }}>
+              {file ? file.name : "Drop your .xlsx or .xls file here"}
+            </div>
+            <input id="del-file-input" type="file" accept=".xlsx,.xls" style={{ display: "none" }}
+              onChange={e => { const f = e.target.files[0]; if (f) parseFile(f); e.target.value = ""; }} />
+            <div style={{ color: C.muted, fontSize: 12, marginTop: 6 }}>
+              {loading ? "Parsing file…" : "or click to browse — file must have a 'Seller SKU' column"}
+            </div>
+          </div>
+        </Section>
+      )}
+
+      {step === 2 && preview && (
+        <div>
+          <div style={{ background: "#ef444415", border: "1px solid #ef444455", borderRadius: 10,
+            padding: "14px 18px", marginBottom: 20, display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 20 }}>⚠️</span>
+            <div>
+              <div style={{ color: "#ef4444", fontWeight: 700, fontSize: 14 }}>This action cannot be undone</div>
+              <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>
+                {preview.total} listing{preview.total !== 1 ? "s" : ""} will be permanently deleted from OnBuy.
+              </div>
+            </div>
+          </div>
+
+          <Section>
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>OnBuy Account</label>
+              <select value={accountId} onChange={e => setAccountId(e.target.value)}
+                style={{ background: C.card, color: C.text, border: `1px solid ${C.border}`,
+                  borderRadius: 8, padding: "8px 12px", fontSize: 13, width: "100%", maxWidth: 320 }}>
+                <option value="">Select account…</option>
+                {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+              </select>
+            </div>
+
+            <div style={{ color: C.muted, fontSize: 12, marginBottom: 10 }}>
+              Showing {Math.min(preview.rows.length, 50)} of {preview.total} SKU{preview.total !== 1 ? "s" : ""}
+            </div>
+            <div style={{ maxHeight: 320, overflowY: "auto", marginBottom: 20 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <th style={{ padding: "6px 10px", color: C.muted, textAlign: "left", fontWeight: 600 }}>Row</th>
+                    <th style={{ padding: "6px 10px", color: C.muted, textAlign: "left", fontWeight: 600 }}>Seller SKU</th>
+                    <th style={{ padding: "6px 10px", color: C.muted, textAlign: "left", fontWeight: 600 }}>Product Name</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {preview.rows.slice(0, 50).map((r, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}20` }}>
+                      <td style={{ padding: "6px 10px", color: C.muted }}>{r._row}</td>
+                      <td style={{ padding: "6px 10px", color: C.text, fontFamily: "monospace" }}>{r.sku}</td>
+                      <td style={{ padding: "6px 10px", color: C.textDim }}>{r.name || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ display: "flex", gap: 10 }}>
+              <Btn variant="secondary" onClick={reset}>Cancel</Btn>
+              <Btn onClick={runDelete} disabled={loading || !accountId}
+                style={{ background: "#ef4444", borderColor: "#ef4444" }}>
+                {loading ? "Deleting…" : `Delete ${preview.total} Listing${preview.total !== 1 ? "s" : ""}`}
+              </Btn>
+            </div>
+          </Section>
+        </div>
+      )}
+
+      {step === 3 && result && (
+        <Section>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
+            <StatCard label="Total"     value={result.total}    color={C.text} />
+            <StatCard label="Deleted"   value={result.deleted}  color={C.accent} />
+            <StatCard label="Not Found" value={result.notFound} color={C.amber} />
+            <StatCard label="Failed"    value={result.failed}   color={C.red} />
+          </div>
+
+          {result.failed > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Failed SKUs</div>
+              <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                {Object.entries(result.results)
+                  .filter(([, v]) => v.status !== "ok" && v.error !== "SKU not found")
+                  .map(([sku, v], i) => (
+                    <div key={i} style={{ background: "#ef444411", border: "1px solid #ef444433",
+                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
+                      <span style={{ color: "#ef4444", fontWeight: 600, fontFamily: "monospace" }}>{sku}</span>
+                      <span style={{ color: C.muted, marginLeft: 10 }}>{v.error || "Unknown error"}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          {result.notFound > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Not Found on OnBuy</div>
+              <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                {Object.entries(result.results)
+                  .filter(([, v]) => v.error === "SKU not found")
+                  .map(([sku], i) => (
+                    <div key={i} style={{ background: `${C.amber}15`, border: `1px solid ${C.amber}44`,
+                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
+                      <span style={{ color: C.amber, fontFamily: "monospace" }}>{sku}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ textAlign: "center", marginTop: 24 }}>
+            <Btn onClick={reset}>Delete More</Btn>
+          </div>
+        </Section>
+      )}
     </div>
   );
 }
