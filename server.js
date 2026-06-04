@@ -1966,10 +1966,24 @@ app.post('/api/onbuy-bulk/sessions/:sessionId/cancel', requireAuth, async (req, 
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
-              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at, s.completed_at,
-              COALESCE(pq.pending_count, 0) AS pending_queues
+      `SELECT s.id, s.account_name, s.total_rows, s.status, s.created_at, s.completed_at,
+              COALESCE(ic.products_created, 0)  AS products_created,
+              COALESCE(ic.listings_created, 0)  AS listings_created,
+              COALESCE(ic.listings_updated, 0)  AS listings_updated,
+              COALESCE(ic.errors_count, 0)       AS errors_count,
+              COALESCE(ic.errors_count, 0)       AS skipped,
+              COALESCE(pq.pending_count, 0)      AS pending_queues
        FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id,
+           COUNT(*) FILTER (WHERE status = 'product_created')  AS products_created,
+           COUNT(*) FILTER (WHERE status = 'listing_created')  AS listings_created,
+           COUNT(*) FILTER (WHERE status = 'listing_updated')  AS listings_updated,
+           COUNT(*) FILTER (WHERE status = 'error')            AS errors_count
+         FROM onbuy_bulk_import_items
+         WHERE session_id = $1
+         GROUP BY session_id
+       ) ic ON ic.session_id = s.id
        LEFT JOIN (
          SELECT session_id, COUNT(*) AS pending_count
          FROM onbuy_bulk_pending_queues
@@ -1990,10 +2004,28 @@ app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => 
 app.get('/api/onbuy-bulk/active-session', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
-              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at,
-              COALESCE(pq.pending_count, 0) AS pending_queues
+      `SELECT s.id, s.account_name, s.total_rows, s.status, s.created_at,
+              COALESCE(ic.products_created, 0)  AS products_created,
+              COALESCE(ic.listings_created, 0)  AS listings_created,
+              COALESCE(ic.listings_updated, 0)  AS listings_updated,
+              COALESCE(ic.errors_count, 0)       AS errors_count,
+              COALESCE(ic.errors_count, 0)       AS skipped,
+              COALESCE(pq.pending_count, 0)      AS pending_queues
        FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id,
+           COUNT(*) FILTER (WHERE status = 'product_created')  AS products_created,
+           COUNT(*) FILTER (WHERE status = 'listing_created')  AS listings_created,
+           COUNT(*) FILTER (WHERE status = 'listing_updated')  AS listings_updated,
+           COUNT(*) FILTER (WHERE status = 'error')            AS errors_count
+         FROM onbuy_bulk_import_items
+         WHERE session_id IN (
+           SELECT id FROM onbuy_bulk_import_sessions
+           WHERE user_id = $1 AND status = 'processing'
+           ORDER BY created_at DESC LIMIT 1
+         )
+         GROUP BY session_id
+       ) ic ON ic.session_id = s.id
        LEFT JOIN (
          SELECT session_id, COUNT(*) AS pending_count
          FROM onbuy_bulk_pending_queues
@@ -2015,10 +2047,24 @@ app.get('/api/onbuy-bulk/active-session', requireAuth, async (req, res) => {
 app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
-              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at, s.completed_at,
-              COALESCE(pq.pending_count, 0) AS pending_queues
+      `SELECT s.id, s.account_name, s.total_rows, s.status, s.created_at, s.completed_at,
+              COALESCE(ic.products_created, 0)  AS products_created,
+              COALESCE(ic.listings_created, 0)  AS listings_created,
+              COALESCE(ic.listings_updated, 0)  AS listings_updated,
+              COALESCE(ic.errors_count, 0)       AS errors_count,
+              COALESCE(ic.errors_count, 0)       AS skipped,
+              COALESCE(pq.pending_count, 0)      AS pending_queues
        FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id,
+           COUNT(*) FILTER (WHERE status = 'product_created')  AS products_created,
+           COUNT(*) FILTER (WHERE status = 'listing_created')  AS listings_created,
+           COUNT(*) FILTER (WHERE status = 'listing_updated')  AS listings_updated,
+           COUNT(*) FILTER (WHERE status = 'error')            AS errors_count
+         FROM onbuy_bulk_import_items
+         WHERE user_id = $1
+         GROUP BY session_id
+       ) ic ON ic.session_id = s.id
        LEFT JOIN (
          SELECT session_id, COUNT(*) AS pending_count
          FROM onbuy_bulk_pending_queues
