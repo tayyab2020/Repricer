@@ -1955,9 +1955,17 @@ app.post('/api/onbuy-bulk/sessions/:sessionId/cancel', requireAuth, async (req, 
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT id, account_name, total_rows, products_created, listings_created,
-              listings_updated, skipped, errors_count, pending_queues, status, created_at, completed_at
-       FROM onbuy_bulk_import_sessions WHERE id = $1 AND user_id = $2`,
+      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
+              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at, s.completed_at,
+              COALESCE(pq.pending_count, 0) AS pending_queues
+       FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id, COUNT(*) AS pending_count
+         FROM onbuy_bulk_pending_queues
+         WHERE status = 'pending'
+         GROUP BY session_id
+       ) pq ON pq.session_id = s.id
+       WHERE s.id = $1 AND s.user_id = $2`,
       [req.params.sessionId, req.effectiveUserId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
@@ -1971,11 +1979,18 @@ app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => 
 app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT id, account_name, total_rows, products_created, listings_created,
-              listings_updated, skipped, errors_count, pending_queues, status, created_at, completed_at
-       FROM onbuy_bulk_import_sessions
-       WHERE user_id = $1
-       ORDER BY created_at DESC
+      `SELECT s.id, s.account_name, s.total_rows, s.products_created, s.listings_created,
+              s.listings_updated, s.skipped, s.errors_count, s.status, s.created_at, s.completed_at,
+              COALESCE(pq.pending_count, 0) AS pending_queues
+       FROM onbuy_bulk_import_sessions s
+       LEFT JOIN (
+         SELECT session_id, COUNT(*) AS pending_count
+         FROM onbuy_bulk_pending_queues
+         WHERE user_id = $1 AND status = 'pending'
+         GROUP BY session_id
+       ) pq ON pq.session_id = s.id
+       WHERE s.user_id = $1
+       ORDER BY s.created_at DESC
        LIMIT 50`,
       [req.effectiveUserId]
     );
