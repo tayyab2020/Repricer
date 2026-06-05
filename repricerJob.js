@@ -1575,7 +1575,7 @@ async function processBulkImportJob(job) {
   const results = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
   const categoryCache = {};
   const CHUNK        = 1000; // listing creation (Phase 4) — small payload per item
-  const CREATE_CHUNK = 500;  // product creation (Phase 2/3.5) — large payload (desc + images)
+  const CREATE_CHUNK = 100;  // product creation (Phase 2/3.5) — large payload (desc + images)
   let currentToken = token; // mutable so we can refresh mid-job
 
   async function refreshToken() {
@@ -1808,22 +1808,29 @@ async function processBulkImportJob(job) {
       };
     });
     blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CREATE_CHUNK)+1} of ${Math.ceil(toCreate.length/CREATE_CHUNK)})`);
-    let createRes = await fetch('https://api.onbuy.com/v2/products', {
-      method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-    });
-    if (createRes.status === 401) {
-      await refreshToken();
+    let createRes, createData;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) {
+        blog(`Phase 2 chunk retry ${attempt}/3 — waiting 30s…`);
+        await new Promise(r => setTimeout(r, 30_000));
+      }
       createRes = await fetch('https://api.onbuy.com/v2/products', {
         method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
         body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
       });
-    }
-    let createData;
-    try { createData = await createRes.json(); }
-    catch (jsonErr) {
-      const txt = await createRes.text().catch(() => '');
-      throw new Error(`Phase 2 HTTP ${createRes.status} — non-JSON response: ${txt.slice(0, 300)}`);
+      if (createRes.status === 401) {
+        await refreshToken();
+        createRes = await fetch('https://api.onbuy.com/v2/products', {
+          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
+        });
+      }
+      try { createData = await createRes.json(); break; }
+      catch (jsonErr) {
+        const txt = await createRes.text().catch(() => '');
+        if (attempt === 3) throw new Error(`Phase 2 HTTP ${createRes.status} — non-JSON response: ${txt.slice(0, 300)}`);
+        blog(`Phase 2 HTTP ${createRes.status} non-JSON (attempt ${attempt}/3): ${txt.slice(0, 200)}`);
+      }
     }
     blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 1000)}`);
     for (let j = 0; j < chunk.length; j++) {
