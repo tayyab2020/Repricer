@@ -1,2 +1,5 @@
 npx puppeteer browsers install chrome
-pm2 restart repricer-worker
+crontab -e
+1
+0 * * * * find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +120 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +120 -exec rm -rf {} + 2>/dev/null
+pm2 restart all

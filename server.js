@@ -27,10 +27,12 @@ import jwt from 'jsonwebtoken';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { mkdirSync(join(__dirname, 'logs'), { recursive: true }); } catch {}
 
-// Clean up stale Puppeteer temp profiles left by prior crashes/restarts
-try {
-  spawn('sh', ['-c', 'find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +30 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +30 -exec rm -rf {} + 2>/dev/null'], { detached: true, stdio: 'ignore' }).unref();
-} catch {}
+// Clean up stale Puppeteer temp profiles left by prior crashes/restarts (Linux only)
+if (process.platform === 'linux') {
+  try {
+    spawn('sh', ['-c', 'find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +30 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +30 -exec rm -rf {} + 2>/dev/null'], { detached: true, stdio: 'ignore' }).unref();
+  } catch {}
+}
 
 dotenv.config();
 
