@@ -1802,32 +1802,62 @@ function findBulkColIdx(headers, aliases) {
   return headers.findIndex(h => aliases.some(a => norm(h) === norm(a) || norm(h).includes(norm(a))));
 }
 
-// GET /api/onbuy-bulk/template — download blank import template
+// GET /api/onbuy-bulk/template — download blank import template (columns match zaykan111 export format)
 app.get('/api/onbuy-bulk/template', requireAuth, (req, res) => {
   const headers = [
-    'Product Name', 'Category Name', 'Brand', 'EAN', 'MPN',
-    'Condition', 'Description', 'Image URL 1', 'Image URL 2', 'Image URL 3',
-    'SKU', 'Price (£)', 'Stock', 'Delivery Weight (kg)',
+    'SKU', 'Product_Name', 'Description', 'Default_Image', 'Brand', 'Category',
+    'Condition', 'EAN / UPC', 'Price', 'Stock', 'Handling_Time', 'Colour',
+    'Summary_Point_One', 'Summary_Point_Two', 'Summary_Point_Three',
+    'Summary_Point_Four', 'Summary_Point_Five',
+    'Additional_images_One', 'Additional_images_Two', 'Additional_images_Three',
+    'Additional_images_Four', 'Additional_images_Five',
   ];
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet([
     headers,
     [
-      'TP-Link Tapo C320WS Security Camera', 'IP Cameras', 'TP-Link',
-      '6935364099213', 'C320WS', 'new',
-      '5MP pan/tilt Smart Security Camera with Night Vision & Colour',
-      'https://example.com/tp-link-main.jpg', '', '',
-      'TPLINK-C320WS-001', '49.99', '5', '0.5',
+      'TPLINK-C320WS-001', 'TP-Link Tapo C320WS Security Camera',
+      '5MP pan/tilt Smart Security Camera with Colour Night Vision',
+      'https://example.com/tp-link-main.jpg',
+      'TP-Link', 'IP Cameras', 'new', '6935364099213',
+      '49.99', '5', '2', '',
+      'Pan & tilt 360° coverage', '5MP full-colour night vision', 'IP66 weatherproof', '', '',
+      'https://example.com/tp-link-2.jpg', 'https://example.com/tp-link-3.jpg', '', '', '',
     ],
     [
-      'Foam Exercise Floor Mats (6-Pack)', 'Exercise Mats', 'Generic',
-      '', '', 'new',
-      'Interlocking foam floor mats — pack of 6, ideal for gym or play room',
-      'https://example.com/foam-mats.jpg', '', '',
-      'FOAM-MAT-6PK-001', '19.99', '10', '1.2',
+      'FOAM-MAT-6PK-001', 'Foam Exercise Floor Mats 6-Pack',
+      'Interlocking foam floor mats, pack of 6, ideal for gym or play room',
+      'https://example.com/foam-mats.jpg',
+      'Generic', 'Exercise Mats', 'new', '',
+      '19.99', '10', '3', '',
+      'Pack of 6 interlocking tiles', 'Soft EVA foam', 'Easy to clean', '', '',
+      '', '', '', '', '',
     ],
   ]);
-  ws['!cols'] = [40, 25, 18, 18, 15, 10, 55, 45, 45, 45, 22, 12, 8, 22].map(w => ({ wch: w }));
+  ws['!cols'] = [
+    { wch: 22 }, // SKU
+    { wch: 45 }, // Product_Name
+    { wch: 60 }, // Description
+    { wch: 50 }, // Default_Image
+    { wch: 18 }, // Brand
+    { wch: 25 }, // Category
+    { wch: 10 }, // Condition
+    { wch: 18 }, // EAN / UPC
+    { wch: 10 }, // Price
+    { wch:  8 }, // Stock
+    { wch: 14 }, // Handling_Time
+    { wch: 14 }, // Colour
+    { wch: 40 }, // Summary_Point_One
+    { wch: 40 }, // Summary_Point_Two
+    { wch: 40 }, // Summary_Point_Three
+    { wch: 40 }, // Summary_Point_Four
+    { wch: 40 }, // Summary_Point_Five
+    { wch: 50 }, // Additional_images_One
+    { wch: 50 }, // Additional_images_Two
+    { wch: 50 }, // Additional_images_Three
+    { wch: 50 }, // Additional_images_Four
+    { wch: 50 }, // Additional_images_Five
+  ];
   XLSX.utils.book_append_sheet(wb, ws, 'OnBuy Products');
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

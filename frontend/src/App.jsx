@@ -3091,6 +3091,7 @@ function OnBuyBulkPage() {
   // sessionData[id] = { items, total, page, totalPages, search, loading }
   const [sessionData, setSessionData] = useState({});
   const [exportMenuOpen, setExportMenuOpen] = useState(null); // sessionId with open menu
+  const [exportLoading, setExportLoading]   = useState(false);
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
@@ -3144,6 +3145,15 @@ function OnBuyBulkPage() {
     return () => document.removeEventListener("click", close);
   }, [exportMenuOpen]);
 
+  // When history refreshes (via pending poll), also refresh the expanded session's item table
+  useEffect(() => {
+    if (!expandedSession) return;
+    const sess = history.find(s => s.id === expandedSession);
+    if (!sess) return;
+    const sd = sessionData[expandedSession];
+    fetchSessionPage(expandedSession, { page: sd?.page || 1, search: sd?.search || "" });
+  }, [history]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function startImportPoll(sessionId) {
     if (importPollRef.current) clearInterval(importPollRef.current);
     importPollRef.current = setInterval(async () => {
@@ -3177,6 +3187,7 @@ function OnBuyBulkPage() {
 
   async function exportSession(sessionId, type) {
     setExportMenuOpen(null);
+    setExportLoading(true);
     try {
       const token = localStorage.getItem("repricer_token");
       const r = await fetch(`${API}/onbuy-bulk/history/${sessionId}/export?type=${type}`, {
@@ -3193,6 +3204,7 @@ function OnBuyBulkPage() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (e) { alert("Export failed: " + e.message); }
+    finally { setExportLoading(false); }
   }
 
   async function fetchSessionPage(sessionId, { page = 1, search = "" } = {}) {
@@ -3268,6 +3280,26 @@ function OnBuyBulkPage() {
   return (
     <div>
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+
+      {/* Full-page export loader */}
+      {exportLoading && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(5,8,18,0.88)", backdropFilter: "blur(6px)",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 24,
+        }}>
+          <div style={{ position: "relative", width: 72, height: 72 }}>
+            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid ${C.border}` }} />
+            <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `4px solid transparent`, borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
+            <div style={{ position: "absolute", inset: 10, borderRadius: "50%", border: `3px solid transparent`, borderTopColor: C.blue, animation: "spin 1.4s linear infinite reverse" }} />
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ color: C.text, fontSize: 18, fontWeight: 700, marginBottom: 6 }}>Preparing Export</div>
+            <div style={{ color: C.muted, fontSize: 13 }}>Building your XLSX file, please wait…</div>
+          </div>
+        </div>
+      )}
+
       {/* Pending queue banner — shown whenever OnBuy is still processing product creation queues */}
       {pendingStatus && parseInt(pendingStatus.pending) > 0 && (
         <div style={{
