@@ -3187,7 +3187,7 @@ function OnBuyBulkPage() {
       const url  = URL.createObjectURL(blob);
       const a    = document.createElement("a");
       a.href = url;
-      a.download = `bulk-import-${sessionId}-${type}.csv`;
+      a.download = `bulk-export-${sessionId}-${type}.xlsx`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -3225,7 +3225,10 @@ function OnBuyBulkPage() {
         body: fd,
       });
       if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) {
+        const body = await r.json().catch(() => null);
+        throw new Error(body?.error || await r.text());
+      }
       setPreview(await r.json());
       setStep(2);
     } catch (e) { setErr(String(e.message || e)); }

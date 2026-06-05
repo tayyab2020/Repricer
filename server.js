@@ -1771,20 +1771,30 @@ app.put('/api/settings', requireAuth, async (req, res) => {
 
 // Flexible column aliases for the OnBuy bulk template
 const BULK_COL_ALIASES = {
-  name:            ['product name', 'title', 'name', 'product title'],
+  name:            ['product name', 'product_name', 'title', 'name', 'product title'],
   category:        ['category name', 'category', 'cat'],
   brand:           ['brand', 'brand name', 'manufacturer'],
-  ean:             ['ean', 'barcode', 'ean/barcode', 'ean / barcode', 'gtin'],
+  ean:             ['ean', 'barcode', 'ean/barcode', 'ean / barcode', 'ean / upc', 'gtin'],
   mpn:             ['mpn', 'manufacturer part number', 'part number', 'model number'],
   condition:       ['condition'],
   description:     ['description', 'product description', 'desc'],
-  image1:          ['image url 1', 'image url', 'image 1', 'image', 'main image'],
+  image1:          ['image url 1', 'image url', 'default image', 'default_image', 'image 1', 'image', 'main image'],
   image2:          ['image url 2', 'image 2', 'additional image 1', 'additional images one', 'additional_images_one'],
   image3:          ['image url 3', 'image 3', 'additional image 2', 'additional images two', 'additional_images_two'],
+  image4:          ['image url 4', 'image 4', 'additional image 3', 'additional images three', 'additional_images_three'],
+  image5:          ['image url 5', 'image 5', 'additional image 4', 'additional images four', 'additional_images_four'],
+  image6:          ['image url 6', 'image 6', 'additional image 5', 'additional images five', 'additional_images_five'],
   sku:             ['sku', 'seller sku', 'your sku', 'listing sku'],
   price:           ['price (£)', 'price', 'selling price', 'sale price'],
   stock:           ['stock', 'quantity', 'qty', 'inventory'],
   delivery_weight: ['delivery weight (kg)', 'delivery weight', 'weight (kg)', 'weight'],
+  handling_time:   ['handling time', 'handling_time', 'handling time (days)', 'dispatch time', 'dispatch days'],
+  colour:          ['colour', 'color', 'colour / variation', 'color / variation', 'variant'],
+  summary1:        ['summary_point_one', 'summary point one', 'summary point 1', 'bullet point 1', 'bullet 1', 'feature 1'],
+  summary2:        ['summary_point_two', 'summary point two', 'summary point 2', 'bullet point 2', 'bullet 2', 'feature 2'],
+  summary3:        ['summary_point_three', 'summary point three', 'summary point 3', 'bullet point 3', 'bullet 3', 'feature 3'],
+  summary4:        ['summary_point_four', 'summary point four', 'summary point 4', 'bullet point 4', 'bullet 4', 'feature 4'],
+  summary5:        ['summary_point_five', 'summary point five', 'summary point 5', 'bullet point 5', 'bullet 5', 'feature 5'],
 };
 
 function findBulkColIdx(headers, aliases) {
@@ -1837,6 +1847,11 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, re
     const headers = allRows[0].map(h => String(h || '').trim());
     const dataRows = allRows.slice(1);
 
+    const IMPORT_LIMIT = 15_000;
+    const nonBlankCount = dataRows.filter(row => row.some(v => String(v).trim())).length;
+    if (nonBlankCount > IMPORT_LIMIT)
+      return res.status(400).json({ error: `File contains ${nonBlankCount.toLocaleString()} rows. Maximum allowed per import is ${IMPORT_LIMIT.toLocaleString()}. Please split the file into smaller batches.` });
+
     const idx = {};
     for (const [key, aliases] of Object.entries(BULK_COL_ALIASES)) {
       idx[key] = findBulkColIdx(headers, aliases);
@@ -1860,10 +1875,20 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, re
       const img1      = getCell(row, 'image1');
       const img2      = getCell(row, 'image2');
       const img3      = getCell(row, 'image3');
+      const img4      = getCell(row, 'image4');
+      const img5      = getCell(row, 'image5');
+      const img6      = getCell(row, 'image6');
       const sku       = getCell(row, 'sku');
       const price     = parseFloat(getCell(row, 'price').replace(/[£,]/g, '')) || null;
       const stock     = parseInt(getCell(row, 'stock')) || 0;
       const delivery_weight = parseFloat(getCell(row, 'delivery_weight')) || null;
+      const handling_time   = getCell(row, 'handling_time');
+      const colour          = getCell(row, 'colour');
+      const summary1        = getCell(row, 'summary1');
+      const summary2        = getCell(row, 'summary2');
+      const summary3        = getCell(row, 'summary3');
+      const summary4        = getCell(row, 'summary4');
+      const summary5        = getCell(row, 'summary5');
 
       const errors = [];
       if (!name)     errors.push('Product Name required');
@@ -1872,11 +1897,14 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, re
       if (!sku)      errors.push('SKU required');
       if (!stock)    errors.push('Stock must be > 0');
 
+      // images stored positionally (no filter) so export slots stay aligned
+      const images = [img1, img2, img3, img4, img5, img6];
       return {
         _row: i + 2, valid: errors.length === 0, errors,
         name, category, brand, ean, mpn, condition, description: desc,
-        images: [img1, img2, img3].filter(Boolean),
+        images,
         sku, price, stock, delivery_weight,
+        handling_time, colour, summary1, summary2, summary3, summary4, summary5,
       };
     }).filter(Boolean);
 
@@ -2096,7 +2124,7 @@ app.get('/api/onbuy-bulk/history', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/onbuy-bulk/history/:sessionId/export — download session items as CSV
+// GET /api/onbuy-bulk/history/:sessionId/export — download session items as XLSX (zaykan111 format)
 app.get('/api/onbuy-bulk/history/:sessionId/export', requireAuth, async (req, res) => {
   try {
     const type = req.query.type || 'all'; // 'all' | 'success' | 'failed'
@@ -2104,40 +2132,116 @@ app.get('/api/onbuy-bulk/history/:sessionId/export', requireAuth, async (req, re
     const uid  = req.effectiveUserId;
 
     let whereStatus = '';
-    if (type === 'success') whereStatus = `AND status IN ('listing_created','product_created')`;
+    if (type === 'success') whereStatus = `AND status IN ('listing_created','listing_updated','product_created')`;
     if (type === 'failed')  whereStatus = `AND status = 'error'`;
 
-    const { rows } = await db.query(
-      `SELECT row_number, product_name, sku, ean, brand, category,
-              source_price, selling_price, stock, condition, opc, status, error_message
-       FROM onbuy_bulk_import_items
-       WHERE session_id = $1 AND user_id = $2 ${whereStatus}
-       ORDER BY row_number ASC`,
-      [sid, uid]
-    );
+    // Load items + session rows_data (original import data) in parallel
+    const [itemsResult, sessResult] = await Promise.all([
+      db.query(
+        `SELECT row_number, product_name, sku, ean, brand, category,
+                selling_price, stock, condition, opc, status, error_message
+         FROM onbuy_bulk_import_items
+         WHERE session_id = $1 AND user_id = $2 ${whereStatus}
+         ORDER BY row_number ASC`,
+        [sid, uid]
+      ),
+      db.query(
+        `SELECT rows_data FROM onbuy_bulk_import_sessions WHERE id=$1 AND user_id=$2`,
+        [sid, uid]
+      ),
+    ]);
 
-    const escape = v => {
-      if (v == null) return '';
-      const s = String(v);
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;
-      return s;
-    };
-    const headers = ['Row','Product','SKU','EAN','Brand','Category','Source Price','Selling Price','Stock','Condition','OPC','Status','Error'];
-    const lines   = [
-      headers.join(','),
-      ...rows.map(r => [
-        r.row_number, r.product_name, r.sku, r.ean, r.brand, r.category,
-        r.source_price, r.selling_price, r.stock, r.condition, r.opc,
-        r.status, r.error_message,
-      ].map(escape).join(',')),
+    const items    = itemsResult.rows;
+    const rowsData = sessResult.rows[0]?.rows_data ?? [];
+
+    // Build lookup: _row number → original row object
+    const rowMap = new Map();
+    for (const r of rowsData) rowMap.set(r._row, r);
+
+    // Column headers matching zaykan111 import template exactly
+    const headers = [
+      'SKU', 'Product_Name', 'Description', 'Default_Image', 'Brand', 'Category',
+      'Condition', 'EAN / UPC', 'Price', 'Stock', 'Handling_Time', 'Colour',
+      'Summary_Point_One', 'Summary_Point_Two', 'Summary_Point_Three',
+      'Summary_Point_Four', 'Summary_Point_Five',
+      'Additional_images_One', 'Additional_images_Two', 'Additional_images_Three',
+      'Additional_images_Four', 'Additional_images_Five',
+      // Diagnostic columns
+      'OPC', 'Status', 'Error',
     ];
 
-    const filename = `bulk-import-${sid}-${type}.csv`;
-    // UTF-8 BOM prevents Excel from misreading £ and other non-ASCII chars as latin-1
-    const bom = '﻿';
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    const sheetData = [
+      headers,
+      ...items.map(item => {
+        const orig = rowMap.get(item.row_number) || {};
+        const imgs = Array.isArray(orig.images) ? orig.images : [];
+        return [
+          item.sku          || orig.sku          || '',   // SKU
+          item.product_name || orig.name         || '',   // Product_Name
+          orig.description  || '',                        // Description
+          imgs[0]           || '',                        // Default_Image
+          item.brand        || orig.brand        || '',   // Brand
+          item.category     || orig.category     || '',   // Category
+          item.condition    || orig.condition    || '',   // Condition
+          item.ean          || orig.ean          || '',   // EAN / UPC
+          orig.price        != null ? parseFloat(orig.price)        : (item.selling_price != null ? parseFloat(item.selling_price) : ''), // Price
+          orig.stock        != null ? parseInt(orig.stock)          : (item.stock         != null ? parseInt(item.stock)           : ''), // Stock
+          orig.handling_time || '',                       // Handling_Time
+          orig.colour        || '',                       // Colour
+          orig.summary1      || '',                       // Summary_Point_One
+          orig.summary2      || '',                       // Summary_Point_Two
+          orig.summary3      || '',                       // Summary_Point_Three
+          orig.summary4      || '',                       // Summary_Point_Four
+          orig.summary5      || '',                       // Summary_Point_Five
+          imgs[1]            || '',                       // Additional_images_One
+          imgs[2]            || '',                       // Additional_images_Two
+          imgs[3]            || '',                       // Additional_images_Three
+          imgs[4]            || '',                       // Additional_images_Four
+          imgs[5]            || '',                       // Additional_images_Five
+          item.opc           || '',                       // OPC
+          item.status        || '',                       // Status
+          item.error_message || '',                       // Error
+        ];
+      }),
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+    ws['!cols'] = [
+      { wch: 22 }, // SKU
+      { wch: 40 }, // Product_Name
+      { wch: 55 }, // Description
+      { wch: 45 }, // Default_Image
+      { wch: 16 }, // Brand
+      { wch: 30 }, // Category
+      { wch: 10 }, // Condition
+      { wch: 18 }, // EAN / UPC
+      { wch: 10 }, // Price
+      { wch:  8 }, // Stock
+      { wch: 14 }, // Handling_Time
+      { wch: 14 }, // Colour
+      { wch: 40 }, // Summary_Point_One
+      { wch: 40 }, // Summary_Point_Two
+      { wch: 40 }, // Summary_Point_Three
+      { wch: 40 }, // Summary_Point_Four
+      { wch: 40 }, // Summary_Point_Five
+      { wch: 45 }, // Additional_images_One
+      { wch: 45 }, // Additional_images_Two
+      { wch: 45 }, // Additional_images_Three
+      { wch: 45 }, // Additional_images_Four
+      { wch: 45 }, // Additional_images_Five
+      { wch: 14 }, // OPC
+      { wch: 16 }, // Status
+      { wch: 45 }, // Error
+    ];
+
+    XLSX.utils.book_append_sheet(wb, ws, 'OnBuy Products');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const filename = `bulk-export-${sid}-${type}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(bom + lines.join('\r\n'));
+    res.send(buf);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

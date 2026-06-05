@@ -1486,6 +1486,16 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
     }).catch(() => {});
   } else {
     plog('[QueuePoller] All queues resolved');
+    // Mark any sessions that are still 'processing' but have no more pending queues as completed
+    db.query(
+      `UPDATE onbuy_bulk_import_sessions
+       SET status='completed', completed_at=NOW()
+       WHERE status='processing'
+         AND (pending_queues IS NULL OR pending_queues = 0)
+         AND id NOT IN (
+           SELECT DISTINCT session_id FROM onbuy_bulk_pending_queues WHERE status='pending'
+         )`
+    ).catch(e => plog(`[QueuePoller] Session cleanup error: ${e.message}`));
   }
 }, { connection: redis, concurrency: 1 });
 
@@ -1515,7 +1525,7 @@ function _bulkNormCond(val) {
 
 async function processBulkImportJob(job) {
   const { sessionId, accountId, userId } = job.data;
-
+  try {
   // Read rows from session record (stored as JSONB to avoid large Redis payloads)
   const { rows: [sess] } = await db.query(
     `SELECT rows_data FROM onbuy_bulk_import_sessions WHERE id=$1`,
@@ -1524,8 +1534,7 @@ async function processBulkImportJob(job) {
   if (!sess?.rows_data) throw new Error(`Session ${sessionId} has no rows_data`);
   const validRows = sess.rows_data;
 
-  // Free the JSONB column now that rows are in memory
-  db.query(`UPDATE onbuy_bulk_import_sessions SET rows_data=NULL WHERE id=$1`, [sessionId]).catch(() => {});
+  // rows_data is kept for export — cleared when user cancels or after 30 days
 
   // Get fresh account + token
   const { rows: [account] } = await db.query(
@@ -1996,6 +2005,16 @@ async function processBulkImportJob(job) {
     [results.product_created, results.listing_created, results.listing_updated, results.skipped, results.errors.length, sessionId]
   );
   blog(`Import complete — products:${results.product_created} listings:${results.listing_created} skipped:${results.skipped} errors:${results.errors.length}`);
+  } catch (err) {
+    console.error(`[BulkImport][session=${sessionId}] Fatal error:`, err.message);
+    try {
+      await db.query(
+        `UPDATE onbuy_bulk_import_sessions SET status='failed', completed_at=NOW() WHERE id=$1 AND status='processing'`,
+        [sessionId]
+      );
+    } catch {}
+    throw err; // re-throw so BullMQ marks the job as failed
+  }
 }
 
 const bulkImportWorker = new Worker('bulk-import', processBulkImportJob, {
