@@ -34,6 +34,22 @@ const LOG_FILE  = join(__dirname, 'scraper.log');
 const LOGS_DIR  = join(__dirname, 'logs');
 try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
 
+function rotatingAppend(filePath, line) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const mtime = fs.statSync(filePath).mtime;
+      const fileDay = `${mtime.getFullYear()}-${mtime.getMonth()}-${mtime.getDate()}`;
+      const now     = new Date();
+      const today   = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+      if (fileDay !== today) {
+        const prev = filePath.replace(/\.log$/, '-previous.log');
+        try { fs.renameSync(filePath, prev); } catch {}
+      }
+    }
+    fs.appendFileSync(filePath, line, 'utf8');
+  } catch {}
+}
+
 // Propagates the current job's userId through the entire async scrape call chain
 // so the log() function below can write to the correct per-user log file.
 export const jobContext = new AsyncLocalStorage();
@@ -54,7 +70,7 @@ function log(level, message, meta = {}) {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
   const ctx = jobContext.getStore();
   if (ctx?.userId) {
-    try { fs.appendFileSync(join(LOGS_DIR, `user-${ctx.userId}.log`), line + '\n'); } catch {}
+    rotatingAppend(join(LOGS_DIR, `user-${ctx.userId}.log`), line + '\n');
   }
 }
 

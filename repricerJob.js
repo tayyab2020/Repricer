@@ -30,7 +30,7 @@ import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import https from 'https';
-import { appendFileSync, mkdirSync } from 'fs';
+import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
@@ -43,6 +43,24 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
 export const LOGS_DIR = join(__dirname, 'logs');
 try { mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
+
+// Rotating log writer — keeps only today's log + one previous-day log per file.
+// On first write of a new day: current → previous (overwriting older previous), then write fresh.
+function rotatingAppend(filePath, line) {
+  try {
+    if (existsSync(filePath)) {
+      const mtime = statSync(filePath).mtime;
+      const fileDay = `${mtime.getFullYear()}-${mtime.getMonth()}-${mtime.getDate()}`;
+      const now     = new Date();
+      const today   = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+      if (fileDay !== today) {
+        const prev = filePath.replace(/\.log$/, '-previous.log');
+        try { renameSync(filePath, prev); } catch {}
+      }
+    }
+    appendFileSync(filePath, line, 'utf8');
+  } catch {}
+}
 
 // Prevent unhandled errors from crashing the worker process.
 // BullMQ and IORedis can throw outside of any try-catch (e.g. network events).
@@ -90,7 +108,7 @@ function logToUser(userId, ...args) {
   if (!userId) return;
   const msg  = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
   const line = `[${new Date().toISOString()}] ${msg}\n`;
-  try { appendFileSync(join(LOGS_DIR, `user-${userId}.log`), line, 'utf8'); } catch {}
+  rotatingAppend(join(LOGS_DIR, `user-${userId}.log`), line);
 }
 
 // Log to stdout AND the user file at once.
@@ -1276,7 +1294,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
   const plog = (...a) => {
     const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`;
     console.log(line.trimEnd());
-    try { appendFileSync(join(LOGS_DIR, 'queue-poller.log'), line, 'utf8'); } catch {}
+    rotatingAppend(join(LOGS_DIR, 'queue-poller.log'), line);
   };
   plog('[QueuePoller] Starting poll run');
 
@@ -1341,7 +1359,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
         const sessionId = q.session_id;
         const ilog = (msg) => {
           const line = `[${new Date().toISOString()}] [QueuePoller][session=${sessionId}] ${msg}\n`;
-          try { appendFileSync(join(LOGS_DIR, `user-${userId}-import.log`), line, 'utf8'); } catch {}
+          rotatingAppend(join(LOGS_DIR, `user-${userId}-import.log`), line);
         };
 
         const qr     = pollMap.get(q.queue_id) ?? {};
@@ -1525,6 +1543,15 @@ function _bulkNormCond(val) {
 
 async function processBulkImportJob(job) {
   const { sessionId, accountId, userId } = job.data;
+
+  function blog(...args) {
+    const msg  = args.join(' ');
+    const line = `[${new Date().toISOString()}] [BulkImport][session=${sessionId}] ${msg}\n`;
+    const logFile = join(LOGS_DIR, `user-${userId}-import.log`);
+    rotatingAppend(logFile, line);
+    console.log(`[BulkImport][s=${sessionId}]`, msg);
+  }
+
   try {
   // Read rows from session record (stored as JSONB to avoid large Redis payloads)
   const { rows: [sess] } = await db.query(
@@ -1547,7 +1574,8 @@ async function processBulkImportJob(job) {
 
   const results = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
   const categoryCache = {};
-  const CHUNK = 1000;
+  const CHUNK        = 1000; // listing creation (Phase 4) — small payload per item
+  const CREATE_CHUNK = 500;  // product creation (Phase 2/3.5) — large payload (desc + images)
   let currentToken = token; // mutable so we can refresh mid-job
 
   async function refreshToken() {
@@ -1555,14 +1583,6 @@ async function processBulkImportJob(job) {
     if (newTok) { currentToken = newTok; blog('Token refreshed mid-job'); }
     else blog('Token refresh failed — continuing with old token');
     return !!newTok;
-  }
-
-  function blog(...args) {
-    const msg  = args.join(' ');
-    const line = `[${new Date().toISOString()}] [BulkImport][session=${sessionId}] ${msg}\n`;
-    const logFile = join(LOGS_DIR, `user-${userId}-import.log`);
-    try { appendFileSync(logFile, line, 'utf8'); } catch {}
-    console.log(`[BulkImport][s=${sessionId}]`, msg);
   }
 
   async function syncCategoriesIfNeeded() {
@@ -1768,8 +1788,8 @@ async function processBulkImportJob(job) {
       toCreate = toCreate.filter(m => !pendingSkus.has(m.row.sku));
     }
   }
-  for (let i = 0; i < toCreate.length; i += CHUNK) {
-    const chunk    = toCreate.slice(i, i + CHUNK);
+  for (let i = 0; i < toCreate.length; i += CREATE_CHUNK) {
+    const chunk    = toCreate.slice(i, i + CREATE_CHUNK);
     const products = chunk.map(({ row, sellingPrice, categoryId }) => {
       const brandVal = row.brand?.trim();
       const addImgs  = (row.images || []).slice(1).filter(Boolean);
@@ -1787,7 +1807,7 @@ async function processBulkImportJob(job) {
         ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
       };
     });
-    blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CHUNK)+1} of ${Math.ceil(toCreate.length/CHUNK)})`);
+    blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CREATE_CHUNK)+1} of ${Math.ceil(toCreate.length/CREATE_CHUNK)})`);
     let createRes = await fetch('https://api.onbuy.com/v2/products', {
       method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
@@ -1799,7 +1819,12 @@ async function processBulkImportJob(job) {
         body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
       });
     }
-    const createData = await createRes.json();
+    let createData;
+    try { createData = await createRes.json(); }
+    catch (jsonErr) {
+      const txt = await createRes.text().catch(() => '');
+      throw new Error(`Phase 2 HTTP ${createRes.status} — non-JSON response: ${txt.slice(0, 300)}`);
+    }
     blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 1000)}`);
     for (let j = 0; j < chunk.length; j++) {
       const m  = chunk[j];
@@ -1885,8 +1910,8 @@ async function processBulkImportJob(job) {
   const toUpdate = existingMeta.filter(m => m.opc);
   if (toUpdate.length > 0) {
     blog(`Phase 3.5: updating ${toUpdate.length} existing product(s)`);
-    for (let i = 0; i < toUpdate.length; i += CHUNK) {
-      const chunk    = toUpdate.slice(i, i + CHUNK);
+    for (let i = 0; i < toUpdate.length; i += CREATE_CHUNK) {
+      const chunk    = toUpdate.slice(i, i + CREATE_CHUNK);
       const products = chunk.map(({ row, categoryId, opc }) => {
         const brandVal = row.brand?.trim();
         const addImgs  = (row.images || []).slice(1).filter(Boolean);
@@ -1912,7 +1937,7 @@ async function processBulkImportJob(job) {
           body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
         });
       }
-      blog(`Phase 3.5 HTTP ${p35Res.status}: chunk ${Math.floor(i/CHUNK)+1}`);
+      blog(`Phase 3.5 HTTP ${p35Res.status}: chunk ${Math.floor(i/CREATE_CHUNK)+1}`);
     }
   }
 
@@ -2006,6 +2031,7 @@ async function processBulkImportJob(job) {
   );
   blog(`Import complete — products:${results.product_created} listings:${results.listing_created} skipped:${results.skipped} errors:${results.errors.length}`);
   } catch (err) {
+    blog(`Fatal error: ${err.message}`);
     console.error(`[BulkImport][session=${sessionId}] Fatal error:`, err.message);
     try {
       await db.query(
