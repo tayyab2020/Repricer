@@ -1632,6 +1632,7 @@ async function runMigrations() {
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS listings_updated INTEGER DEFAULT 0`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS pending_queues INTEGER DEFAULT 0`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS rows_data JSONB`,
+    `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS rate_limit_until TIMESTAMPTZ`,
     `CREATE TABLE IF NOT EXISTS onbuy_categories (
        category_id  INTEGER      NOT NULL,
        account_id   INTEGER      NOT NULL,
@@ -2162,7 +2163,7 @@ app.post('/api/onbuy-bulk/sessions/:sessionId/cancel', requireAuth, async (req, 
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT s.id, s.account_name, s.total_rows, s.status, s.created_at, s.completed_at,
+      `SELECT s.id, s.account_name, s.total_rows, s.status, s.created_at, s.completed_at, s.rate_limit_until,
               COALESCE(ic.products_created, 0)  AS products_created,
               COALESCE(ic.listings_created, 0)  AS listings_created,
               COALESCE(ic.listings_updated, 0)  AS listings_updated,

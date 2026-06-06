@@ -3102,7 +3102,7 @@ function OnBuyBulkPage() {
     }).catch(() => {});
     // Restore running import state across page reloads
     api("/onbuy-bulk/active-session").then(s => {
-      if (s && s.status === 'processing') {
+      if (s && (s.status === 'processing' || s.status === 'rate_limited')) {
         setResult(s);
         setStep(3);
         startImportPoll(s.id);
@@ -3172,7 +3172,7 @@ function OnBuyBulkPage() {
           }));
           startPendingPoll();
         }
-        if (s.status === 'completed' || s.status === 'failed') {
+        if (s.status === 'completed' || s.status === 'failed' || s.status === 'cancelled') {
           clearInterval(importPollRef.current);
           importPollRef.current = null;
         }
@@ -3425,6 +3425,10 @@ function OnBuyBulkPage() {
                         {s.status === 'cancelled' && (
                           <span style={{ background: "#ef444422", color: C.red, borderRadius: 4,
                             padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>CANCELLED</span>
+                        )}
+                        {s.status === 'rate_limited' && (
+                          <span style={{ background: "#f59e0b22", color: C.amber, borderRadius: 4,
+                            padding: "1px 7px", fontSize: 10, fontWeight: 600 }}>RATE LIMITED</span>
                         )}
                         {s.status === 'failed' && (
                           <span style={{ background: "#ef444422", color: C.red, borderRadius: 4,
@@ -3844,20 +3848,43 @@ function OnBuyBulkPage() {
       )}
 
       {/* Step 3 — Processing / Results */}
-      {step === 3 && result && result.status === 'processing' && (
-        <Section title="Import Running">
+      {step === 3 && result && (result.status === 'processing' || result.status === 'rate_limited') && (
+        <Section title={result.status === 'rate_limited' ? "⏸ Rate Limit — Waiting" : "Import Running"}>
           <div style={{ padding: "28px 24px", textAlign: "center" }}>
-            <div style={{ position: "relative", width: 64, height: 64, margin: "0 auto 20px" }}>
-              <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid ${C.border}` }} />
-              <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid transparent`,
-                borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
-            </div>
-            <div style={{ color: C.accent, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>
-              Processing {(result.total_rows || 0).toLocaleString()} products…
-            </div>
-            <div style={{ color: C.muted, fontSize: 13, marginBottom: 24 }}>
-              Searching EANs, creating products and listings on OnBuy. This can take a few minutes for large files.
-            </div>
+            {result.status === 'rate_limited' ? (
+              <>
+                <div style={{ fontSize: 48, marginBottom: 16 }}>⏳</div>
+                <div style={{ color: C.amber, fontSize: 20, fontWeight: 700, marginBottom: 8 }}>
+                  OnBuy rate limit reached
+                </div>
+                <div style={{ background: "#f59e0b18", border: `1px solid ${C.amber}44`, borderRadius: 10,
+                  padding: "14px 20px", marginBottom: 20, display: "inline-block" }}>
+                  <div style={{ color: C.text, fontSize: 13, marginBottom: 4 }}>
+                    OnBuy allows 240 POST requests per hour. The limit has been reached.
+                  </div>
+                  <div style={{ color: C.amber, fontSize: 13, fontWeight: 600 }}>
+                    Import will automatically resume at{" "}
+                    {result.rate_limit_until
+                      ? new Date(result.rate_limit_until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                      : "approximately 1 hour from now"}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ position: "relative", width: 64, height: 64, margin: "0 auto 20px" }}>
+                  <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid ${C.border}` }} />
+                  <div style={{ position: "absolute", inset: 0, borderRadius: "50%", border: `3px solid transparent`,
+                    borderTopColor: C.accent, animation: "spin 0.9s linear infinite" }} />
+                </div>
+                <div style={{ color: C.accent, fontSize: 20, fontWeight: 700, marginBottom: 6 }}>
+                  Processing {(result.total_rows || 0).toLocaleString()} products…
+                </div>
+                <div style={{ color: C.muted, fontSize: 13, marginBottom: 24 }}>
+                  Searching EANs, creating products and listings on OnBuy. This can take a few minutes for large files.
+                </div>
+              </>
+            )}
             <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap", marginBottom: 16 }}>
               {[
                 ["Products Created", result.products_created, C.blue],
@@ -3872,7 +3899,9 @@ function OnBuyBulkPage() {
                 </div>
               ))}
             </div>
-            <div style={{ color: C.muted, fontSize: 11 }}>Updating every 3 s…</div>
+            <div style={{ color: C.muted, fontSize: 11 }}>
+              {result.status === 'rate_limited' ? "Checking every 3 s — page will update when import resumes…" : "Updating every 3 s…"}
+            </div>
           </div>
         </Section>
       )}
