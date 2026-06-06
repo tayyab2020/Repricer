@@ -3092,6 +3092,7 @@ function OnBuyBulkPage() {
   const [sessionData, setSessionData] = useState({});
   const [exportMenuOpen, setExportMenuOpen] = useState(null); // sessionId with open menu
   const [exportLoading, setExportLoading]   = useState(false);
+  const [catExportLoading, setCatExportLoading] = useState(false);
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
@@ -3183,6 +3184,26 @@ function OnBuyBulkPage() {
     setHistLoading(true);
     try { setHistory(await api("/onbuy-bulk/history")); } catch {}
     setHistLoading(false);
+  }
+
+  async function downloadCategoriesSheet() {
+    setCatExportLoading(true);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const qs = accountId ? `?account_id=${accountId}` : "";
+      const r = await fetch(`${API}/onbuy-bulk/categories/export${qs}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const blob = await r.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href = url; a.download = "onbuy-categories.xlsx";
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) { alert("Failed to download categories: " + e.message); }
+    finally { setCatExportLoading(false); }
   }
 
   async function exportSession(sessionId, type) {
@@ -3332,7 +3353,7 @@ function OnBuyBulkPage() {
       )}
 
       {/* Tab switcher */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 0 }}>
+      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 0, alignItems: "center" }}>
         {[["import","📦 Import"], ["history","📋 History"]].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)} style={{
             background: "none", border: "none", cursor: "pointer",
@@ -3342,6 +3363,25 @@ function OnBuyBulkPage() {
             marginBottom: -1, transition: "color 0.15s",
           }}>{label}</button>
         ))}
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={downloadCategoriesSheet}
+          disabled={catExportLoading}
+          style={{
+            background: catExportLoading ? C.surface : "transparent",
+            border: `1px solid ${C.border}`, borderRadius: 6,
+            color: catExportLoading ? C.muted : C.text,
+            cursor: catExportLoading ? "not-allowed" : "pointer",
+            padding: "5px 13px", fontSize: 12, fontWeight: 600,
+            display: "flex", alignItems: "center", gap: 6,
+            marginBottom: 4,
+          }}
+        >
+          {catExportLoading
+            ? <><span style={{ fontSize: 13 }}>⏳</span> Fetching…</>
+            : <><span style={{ fontSize: 13 }}>📥</span> Download Categories Sheet</>
+          }
+        </button>
       </div>
 
       {/* ── History Tab ── */}

@@ -1872,6 +1872,123 @@ app.get('/api/onbuy-bulk/template', requireAuth, (req, res) => {
   res.send(buf);
 });
 
+// GET /api/onbuy-bulk/categories/export — download all OnBuy categories as XLSX
+app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const reqAccountId = req.query.account_id ? parseInt(req.query.account_id) : null;
+
+    // Prefer the explicitly requested account, then user's first active, then any active
+    let account;
+    if (reqAccountId) {
+      const { rows } = await db.query(
+        `SELECT * FROM onbuy_accounts WHERE id=$1 AND is_active=true LIMIT 1`, [reqAccountId]
+      );
+      account = rows[0];
+    }
+    if (!account) {
+      const { rows } = await db.query(
+        `SELECT * FROM onbuy_accounts WHERE user_id=$1 AND is_active=true ORDER BY id LIMIT 1`, [uid]
+      );
+      account = rows[0];
+    }
+    if (!account) {
+      const { rows } = await db.query(
+        `SELECT * FROM onbuy_accounts WHERE is_active=true ORDER BY id LIMIT 1`
+      );
+      account = rows[0];
+    }
+    if (!account) return res.status(400).json({ error: 'No active OnBuy account found' });
+    const accountId = account.id;
+    const siteId    = account.site_id || 2000;
+
+    // Check if DB cache is fresh (< 24 h)
+    const { rows: [{ last_sync, cat_count }] } = await db.query(
+      `SELECT MAX(synced_at) AS last_sync, COUNT(*) AS cat_count
+       FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
+      [accountId, siteId]
+    );
+    const cacheAge = last_sync ? Date.now() - new Date(last_sync).getTime() : Infinity;
+    const needSync = cacheAge > 24 * 60 * 60 * 1000 || parseInt(cat_count) === 0;
+
+    if (needSync) {
+      // Sync categories from OnBuy API
+      const token = await getTokenForAccount(account);
+      if (!token) return res.status(500).json({ error: 'Failed to get OnBuy token' });
+      let currentToken = token;
+      const limit = 100;
+      let offset = 0, total = null;
+      while (true) {
+        let data;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const r = await fetch(
+            `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
+            { headers: { Authorization: currentToken } }
+          );
+          if (r.status === 401) {
+            currentToken = await getTokenForAccount(account);
+            continue;
+          }
+          if (r.status === 429) { await new Promise(x => setTimeout(x, attempt * 60_000)); continue; }
+          if (!r.ok) throw new Error(`OnBuy categories API HTTP ${r.status}`);
+          data = await r.json();
+          break;
+        }
+        if (!data) throw new Error('Failed to fetch categories from OnBuy after retries');
+        const items = data?.payload ?? data?.results ?? (Array.isArray(data) ? data : []);
+        if (total === null) total = data?.metadata?.total_rows ?? data?.total ?? items.length;
+        if (!items.length) break;
+        const vals = [], params = [];
+        let p = 1;
+        for (const cat of items) {
+          const catId = cat.category_id ?? cat.id;
+          if (!catId) continue;
+          vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
+          params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? cat.tree ?? null, cat.level ?? null);
+        }
+        if (vals.length) {
+          await db.query(
+            `INSERT INTO onbuy_categories (category_id,account_id,site_id,name,tree,level,synced_at)
+             VALUES ${vals.join(',')}
+             ON CONFLICT (category_id,account_id,site_id)
+             DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
+            params
+          );
+        }
+        offset += items.length;
+        if (offset >= total) break;
+        await new Promise(x => setTimeout(x, 150));
+      }
+    }
+
+    // Fetch all categories from DB
+    const { rows: cats } = await db.query(
+      `SELECT category_id, name, tree
+       FROM onbuy_categories WHERE account_id=$1 AND site_id=$2
+       ORDER BY COALESCE(tree,'') ASC, name ASC`,
+      [accountId, siteId]
+    );
+
+    // Build XLSX
+    const wsData = [['ID', 'Category']];
+    for (const c of cats) {
+      const fullPath = c.tree ? `${c.tree} > ${c.name}` : c.name;
+      wsData.push([c.category_id, fullPath]);
+    }
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    ws['!cols'] = [{ wch: 10 }, { wch: 100 }];
+    XLSX.utils.book_append_sheet(wb, ws, 'OnBuy Categories');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="onbuy-categories.xlsx"');
+    res.send(buf);
+  } catch (e) {
+    console.error('[Categories export]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/onbuy-bulk/preview — parse uploaded Excel, validate and return rows
 app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
