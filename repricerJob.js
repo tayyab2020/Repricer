@@ -1540,18 +1540,6 @@ function _bulkNormCond(val) {
   const s = String(val ?? '').toLowerCase().trim();
   return BULK_CONDITIONS.has(s) ? s : 'new';
 }
-function isRateLimited(msg) {
-  return /limit of \d+ requests per hour/i.test(msg || '');
-}
-function generateValidEan13() {
-  const prefixes = ['500','501','502','503','504','300','301','302','400','401','690','691'];
-  const pfx = prefixes[Math.floor(Math.random() * prefixes.length)];
-  const middle = Array.from({ length: 9 }, () => Math.floor(Math.random() * 10)).join('');
-  const first12 = pfx + middle;
-  let sum = 0;
-  for (let i = 0; i < 12; i++) sum += parseInt(first12[i]) * (i % 2 === 0 ? 1 : 3);
-  return first12 + String((10 - (sum % 10)) % 10);
-}
 
 async function processBulkImportJob(job) {
   const { sessionId, accountId, userId } = job.data;
@@ -1649,9 +1637,11 @@ async function processBulkImportJob(job) {
       let   p = 1;
       for (const cat of items) {
         const catId = cat.category_id ?? cat.id;
-        if (!catId) continue;
+        const lvl   = cat.lvl ?? cat.level ?? 0;
+        // Only store categories that are listable and deep enough to be valid listing targets
+        if (!catId || !cat.can_list_in || lvl < 4) continue;
         vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
-        params.push(catId, accountId, siteId, cat.name ?? '', cat.tree ?? null, cat.level ?? null);
+        params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? '', lvl);
       }
       if (vals.length) {
         await db.query(
@@ -1683,6 +1673,7 @@ async function processBulkImportJob(job) {
     const { rows } = await db.query(
       `SELECT category_id FROM onbuy_categories
        WHERE account_id=$1 AND site_id=$2 AND lower(name)=lower($3)
+         AND tree IS NOT NULL AND tree <> ''
        LIMIT 1`,
       [accountId, siteId, leafName]
     );
@@ -1696,6 +1687,7 @@ async function processBulkImportJob(job) {
     const { rows: fuzzy } = await db.query(
       `SELECT category_id FROM onbuy_categories
        WHERE account_id=$1 AND site_id=$2 AND lower(name) LIKE lower($3)
+         AND tree IS NOT NULL AND tree <> ''
        LIMIT 1`,
       [accountId, siteId, `%${leafName}%`]
     );
@@ -1800,8 +1792,53 @@ async function processBulkImportJob(job) {
       toCreate = toCreate.filter(m => !pendingSkus.has(m.row.sku));
     }
   }
-  const gtinRetryItems  = [];
-  const rateLimitItems  = [];
+  // POST a chunk to OnBuy. On HTTP 500 non-JSON: retry with short delays, then split in half
+  // and recurse until each sub-chunk succeeds or shrinks to 1 product (logged as a row error).
+  async function sendChunk(products, chunkMeta) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) {
+        const wait = attempt === 2 ? 5_000 : 10_000;
+        blog(`sendChunk(${chunkMeta.length}) HTTP 500 — retry ${attempt}/3 in ${wait / 1000}s…`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+      let fetchRes = await fetch('https://api.onbuy.com/v2/products', {
+        method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
+      });
+      if (fetchRes.status === 401) {
+        await refreshToken();
+        fetchRes = await fetch('https://api.onbuy.com/v2/products', {
+          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
+        });
+      }
+      // Read body as text first — avoids "body already consumed" bug when .json() throws
+      const txt = await fetchRes.text().catch(() => '');
+      let data;
+      try { data = JSON.parse(txt); } catch { /* non-JSON */ }
+      if (data) return data.results ?? [];
+
+      // Non-JSON response (HTTP 500 / empty body)
+      blog(`sendChunk(${chunkMeta.length}) HTTP ${fetchRes.status} non-JSON (attempt ${attempt}/3): ${txt.slice(0, 200)}`);
+      if (attempt < 3) continue;
+
+      // 3 attempts exhausted — single product: log as individual row error and continue job
+      if (chunkMeta.length <= 1) {
+        blog(`sendChunk: single product failed after 3 attempts — logged as row error`);
+        return [{ queue_id: null, message: `HTTP ${fetchRes.status} — server error after 3 attempts` }];
+      }
+
+      // Multi-product chunk: split in half and retry each half recursively
+      const mid = Math.ceil(products.length / 2);
+      blog(`sendChunk(${chunkMeta.length}) splitting → ${mid} + ${products.length - mid} after 3× HTTP ${fetchRes.status}`);
+      await new Promise(r => setTimeout(r, 3_000)); // brief pause before split retries
+      const r1 = await sendChunk(products.slice(0, mid), chunkMeta.slice(0, mid));
+      const r2 = await sendChunk(products.slice(mid), chunkMeta.slice(mid));
+      return [...r1, ...r2];
+    }
+    return chunkMeta.map(() => ({ queue_id: null, message: 'No response received' }));
+  }
+
   for (let i = 0; i < toCreate.length; i += CREATE_CHUNK) {
     const chunk    = toCreate.slice(i, i + CREATE_CHUNK);
     const products = chunk.map(({ row, sellingPrice, categoryId }) => {
@@ -1822,208 +1859,30 @@ async function processBulkImportJob(job) {
       };
     });
     blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CREATE_CHUNK)+1} of ${Math.ceil(toCreate.length/CREATE_CHUNK)})`);
-    let createRes, createData;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      if (attempt > 1) {
-        blog(`Phase 2 chunk retry ${attempt}/3 — waiting 30s…`);
-        await new Promise(r => setTimeout(r, 30_000));
-      }
-      createRes = await fetch('https://api.onbuy.com/v2/products', {
-        method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-      });
-      if (createRes.status === 401) {
-        await refreshToken();
-        createRes = await fetch('https://api.onbuy.com/v2/products', {
-          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-        });
-      }
-      try { createData = await createRes.json(); break; }
-      catch (jsonErr) {
-        const txt = await createRes.text().catch(() => '');
-        if (attempt === 3) throw new Error(`Phase 2 HTTP ${createRes.status} — non-JSON response: ${txt.slice(0, 300)}`);
-        blog(`Phase 2 HTTP ${createRes.status} non-JSON (attempt ${attempt}/3): ${txt.slice(0, 200)}`);
-      }
-    }
-    blog(`Batch create HTTP ${createRes.status}: ${JSON.stringify(createData).slice(0, 1000)}`);
+    const batchResults = await sendChunk(products, chunk);
+    blog(`Phase 2 chunk ${Math.floor(i/CREATE_CHUNK)+1}: ${batchResults.length} results received`);
     for (let j = 0; j < chunk.length; j++) {
       const m  = chunk[j];
-      const br = (createData?.results ?? [])[j];
+      const br = batchResults[j];
       if (!br?.queue_id) {
         const baseMsg   = br?.message || 'No queue_id returned';
         const fieldErrs = br?.messages && typeof br.messages === 'object'
           ? Object.entries(br.messages).map(([f, v]) => `${f}: ${Array.isArray(v) ? v.join(', ') : v}`).join('; ')
           : null;
         const msg = fieldErrs ? `${baseMsg} — ${fieldErrs}` : baseMsg;
-        if (/reserved GTIN group/i.test(msg)) {
-          gtinRetryItems.push(m);
-          blog(`Phase 2: row ${m.row._row} EAN ${m.row.ean} reserved GTIN — queued for auto-fix`);
-        } else if (isRateLimited(msg)) {
-          rateLimitItems.push(m);
-          blog(`Phase 2: row ${m.row._row} rate-limited — queued for retry after rate limit reset`);
-        } else {
-          results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
-          db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId,userId,m.row._row,m.row.name,m.row.sku,m.row.ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),msg]).catch(() => {});
-        }
+        results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
+        db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+          [sessionId,userId,m.row._row,m.row.name,m.row.sku,m.row.ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),msg]).catch(() => {});
       } else {
         queueItems.push({ meta: m, queueId: br.queue_id });
       }
     }
   }
 
-  // ── Phase 2.5: Retry products that failed with reserved GTIN error ──
-  if (gtinRetryItems.length > 0) {
-    blog(`Phase 2.5: retrying ${gtinRetryItems.length} product(s) with auto-generated valid EANs`);
-    for (let i = 0; i < gtinRetryItems.length; i += CREATE_CHUNK) {
-      const chunk = gtinRetryItems.slice(i, i + CREATE_CHUNK);
-      const products = chunk.map(({ row, sellingPrice, categoryId }) => {
-        const newEan   = generateValidEan13();
-        row._fixedEan  = newEan;
-        const brandVal = row.brand?.trim();
-        const addImgs  = (row.images || []).slice(1).filter(Boolean);
-        return {
-          uid:          row.sku || `bulk-${row._row ?? Date.now()}`,
-          published:    '1',
-          category_id:  categoryId,
-          product_name: _bulkTruncateToBytes(row.name, 150),
-          ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
-          default_image: row.images[0],
-          ...(addImgs.length      ? { additional_images: addImgs }     : {}),
-          ...(row.description     ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
-          product_codes: [newEan],
-          ...(row.mpn             ? { mpn: row.mpn }                   : {}),
-          ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
-        };
-      });
-      blog(`Phase 2.5: submitting chunk of ${chunk.length} with generated EANs`);
-      let retryRes, retryData;
-      try {
-        retryRes = await fetch('https://api.onbuy.com/v2/products', {
-          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-        });
-        if (retryRes.status === 401) {
-          await refreshToken();
-          retryRes = await fetch('https://api.onbuy.com/v2/products', {
-            method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-          });
-        }
-        retryData = await retryRes.json();
-      } catch (e) {
-        blog(`Phase 2.5 chunk failed: ${e.message}`);
-        for (const m of chunk) {
-          const ean = m.row._fixedEan || m.row.ean;
-          results.errors.push({ row: m.row._row, product: m.row.name, error: `EAN retry failed: ${e.message}` }); results.skipped++;
-          db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId,userId,m.row._row,m.row.name,m.row.sku,ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),`EAN retry failed: ${e.message}`]).catch(() => {});
-        }
-        continue;
-      }
-      blog(`Phase 2.5 HTTP ${retryRes.status}: ${JSON.stringify(retryData).slice(0, 500)}`);
-      for (let j = 0; j < chunk.length; j++) {
-        const m   = chunk[j];
-        const br  = (retryData?.results ?? [])[j];
-        const ean = m.row._fixedEan || m.row.ean;
-        if (!br?.queue_id) {
-          const msg = br?.message || (br ? `No queue_id in response: ${JSON.stringify(br).slice(0,200)}` : 'No result in batch for this row');
-          if (isRateLimited(msg)) {
-            rateLimitItems.push(m);
-            blog(`Phase 2.5: row ${m.row._row} rate-limited — queued for retry after rate limit reset`);
-          } else {
-            results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
-            db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-              [sessionId,userId,m.row._row,m.row.name,m.row.sku,ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),msg]).catch(() => {});
-          }
-        } else {
-          queueItems.push({ meta: { ...m, row: { ...m.row, ean } }, queueId: br.queue_id });
-          blog(`Phase 2.5: row ${m.row._row} OK — generated EAN ${ean} → queue ${br.queue_id}`);
-        }
-      }
-    }
-  }
-
-  // ── Phase 2.6: Wait 1 hour for rate limit reset, then retry blocked products ──
-  if (rateLimitItems.length > 0) {
-    const retryAt = new Date(Date.now() + 60 * 60 * 1000);
-    blog(`Phase 2.6: ${rateLimitItems.length} product(s) hit OnBuy POST rate limit — pausing until ${retryAt.toISOString()}`);
-    await db.query(
-      `UPDATE onbuy_bulk_import_sessions SET status='rate_limited', rate_limit_until=$1 WHERE id=$2`,
-      [retryAt.toISOString(), sessionId]
-    ).catch(() => {});
-    await new Promise(r => setTimeout(r, 60 * 60 * 1000));
-    await db.query(
-      `UPDATE onbuy_bulk_import_sessions SET status='processing', rate_limit_until=NULL WHERE id=$1`,
-      [sessionId]
-    ).catch(() => {});
-    blog(`Phase 2.6: Rate limit wait complete — retrying ${rateLimitItems.length} product(s)`);
-
-    for (let i = 0; i < rateLimitItems.length; i += CREATE_CHUNK) {
-      const chunk = rateLimitItems.slice(i, i + CREATE_CHUNK);
-      const products = chunk.map(({ row, sellingPrice, categoryId }) => {
-        const ean      = row._fixedEan || row.ean;
-        const brandVal = row.brand?.trim();
-        const addImgs  = (row.images || []).slice(1).filter(Boolean);
-        return {
-          uid:          row.sku || `bulk-${row._row ?? Date.now()}`,
-          published:    '1',
-          category_id:  categoryId,
-          product_name: _bulkTruncateToBytes(row.name, 150),
-          ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
-          default_image: row.images[0],
-          ...(addImgs.length      ? { additional_images: addImgs }     : {}),
-          ...(row.description     ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
-          ...(ean                 ? { product_codes: [ean] }           : {}),
-          ...(row.mpn             ? { mpn: row.mpn }                   : {}),
-          ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
-        };
-      });
-      blog(`Phase 2.6: submitting chunk of ${chunk.length} after rate limit reset`);
-      let rlRes, rlData;
-      try {
-        rlRes = await fetch('https://api.onbuy.com/v2/products', {
-          method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-        });
-        if (rlRes.status === 401) {
-          await refreshToken();
-          rlRes = await fetch('https://api.onbuy.com/v2/products', {
-            method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ site_id: parseInt(siteId)||2000, products }),
-          });
-        }
-        rlData = await rlRes.json();
-      } catch (e) {
-        blog(`Phase 2.6 chunk failed: ${e.message}`);
-        for (const m of chunk) {
-          const ean = m.row._fixedEan || m.row.ean;
-          results.errors.push({ row: m.row._row, product: m.row.name, error: `Rate limit retry failed: ${e.message}` }); results.skipped++;
-          db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId,userId,m.row._row,m.row.name,m.row.sku,ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),`Rate limit retry failed: ${e.message}`]).catch(() => {});
-        }
-        continue;
-      }
-      blog(`Phase 2.6 HTTP ${rlRes.status}: ${JSON.stringify(rlData).slice(0, 500)}`);
-      for (let j = 0; j < chunk.length; j++) {
-        const m   = chunk[j];
-        const br  = (rlData?.results ?? [])[j];
-        const ean = m.row._fixedEan || m.row.ean;
-        if (!br?.queue_id) {
-          const msg = br?.message || 'No queue_id after rate limit retry';
-          results.errors.push({ row: m.row._row, product: m.row.name, error: msg }); results.skipped++;
-          db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-            [sessionId,userId,m.row._row,m.row.name,m.row.sku,ean,m.row.category,m.row.brand,m.sourcePrice,m.sellingPrice,parseInt(m.row.stock)||0,_bulkNormCond(m.row.condition),msg]).catch(() => {});
-        } else {
-          queueItems.push({ meta: { ...m, row: { ...m.row, ean } }, queueId: br.queue_id });
-          blog(`Phase 2.6: row ${m.row._row} OK → queue ${br.queue_id}`);
-        }
-      }
-    }
-  }
-
   // ── Phase 3: Poll queues 15 s after product creation ──
+  // Newly created products go into newlyCreatedMeta (not existingMeta) so Phase 3.5
+  // skips updating them — the Phase 2 POST already sent all required fields.
+  const newlyCreatedMeta = [];
   if (queueItems.length > 0) {
     blog(`Phase 3: waiting 15 s before polling ${queueItems.length} queue(s)…`);
     await new Promise(res => setTimeout(res, 15_000));
@@ -2038,7 +1897,7 @@ async function processBulkImportJob(job) {
         const opc    = qr.opc   ?? null;
         if (status === 'success' && opc) {
           results.product_created++;
-          existingMeta.push({ ...meta, opc });
+          newlyCreatedMeta.push({ ...meta, opc });
           db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,opc,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'product_created')`,
             [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),opc]).catch(() => {});
         } else if (status === 'failed' || status === 'error') {
@@ -2055,42 +1914,6 @@ async function processBulkImportJob(job) {
               results.errors.push({ row: meta.row._row, product: meta.row.name, error: searchErr.message }); results.skipped++;
               db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
                 [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),searchErr.message]).catch(() => {});
-            }
-          } else if (/reserved GTIN group/i.test(error)) {
-            const newEan = generateValidEan13();
-            blog(`Phase 3: row ${meta.row._row} reserved GTIN in queue — retrying with generated EAN ${newEan}`);
-            try {
-              const { row, sellingPrice, categoryId } = meta;
-              const brandVal = row.brand?.trim();
-              const addImgs  = (row.images || []).slice(1).filter(Boolean);
-              const rr = await fetch('https://api.onbuy.com/v2/products', {
-                method: 'POST', headers: { Authorization: currentToken, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ site_id: parseInt(siteId)||2000, products: [{
-                  uid:          row.sku || `bulk-${row._row ?? Date.now()}`,
-                  published:    '1',
-                  category_id:  categoryId,
-                  product_name: _bulkTruncateToBytes(row.name, 150),
-                  ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
-                  default_image: row.images[0],
-                  ...(addImgs.length      ? { additional_images: addImgs }     : {}),
-                  ...(row.description     ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
-                  product_codes: [newEan],
-                  ...(row.mpn             ? { mpn: row.mpn }                   : {}),
-                  ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
-                }] }),
-              });
-              const rd = await rr.json();
-              const rb = (rd?.results ?? [])[0];
-              if (rb?.queue_id) {
-                pendingToSave.push({ queueId: rb.queue_id, meta: { ...meta, row: { ...meta.row, ean: newEan } }, uid: rb.uid ?? null });
-                blog(`Phase 3 GTIN retry: row ${meta.row._row} → queue ${rb.queue_id} with EAN ${newEan}`);
-              } else {
-                throw new Error(rb?.message || 'No queue_id on GTIN retry');
-              }
-            } catch (retryErr) {
-              results.errors.push({ row: meta.row._row, product: meta.row.name, error: retryErr.message }); results.skipped++;
-              db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-                [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),retryErr.message]).catch(() => {});
             }
           } else {
             results.errors.push({ row: meta.row._row, product: meta.row.name, error }); results.skipped++;
@@ -2121,10 +1944,11 @@ async function processBulkImportJob(job) {
     [results.product_created, results.skipped, results.errors.length, sessionId]
   ).catch(() => {});
 
-  // ── Phase 3.5: Update existing products ──
+  // ── Phase 3.5: Update pre-existing products only ──
+  // Newly created products (newlyCreatedMeta) are skipped — Phase 2 already sent all fields.
   const toUpdate = existingMeta.filter(m => m.opc);
   if (toUpdate.length > 0) {
-    blog(`Phase 3.5: updating ${toUpdate.length} existing product(s)`);
+    blog(`Phase 3.5: updating ${toUpdate.length} pre-existing product(s)`);
     for (let i = 0; i < toUpdate.length; i += CREATE_CHUNK) {
       const chunk    = toUpdate.slice(i, i + CREATE_CHUNK);
       const products = chunk.map(({ row, categoryId, opc }) => {
@@ -2139,6 +1963,7 @@ async function processBulkImportJob(job) {
           ...(addImgs.length    ? { additional_images: addImgs }      : {}),
           ...(row.description   ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
           ...(row.mpn           ? { mpn: row.mpn }                    : {}),
+          ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
         };
       });
       let p35Res = await fetch('https://api.onbuy.com/v2/products', {
@@ -2157,10 +1982,12 @@ async function processBulkImportJob(job) {
   }
 
   // ── Phase 4: Create listings ──
-  if (existingMeta.length > 0) {
-    blog(`Phase 4: creating ${existingMeta.length} listing(s)`);
-    for (let i = 0; i < existingMeta.length; i += CHUNK) {
-      const chunk    = existingMeta.slice(i, i + CHUNK);
+  // Covers both pre-existing products (existingMeta) and newly created ones (newlyCreatedMeta).
+  const allListingMeta = [...existingMeta, ...newlyCreatedMeta];
+  if (allListingMeta.length > 0) {
+    blog(`Phase 4: creating ${allListingMeta.length} listing(s) (${existingMeta.length} pre-existing + ${newlyCreatedMeta.length} newly created)`);
+    for (let i = 0; i < allListingMeta.length; i += CHUNK) {
+      const chunk    = allListingMeta.slice(i, i + CHUNK);
       const listings = chunk.map(({ row, sellingPrice, opc }) => ({
         opc, condition: _bulkNormCond(row.condition), price: sellingPrice, stock: parseInt(row.stock)||0,
         ...(row.sku             ? { sku: row.sku }                                    : {}),

@@ -1943,9 +1943,11 @@ app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
         let p = 1;
         for (const cat of items) {
           const catId = cat.category_id ?? cat.id;
-          if (!catId) continue;
+          const lvl   = cat.lvl ?? cat.level ?? 0;
+          // Only store categories that are listable and deep enough to be valid listing targets
+          if (!catId || !cat.can_list_in || lvl < 4) continue;
           vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
-          params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? cat.tree ?? null, cat.level ?? null);
+          params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? '', lvl);
         }
         if (vals.length) {
           await db.query(
@@ -1962,11 +1964,14 @@ app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
       }
     }
 
-    // Fetch all categories from DB
+    // Mirror the sync filter: only export categories that are deep enough (lvl>=4) and have a tree
     const { rows: cats } = await db.query(
       `SELECT category_id, name, tree
-       FROM onbuy_categories WHERE account_id=$1 AND site_id=$2
-       ORDER BY COALESCE(tree,'') ASC, name ASC`,
+       FROM onbuy_categories
+       WHERE account_id=$1 AND site_id=$2
+         AND tree IS NOT NULL AND tree <> ''
+         AND level >= 4
+       ORDER BY tree ASC, name ASC`,
       [accountId, siteId]
     );
 
