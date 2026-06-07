@@ -1605,7 +1605,7 @@ async function processBulkImportJob(job) {
 
   const STOP_WORDS = new Set([
     'and','the','for','with','from','this','that','into','only','plus',
-    'size','colour','color','black','white','new','all','baby','toddler',
+    'size','colour','color','black','white','new','all',
   ]);
   function extractWords(str, minLen = 3) {
     return [...new Set(
