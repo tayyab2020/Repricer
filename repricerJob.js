@@ -1586,115 +1586,154 @@ async function processBulkImportJob(job) {
   }
 
   async function syncCategoriesIfNeeded() {
-    // Re-sync if no rows exist or last sync is older than 24 h
-    const { rows: [{ last_sync }] } = await db.query(
-      `SELECT MAX(synced_at) AS last_sync FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
-      [accountId, siteId]
-    );
-    if (last_sync && (Date.now() - new Date(last_sync).getTime()) < 24 * 60 * 60 * 1000) {
-      const { rows: [{ cnt }] } = await db.query(
-        `SELECT COUNT(*) AS cnt FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
-        [accountId, siteId]
-      );
-      blog(`Category DB cache is fresh (${cnt} categories, synced ${Math.round((Date.now() - new Date(last_sync).getTime()) / 60000)} min ago) — skipping sync`);
-      return;
-    }
-
-    blog('Syncing OnBuy categories into DB…');
-    const limit = 100;
-    let   offset = 0, total = null, synced = 0;
-
-    while (true) {
-      let data;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const r = await fetch(
-            `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
-            { headers: { Authorization: currentToken } }
-          );
-          if (r.status === 429) {
-            blog(`Category sync rate-limited at offset ${offset} — waiting ${attempt} min`);
-            await new Promise(res => setTimeout(res, attempt * 60_000));
-            continue;
-          }
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          data = await r.json();
-          break;
-        } catch (e) {
-          if (attempt === 3) throw new Error(`Category sync failed at offset ${offset}: ${e.message}`);
-          await new Promise(res => setTimeout(res, 2000));
-        }
-      }
-
-      const items = data?.payload ?? data?.results ?? (Array.isArray(data) ? data : []);
-      if (total === null) total = data?.metadata?.total_rows ?? data?.total ?? items.length;
-
-      if (!items.length) break;
-
-      // Upsert batch
-      const vals   = [];
-      const params = [];
-      let   p = 1;
-      for (const cat of items) {
-        const catId = cat.category_id ?? cat.id;
-        const lvl   = cat.lvl ?? cat.level ?? 0;
-        // Only store categories that are listable and deep enough to be valid listing targets
-        if (!catId || !cat.can_list_in || lvl < 4) continue;
-        vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
-        params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? '', lvl);
-      }
-      if (vals.length) {
-        await db.query(
-          `INSERT INTO onbuy_categories (category_id,account_id,site_id,name,tree,level,synced_at)
-           VALUES ${vals.join(',')}
-           ON CONFLICT (category_id,account_id,site_id)
-           DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
-          params
-        );
-      }
-
-      synced += items.length;
-      offset += limit;
-      blog(`Category sync: ${synced}/${total} categories stored`);
-
-      if (synced >= total) break;
-      await new Promise(res => setTimeout(res, 150)); // small gap between pages
-    }
-    blog(`Category sync complete — ${synced} categories in DB`);
+    const { rows: [{ cnt }] } = await db.query(`SELECT COUNT(*) AS cnt FROM onbuy_categories`);
+    if (parseInt(cnt) === 0) throw new Error('No OnBuy categories found. Ask the admin to upload the categories file in Settings.');
+    blog(`Categories ready — ${cnt} categories in DB`);
   }
 
-  async function lookupCategoryId(name) {
-    const trimmed = String(name).trim();
-    if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
-    if (categoryCache[name] !== undefined) return categoryCache[name];
+  // Splits a string like "A › B > C | D" into clean segments regardless of separator used
+  function parseCategoryPath(str) {
+    return String(str || '')
+      .replace(/[›»]/g, '>') // normalize Unicode arrow separators to >
+      .split('>')
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
 
-    // Try leaf name first (after last '>'), then full trimmed name
-    const leafName = name.includes('>') ? name.split('>').pop().trim() : trimmed;
-    const { rows } = await db.query(
-      `SELECT category_id FROM onbuy_categories
-       WHERE account_id=$1 AND site_id=$2 AND lower(name)=lower($3)
-         AND tree IS NOT NULL AND tree <> ''
-       LIMIT 1`,
-      [accountId, siteId, leafName]
-    );
-    if (rows[0]) {
-      categoryCache[name] = rows[0].category_id;
-      blog(`Category "${leafName}" → id=${categoryCache[name]} (DB)`);
-      return categoryCache[name];
+  // Score how many words from `needleWords` appear in `haystack` (case-insensitive)
+  function wordOverlapScore(needleWords, haystack) {
+    const h = haystack.toLowerCase();
+    return needleWords.filter(w => h.includes(w)).length;
+  }
+
+  // Extract meaningful words from a string (min 3 chars, skip stop words)
+  const STOP_WORDS = new Set([
+    'and','the','for','with','from','this','that','into','only','plus',
+    'size','colour','color','black','white','pack','set','box','new','all',
+  ]);
+  function keywords(str, minLen = 3) {
+    return String(str || '')
+      .split(/[\s\-_,.()/&›>]+/)
+      .map(w => w.replace(/[^a-zA-Z0-9]/g, '').toLowerCase())
+      .filter(w => w.length >= minLen && !STOP_WORDS.has(w));
+  }
+
+  // Pick best match from a candidate row list by word-overlap score.
+  // Returns the category_id if any candidate scores above the threshold.
+  function bestWordMatch(candidates, needleWords, field = 'name', threshold = 0.5) {
+    let best = null, bestScore = 0;
+    for (const row of candidates) {
+      const score = wordOverlapScore(needleWords, row[field]);
+      if (score > bestScore) { bestScore = score; best = row; }
+    }
+    // require at least `threshold` fraction of needle words to match
+    if (best && bestScore >= Math.max(1, Math.ceil(needleWords.length * threshold))) {
+      return best.category_id;
+    }
+    return null;
+  }
+
+  async function lookupCategoryId(catValue, productName = null) {
+    const trimmed = String(catValue || '').trim();
+
+    // Numeric ID — use directly without any lookup
+    if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+
+    // Cache hit (only positive results are cached; nulls are NOT cached so the
+    // product-name fallback can still fire on the per-row call)
+    if (categoryCache[trimmed] !== undefined) return categoryCache[trimmed];
+
+    // Normalize separators and split into segments
+    const segments = parseCategoryPath(trimmed);
+    const leafName = segments[segments.length - 1] ?? trimmed;
+    const mainCat  = segments[0] ?? trimmed;
+    const leafWords = keywords(leafName);
+
+    // ── Tier 1: exact full-path match ──
+    if (segments.length > 1) {
+      const fullPath = segments.join(' > ');
+      const { rows: t1 } = await db.query(
+        `SELECT category_id FROM onbuy_categories
+         WHERE lower(COALESCE(tree,'') || ' > ' || name) = lower($1)
+         LIMIT 1`,
+        [fullPath]
+      );
+      if (t1[0]) {
+        categoryCache[trimmed] = t1[0].category_id;
+        blog(`Category → id=${t1[0].category_id} (full path exact)`);
+        return categoryCache[trimmed];
+      }
     }
 
-    // Partial match fallback
-    const { rows: fuzzy } = await db.query(
-      `SELECT category_id FROM onbuy_categories
-       WHERE account_id=$1 AND site_id=$2 AND lower(name) LIKE lower($3)
-         AND tree IS NOT NULL AND tree <> ''
-       LIMIT 1`,
-      [accountId, siteId, `%${leafName}%`]
+    // ── Tier 2: leaf name exact ──
+    const { rows: t2 } = await db.query(
+      `SELECT category_id FROM onbuy_categories WHERE lower(name)=lower($1) LIMIT 1`,
+      [leafName]
     );
-    categoryCache[name] = fuzzy[0]?.category_id ?? null;
-    if (categoryCache[name]) blog(`Category "${leafName}" → id=${categoryCache[name]} (DB fuzzy)`);
-    else                      blog(`Category "${leafName}" not found in DB`);
-    return categoryCache[name];
+    if (t2[0]) {
+      categoryCache[trimmed] = t2[0].category_id;
+      blog(`Category "${leafName}" → id=${t2[0].category_id} (leaf exact)`);
+      return categoryCache[trimmed];
+    }
+
+    // ── Tier 3: leaf word-intersection — fetch all categories whose name contains
+    //    at least one word from the leaf, then pick the best-scoring one.
+    //    Handles: "Baby Nappies" → "Baby Disposable Nappies" ──
+    if (leafWords.length) {
+      const conditions = leafWords.map((_, i) => `lower(name) LIKE lower($${i + 1})`).join(' OR ');
+      const params     = leafWords.map(w => `%${w}%`);
+      const { rows: t3candidates } = await db.query(
+        `SELECT category_id, name FROM onbuy_categories WHERE ${conditions}`,
+        params
+      );
+      const t3id = bestWordMatch(t3candidates, leafWords, 'name', 0.5);
+      if (t3id) {
+        categoryCache[trimmed] = t3id;
+        blog(`Category "${leafName}" → id=${t3id} (leaf word-overlap)`);
+        return categoryCache[trimmed];
+      }
+    }
+
+    // ── Tier 4: main category word-intersection against tree column ──
+    //    Handles: "Baby Products" → "Baby & Toddler > …" ──
+    if (segments.length > 1) {
+      const mainWords = keywords(mainCat);
+      if (mainWords.length) {
+        const conditions = mainWords.map((_, i) => `lower(tree) LIKE lower($${i + 1})`).join(' OR ');
+        const params     = mainWords.map(w => `%${w}%`);
+        const { rows: t4candidates } = await db.query(
+          `SELECT category_id, tree FROM onbuy_categories WHERE ${conditions} ORDER BY level DESC`,
+          params
+        );
+        const t4id = bestWordMatch(t4candidates, mainWords, 'tree', 0.4);
+        if (t4id) {
+          categoryCache[trimmed] = t4id;
+          blog(`Category "${mainCat}…" → id=${t4id} (main cat word-overlap)`);
+          return categoryCache[trimmed];
+        }
+      }
+    }
+
+    // ── Tier 5: product name keyword fallback (per-row only, not cached) ──
+    if (productName) {
+      const prodWords = keywords(productName, 4).slice(0, 6);
+      for (const kw of prodWords) {
+        const { rows: t5 } = await db.query(
+          `SELECT category_id FROM onbuy_categories
+           WHERE lower(name) LIKE lower($1) OR lower(tree) LIKE lower($1)
+           ORDER BY (lower(name) LIKE lower($1))::int DESC
+           LIMIT 1`,
+          [`%${kw}%`]
+        );
+        if (t5[0]) {
+          blog(`Category fallback via product keyword "${kw}" → id=${t5[0].category_id}`);
+          return t5[0].category_id; // not cached — product-specific
+        }
+      }
+    }
+
+    blog(`Category "${trimmed}" not resolved`);
+    return null; // not cached — allows retry on next per-row call
   }
 
   async function batchPollQueues(queueIds) {
@@ -1755,7 +1794,7 @@ async function processBulkImportJob(job) {
   for (const row of validRows) {
     const sourcePrice  = parseFloat(row.price) || 0;
     const sellingPrice = parseFloat((sourcePrice * 1.20 / 0.85).toFixed(2));
-    const categoryId   = await lookupCategoryId(row.category);
+    const categoryId   = await lookupCategoryId(row.category, row.name);
     if (!categoryId) {
       const errMsg = `Category "${row.category}" not found on OnBuy`;
       results.errors.push({ row: row._row, product: row.name, error: errMsg }); results.skipped++;

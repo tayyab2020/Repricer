@@ -1401,7 +1401,7 @@ const INTERVAL_OPTIONS = [
   { value: "720", label: "Every 12 hours" },
 ];
 
-function SettingsPage({ onIntervalChange, onStartTimeChange }) {
+function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin }) {
   const [proxyUrl,      setProxyUrl]      = useState("");
   const [feePercent,    setFeePercent]    = useState("15");
   const [defaultRoi,    setDefaultRoi]    = useState("20");
@@ -1411,6 +1411,9 @@ function SettingsPage({ onIntervalChange, onStartTimeChange }) {
   const [status,        setStatus]        = useState(null);
   const [saving,        setSaving]        = useState(false);
   const [msg,           setMsg]           = useState(null);
+  const [catCount,      setCatCount]      = useState(null);
+  const [catUploading,  setCatUploading]  = useState(false);
+  const [catMsg,        setCatMsg]        = useState(null);
 
   useEffect(() => {
     api("/settings").then(s => {
@@ -1422,6 +1425,7 @@ function SettingsPage({ onIntervalChange, onStartTimeChange }) {
       setStartTime(s.job_start_time         || "00:00");
       setStatus(s._proxy_status);
     }).catch(console.error);
+    api("/settings/categories/count").then(d => setCatCount(d.count)).catch(() => setCatCount(0));
   }, []);
 
   const save = async () => {
@@ -1648,6 +1652,67 @@ function SettingsPage({ onIntervalChange, onStartTimeChange }) {
       <Btn onClick={save} disabled={saving} style={{ alignSelf: "flex-start" }}>
         {saving ? "Saving…" : "Save Settings"}
       </Btn>
+
+      {isSuperAdmin && (
+        <Section title="OnBuy Categories">
+          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+              <div>
+                <p style={{ color: C.textDim, fontSize: 12, marginBottom: 2 }}>Categories in database</p>
+                <p style={{ color: catCount === 0 ? C.red : C.accent, fontWeight: 700, fontSize: 22 }}>
+                  {catCount === null ? "…" : catCount.toLocaleString()}
+                </p>
+              </div>
+              {catCount === 0 && (
+                <p style={{ color: C.amber, fontSize: 12, maxWidth: 320 }}>
+                  No categories loaded. Bulk listing imports will fail until a categories file is uploaded.
+                </p>
+              )}
+            </div>
+            <div>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 6 }}>
+                Upload Categories File <span style={{ color: C.muted }}>(CSV or XLSX — must have ID and Category columns)</span>
+              </p>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <input
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  style={{ color: C.text, fontSize: 13 }}
+                  disabled={catUploading}
+                  onChange={async e => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    setCatUploading(true); setCatMsg(null);
+                    try {
+                      const token = localStorage.getItem("repricer_token");
+                      const fd = new FormData();
+                      fd.append("file", file);
+                      const r = await fetch(`${API}/settings/categories/upload`, {
+                        method: "POST",
+                        headers: token ? { Authorization: `Bearer ${token}` } : {},
+                        body: fd,
+                      });
+                      const data = await r.json();
+                      if (!r.ok) throw new Error(data.error || "Upload failed");
+                      setCatCount(data.count);
+                      setCatMsg({ ok: true, text: `Uploaded ${data.count.toLocaleString()} categories` });
+                    } catch (err) {
+                      setCatMsg({ ok: false, text: err.message });
+                    } finally {
+                      setCatUploading(false);
+                      e.target.value = "";
+                    }
+                  }}
+                />
+                {catUploading && <span style={{ color: C.muted, fontSize: 12 }}>Uploading…</span>}
+              </div>
+            </div>
+            {catMsg && (
+              <p style={{ color: catMsg.ok ? C.accent : C.red, fontSize: 13 }}>{catMsg.text}</p>
+            )}
+          </div>
+        </Section>
+      )}
     </div>
   );
 }
@@ -1977,7 +2042,7 @@ export default function App() {
         {page === "onbuy-bulk"     && <OnBuyBulkPage />}
         {page === "sku-change"       && <SkuChangePage />}
         {page === "delete-listings"  && <DeleteListingsPage />}
-        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} />}
+        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
         {page === "chart"          && chartMapping && (
@@ -3190,8 +3255,7 @@ function OnBuyBulkPage() {
     setCatExportLoading(true);
     try {
       const token = localStorage.getItem("repricer_token");
-      const qs = accountId ? `?account_id=${accountId}` : "";
-      const r = await fetch(`${API}/onbuy-bulk/categories/export${qs}`, {
+      const r = await fetch(`${API}/onbuy-bulk/categories/export`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (!r.ok) throw new Error(await r.text());

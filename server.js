@@ -1634,16 +1634,23 @@ async function runMigrations() {
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS rows_data JSONB`,
     `ALTER TABLE onbuy_bulk_import_sessions ADD COLUMN IF NOT EXISTS rate_limit_until TIMESTAMPTZ`,
     `CREATE TABLE IF NOT EXISTS onbuy_categories (
-       category_id  INTEGER      NOT NULL,
-       account_id   INTEGER      NOT NULL,
-       site_id      INTEGER      NOT NULL DEFAULT 2000,
+       category_id  INTEGER      NOT NULL PRIMARY KEY,
        name         TEXT         NOT NULL,
        tree         TEXT,
        level        INTEGER,
-       synced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-       PRIMARY KEY (category_id, account_id, site_id)
+       synced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
      )`,
-    `CREATE INDEX IF NOT EXISTS idx_onbuy_cats_name ON onbuy_categories(account_id, site_id, lower(name))`,
+    // Migrate existing installs: drop account/site columns and rebuild PK as global
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='onbuy_categories' AND column_name='account_id') THEN
+         TRUNCATE TABLE onbuy_categories;
+         ALTER TABLE onbuy_categories DROP CONSTRAINT IF EXISTS onbuy_categories_pkey;
+         ALTER TABLE onbuy_categories DROP COLUMN IF EXISTS account_id;
+         ALTER TABLE onbuy_categories DROP COLUMN IF EXISTS site_id;
+         ALTER TABLE onbuy_categories ADD PRIMARY KEY (category_id);
+       END IF;
+     END $$`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_cats_name ON onbuy_categories(lower(name))`,
     `CREATE TABLE IF NOT EXISTS onbuy_bulk_pending_queues (
        id           SERIAL PRIMARY KEY,
        session_id   INTEGER,
@@ -1873,109 +1880,15 @@ app.get('/api/onbuy-bulk/template', requireAuth, (req, res) => {
   res.send(buf);
 });
 
-// GET /api/onbuy-bulk/categories/export — download all OnBuy categories as XLSX
+// GET /api/onbuy-bulk/categories/export — download categories sheet (populated by admin upload)
 app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
   try {
-    const uid = req.user.id;
-    const reqAccountId = req.query.account_id ? parseInt(req.query.account_id) : null;
-
-    // Prefer the explicitly requested account, then user's first active, then any active
-    let account;
-    if (reqAccountId) {
-      const { rows } = await db.query(
-        `SELECT * FROM onbuy_accounts WHERE id=$1 AND is_active=true LIMIT 1`, [reqAccountId]
-      );
-      account = rows[0];
-    }
-    if (!account) {
-      const { rows } = await db.query(
-        `SELECT * FROM onbuy_accounts WHERE user_id=$1 AND is_active=true ORDER BY id LIMIT 1`, [uid]
-      );
-      account = rows[0];
-    }
-    if (!account) {
-      const { rows } = await db.query(
-        `SELECT * FROM onbuy_accounts WHERE is_active=true ORDER BY id LIMIT 1`
-      );
-      account = rows[0];
-    }
-    if (!account) return res.status(400).json({ error: 'No active OnBuy account found' });
-    const accountId = account.id;
-    const siteId    = account.site_id || 2000;
-
-    // Check if DB cache is fresh (< 24 h)
-    const { rows: [{ last_sync, cat_count }] } = await db.query(
-      `SELECT MAX(synced_at) AS last_sync, COUNT(*) AS cat_count
-       FROM onbuy_categories WHERE account_id=$1 AND site_id=$2`,
-      [accountId, siteId]
-    );
-    const cacheAge = last_sync ? Date.now() - new Date(last_sync).getTime() : Infinity;
-    const needSync = cacheAge > 24 * 60 * 60 * 1000 || parseInt(cat_count) === 0;
-
-    if (needSync) {
-      // Sync categories from OnBuy API
-      const token = await getTokenForAccount(account);
-      if (!token) return res.status(500).json({ error: 'Failed to get OnBuy token' });
-      let currentToken = token;
-      const limit = 100;
-      let offset = 0, total = null;
-      while (true) {
-        let data;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          const r = await fetch(
-            `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
-            { headers: { Authorization: currentToken } }
-          );
-          if (r.status === 401) {
-            currentToken = await getTokenForAccount(account);
-            continue;
-          }
-          if (r.status === 429) { await new Promise(x => setTimeout(x, attempt * 60_000)); continue; }
-          if (!r.ok) throw new Error(`OnBuy categories API HTTP ${r.status}`);
-          data = await r.json();
-          break;
-        }
-        if (!data) throw new Error('Failed to fetch categories from OnBuy after retries');
-        const items = data?.payload ?? data?.results ?? (Array.isArray(data) ? data : []);
-        if (total === null) total = data?.metadata?.total_rows ?? data?.total ?? items.length;
-        if (!items.length) break;
-        const vals = [], params = [];
-        let p = 1;
-        for (const cat of items) {
-          const catId = cat.category_id ?? cat.id;
-          const lvl   = cat.lvl ?? cat.level ?? 0;
-          // Only store categories that are listable and deep enough to be valid listing targets
-          if (!catId || !cat.can_list_in || lvl < 4) continue;
-          vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
-          params.push(catId, accountId, siteId, cat.name ?? '', cat.category_tree ?? '', lvl);
-        }
-        if (vals.length) {
-          await db.query(
-            `INSERT INTO onbuy_categories (category_id,account_id,site_id,name,tree,level,synced_at)
-             VALUES ${vals.join(',')}
-             ON CONFLICT (category_id,account_id,site_id)
-             DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
-            params
-          );
-        }
-        offset += items.length;
-        if (offset >= total) break;
-        await new Promise(x => setTimeout(x, 150));
-      }
-    }
-
-    // Mirror the sync filter: only export categories that are deep enough (lvl>=4) and have a tree
     const { rows: cats } = await db.query(
-      `SELECT category_id, name, tree
-       FROM onbuy_categories
-       WHERE account_id=$1 AND site_id=$2
-         AND tree IS NOT NULL AND tree <> ''
-         AND level >= 4
-       ORDER BY tree ASC, name ASC`,
-      [accountId, siteId]
+      `SELECT category_id, name, tree FROM onbuy_categories ORDER BY tree ASC, name ASC`
     );
-
-    // Build XLSX
+    if (!cats.length) {
+      return res.status(400).json({ error: 'No categories found. Please ask the admin to upload the OnBuy categories file in Settings.' });
+    }
     const wsData = [['ID', 'Category']];
     for (const c of cats) {
       const fullPath = c.tree ? `${c.tree} > ${c.name}` : c.name;
@@ -1991,6 +1904,69 @@ app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
     res.send(buf);
   } catch (e) {
     console.error('[Categories export]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/settings/categories/count — return total categories in DB
+app.get('/api/settings/categories/count', requireAuth, async (req, res) => {
+  try {
+    const { rows: [{ count }] } = await db.query(`SELECT COUNT(*) AS count FROM onbuy_categories`);
+    res.json({ count: parseInt(count) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/settings/categories/upload — super-admin uploads OnBuy categories CSV/XLSX
+app.post('/api/settings/categories/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb   = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws   = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+    // Find header row (contains "ID" and "Category")
+    let headerIdx = 0;
+    for (let i = 0; i < Math.min(rows.length, 5); i++) {
+      const r = rows[i].map(c => String(c).toLowerCase().trim());
+      if (r.some(c => c === 'id') && r.some(c => c.includes('category'))) { headerIdx = i; break; }
+    }
+    const header   = rows[headerIdx].map(c => String(c).toLowerCase().trim());
+    const idCol    = header.findIndex(h => h === 'id');
+    const catCol   = header.findIndex(h => h.includes('category'));
+    if (idCol === -1 || catCol === -1) return res.status(400).json({ error: 'File must have "ID" and "Category" columns' });
+
+    const dataRows = rows.slice(headerIdx + 1).filter(r => r[idCol] !== '' && r[catCol] !== '');
+
+    const vals = [], params = [];
+    let p = 1;
+    for (const row of dataRows) {
+      const catId    = parseInt(row[idCol]);
+      const fullPath = String(row[catCol]).trim();
+      if (!catId || !fullPath) continue;
+      const parts = fullPath.split('>').map(s => s.trim());
+      const name  = parts[parts.length - 1];
+      const tree  = parts.length > 1 ? parts.slice(0, -1).join(' > ') : '';
+      const level = parts.length;
+      vals.push(`($${p++},$${p++},$${p++},$${p++},NOW())`);
+      params.push(catId, name, tree, level);
+    }
+
+    if (!vals.length) return res.status(400).json({ error: 'No valid category rows found in file' });
+
+    await db.query(`TRUNCATE TABLE onbuy_categories`);
+    await db.query(
+      `INSERT INTO onbuy_categories (category_id, name, tree, level, synced_at)
+       VALUES ${vals.join(',')}
+       ON CONFLICT (category_id) DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
+      params
+    );
+
+    console.log(`[Categories] Admin uploaded ${vals.length} categories`);
+    res.json({ count: vals.length });
+  } catch (e) {
+    console.error('[Categories upload]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -2103,6 +2079,11 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'No rows provided' });
   if (!account_id)
     return res.status(400).json({ error: 'OnBuy account required' });
+
+  // Guard: categories must be uploaded before imports can run
+  const { rows: [{ cat_count }] } = await db.query(`SELECT COUNT(*) AS cat_count FROM onbuy_categories`);
+  if (parseInt(cat_count) === 0)
+    return res.status(400).json({ error: 'OnBuy categories not found. Please ask the admin to upload the categories file in Settings before importing.' });
 
   const account = await getImportAccount(account_id);
   if (!account) return res.status(400).json({ error: 'Account not found or inactive' });
