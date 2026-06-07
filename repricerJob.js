@@ -1594,6 +1594,15 @@ async function processBulkImportJob(job) {
     blog(`Categories ready — ${cnt} categories in DB`);
   }
 
+  // Generate a structurally valid EAN-13 using GS1 UK prefix 500 + 9 random digits.
+  // Used as a fallback when the original product code is rejected by OnBuy.
+  function generateEan13() {
+    const base = '500' + String(Math.floor(Math.random() * 1_000_000_000)).padStart(9, '0');
+    let sum = 0;
+    for (let i = 0; i < 12; i++) sum += parseInt(base[i]) * (i % 2 === 0 ? 1 : 3);
+    return base + ((10 - (sum % 10)) % 10);
+  }
+
   // Normalize "A › B > C" → ["A", "B", "C"] regardless of separator
   function parseCategoryPath(str) {
     return String(str || '')
@@ -1931,6 +1940,7 @@ async function processBulkImportJob(job) {
     blog(`Phase 3: waiting 15 s before polling ${queueItems.length} queue(s)…`);
     await new Promise(res => setTimeout(res, 15_000));
     const pendingToSave = [];
+    const eanRetries   = []; // collected during poll; sent in batch after all queues are processed
     for (let i = 0; i < queueItems.length; i += 1000) {
       const batch   = queueItems.slice(i, i + 1000);
       const pollMap = await batchPollQueues(batch.map(q => q.queueId));
@@ -1959,6 +1969,28 @@ async function processBulkImportJob(job) {
               db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
                 [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),searchErr.message]).catch(() => {});
             }
+          } else if (/is not a valid product code|reserved GTIN group/i.test(error)) {
+            // Collect for batched retry — sent together after all queues are processed
+            const newEan   = generateEan13();
+            const brandVal = meta.row.brand?.trim();
+            const addImgs  = (meta.row.images || []).slice(1).filter(Boolean);
+            eanRetries.push({
+              prod: {
+                uid:          meta.row.sku || `bulk-${meta.row._row ?? Date.now()}`,
+                published:    '1',
+                category_id:  meta.categoryId,
+                product_name: _bulkTruncateToBytes(meta.row.name, 150),
+                ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
+                default_image: meta.row.images[0],
+                ...(addImgs.length       ? { additional_images: addImgs }                                   : {}),
+                ...(meta.row.description ? { description: String(meta.row.description).replace(/[<>]/g, '') } : {}),
+                product_codes: [newEan],
+                ...(meta.row.mpn             ? { mpn: meta.row.mpn }                              : {}),
+                ...(meta.row.delivery_weight ? { delivery_weight: parseFloat(meta.row.delivery_weight) } : {}),
+              },
+              meta: { ...meta, row: { ...meta.row, ean: newEan } },
+            });
+            blog(`Phase 3: invalid product code for "${meta.row.name}" → EAN ${newEan} queued for batch retry`);
           } else {
             results.errors.push({ row: meta.row._row, product: meta.row.name, error }); results.skipped++;
             db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
@@ -1966,6 +1998,27 @@ async function processBulkImportJob(job) {
           }
         } else {
           pendingToSave.push({ queueId, meta, uid: qr.uid ?? meta.row.uid ?? null });
+        }
+      }
+    }
+    // ── Phase 3 EAN retry: send all invalid-EAN products in CREATE_CHUNK batches ──
+    if (eanRetries.length > 0) {
+      blog(`Phase 3 EAN retry: sending ${eanRetries.length} product(s) in ${Math.ceil(eanRetries.length / CREATE_CHUNK)} batch(es)`);
+      for (let i = 0; i < eanRetries.length; i += CREATE_CHUNK) {
+        const retryChunk   = eanRetries.slice(i, i + CREATE_CHUNK);
+        const retryResults = await sendChunk(retryChunk.map(r => r.prod), retryChunk.map(r => r.meta));
+        for (let j = 0; j < retryChunk.length; j++) {
+          const { meta: retryMeta } = retryChunk[j];
+          const rr = retryResults[j];
+          if (rr?.queue_id) {
+            pendingToSave.push({ queueId: rr.queue_id, meta: retryMeta, uid: null });
+            blog(`Phase 3 EAN retry: queued → queue_id=${rr.queue_id}, ean=${retryMeta.row.ean}`);
+          } else {
+            const retryMsg = `EAN retry failed: ${rr?.message || 'no queue_id'}`;
+            results.errors.push({ row: retryMeta.row._row, product: retryMeta.row.name, error: retryMsg }); results.skipped++;
+            db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+              [sessionId,userId,retryMeta.row._row,retryMeta.row.name,retryMeta.row.sku,retryMeta.row.ean,retryMeta.row.category,retryMeta.row.brand,retryMeta.sourcePrice,retryMeta.sellingPrice,parseInt(retryMeta.row.stock)||0,_bulkNormCond(retryMeta.row.condition),retryMsg]).catch(() => {});
+          }
         }
       }
     }
