@@ -1574,6 +1574,7 @@ async function processBulkImportJob(job) {
 
   const results = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
   const categoryCache = {};
+  let   categoryList  = []; // preloaded at Phase 1b — {category_id, nameLower, fullPathLower, wordSet}
   const CHUNK        = 1000; // listing creation (Phase 4) — small payload per item
   const CREATE_CHUNK = 100;  // product creation (Phase 2/3.5) — large payload (desc + images)
   let currentToken = token; // mutable so we can refresh mid-job
@@ -1591,149 +1592,107 @@ async function processBulkImportJob(job) {
     blog(`Categories ready — ${cnt} categories in DB`);
   }
 
-  // Splits a string like "A › B > C | D" into clean segments regardless of separator used
+  // Normalize "A › B > C" → ["A", "B", "C"] regardless of separator
   function parseCategoryPath(str) {
     return String(str || '')
-      .replace(/[›»]/g, '>') // normalize Unicode arrow separators to >
+      .replace(/[›»]/g, '>')
       .split('>')
       .map(s => s.trim())
       .filter(Boolean);
   }
 
-  // Score how many words from `needleWords` appear in `haystack` (case-insensitive)
-  function wordOverlapScore(needleWords, haystack) {
-    const h = haystack.toLowerCase();
-    return needleWords.filter(w => h.includes(w)).length;
-  }
-
-  // Extract meaningful words from a string (min 3 chars, skip stop words)
   const STOP_WORDS = new Set([
     'and','the','for','with','from','this','that','into','only','plus',
-    'size','colour','color','black','white','pack','set','box','new','all',
+    'size','colour','color','black','white','new','all','baby','toddler',
   ]);
-  function keywords(str, minLen = 3) {
-    return String(str || '')
-      .split(/[\s\-_,.()/&›>]+/)
-      .map(w => w.replace(/[^a-zA-Z0-9]/g, '').toLowerCase())
-      .filter(w => w.length >= minLen && !STOP_WORDS.has(w));
+  function extractWords(str, minLen = 3) {
+    return [...new Set(
+      String(str || '')
+        .split(/[\s\-_,.()/&›>]+/)
+        .map(w => w.replace(/[^a-zA-Z0-9]/g, '').toLowerCase())
+        .filter(w => w.length >= minLen && !STOP_WORDS.has(w))
+    )];
   }
 
-  // Pick best match from a candidate row list by word-overlap score.
-  // Returns the category_id if any candidate scores above the threshold.
-  function bestWordMatch(candidates, needleWords, field = 'name', threshold = 0.5) {
+  // Score one DB category against a set of input words.
+  // Returns fraction of inputWords found in the category's full path (name + tree).
+  function scoreCategory(cat, inputWords) {
+    let hits = 0;
+    for (const w of inputWords) {
+      if (cat.wordSet.has(w)) hits++;
+    }
+    return hits / inputWords.length;
+  }
+
+  // Pick best-scoring category from the preloaded list.
+  // minFraction: minimum fraction of inputWords that must match.
+  // minHits: absolute minimum hit count (prevents 1/1 = 100% on single noise words).
+  function bestCategory(inputWords, minFraction = 0.35, minHits = 2) {
+    if (!categoryList.length || !inputWords.length) return null;
     let best = null, bestScore = 0;
-    for (const row of candidates) {
-      const score = wordOverlapScore(needleWords, row[field]);
-      if (score > bestScore) { bestScore = score; best = row; }
+    for (const cat of categoryList) {
+      const score = scoreCategory(cat, inputWords);
+      if (score > bestScore) { bestScore = score; best = cat; }
     }
-    // require at least `threshold` fraction of needle words to match
-    if (best && bestScore >= Math.max(1, Math.ceil(needleWords.length * threshold))) {
-      return best.category_id;
-    }
+    const hits = best ? Math.round(bestScore * inputWords.length) : 0;
+    if (best && bestScore >= minFraction && hits >= minHits) return best.category_id;
     return null;
   }
 
   async function lookupCategoryId(catValue, productName = null) {
     const trimmed = String(catValue || '').trim();
-
-    // Numeric ID — use directly without any lookup
     if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
-
-    // Cache hit (only positive results are cached; nulls are NOT cached so the
-    // product-name fallback can still fire on the per-row call)
     if (categoryCache[trimmed] !== undefined) return categoryCache[trimmed];
 
-    // Normalize separators and split into segments
-    const segments = parseCategoryPath(trimmed);
-    const leafName = segments[segments.length - 1] ?? trimmed;
-    const mainCat  = segments[0] ?? trimmed;
-    const leafWords = keywords(leafName);
+    const segments    = parseCategoryPath(trimmed);
+    const leafName    = (segments[segments.length - 1] ?? trimmed).toLowerCase();
+    const fullPathLow = segments.join(' > ').toLowerCase();
 
-    // ── Tier 1: exact full-path match ──
-    if (segments.length > 1) {
-      const fullPath = segments.join(' > ');
-      const { rows: t1 } = await db.query(
-        `SELECT category_id FROM onbuy_categories
-         WHERE lower(COALESCE(tree,'') || ' > ' || name) = lower($1)
-         LIMIT 1`,
-        [fullPath]
-      );
-      if (t1[0]) {
-        categoryCache[trimmed] = t1[0].category_id;
-        blog(`Category → id=${t1[0].category_id} (full path exact)`);
-        return categoryCache[trimmed];
-      }
-    }
-
-    // ── Tier 2: leaf name exact ──
-    const { rows: t2 } = await db.query(
-      `SELECT category_id FROM onbuy_categories WHERE lower(name)=lower($1) LIMIT 1`,
-      [leafName]
-    );
-    if (t2[0]) {
-      categoryCache[trimmed] = t2[0].category_id;
-      blog(`Category "${leafName}" → id=${t2[0].category_id} (leaf exact)`);
+    // ── Tier 1: exact full-path match (in-memory) ──
+    const t1 = categoryList.find(c => c.fullPathLower === fullPathLow);
+    if (t1) {
+      categoryCache[trimmed] = t1.category_id;
+      blog(`Category → id=${t1.category_id} (full path exact)`);
       return categoryCache[trimmed];
     }
 
-    // ── Tier 3: leaf word-intersection — fetch all categories whose name contains
-    //    at least one word from the leaf, then pick the best-scoring one.
-    //    Handles: "Baby Nappies" → "Baby Disposable Nappies" ──
-    if (leafWords.length) {
-      const conditions = leafWords.map((_, i) => `lower(name) LIKE lower($${i + 1})`).join(' OR ');
-      const params     = leafWords.map(w => `%${w}%`);
-      const { rows: t3candidates } = await db.query(
-        `SELECT category_id, name FROM onbuy_categories WHERE ${conditions}`,
-        params
-      );
-      const t3id = bestWordMatch(t3candidates, leafWords, 'name', 0.5);
+    // ── Tier 2: exact leaf name match (in-memory) ──
+    const t2 = categoryList.find(c => c.nameLower === leafName);
+    if (t2) {
+      categoryCache[trimmed] = t2.category_id;
+      blog(`Category "${leafName}" → id=${t2.category_id} (leaf exact)`);
+      return categoryCache[trimmed];
+    }
+
+    // ── Tier 3: score ALL path segments against ALL DB categories.
+    //    Uses the full input path ("toys games card collectible booster packs")
+    //    so "Booster Seats" (only matches "booster" → 1/6 = 17%) loses to
+    //    "Card Games" (matches "toys","games","card" → 3/6 = 50%). ──
+    const pathWords = extractWords(segments.join(' '));
+    if (pathWords.length) {
+      const t3id = bestCategory(pathWords, 0.35, 2);
       if (t3id) {
         categoryCache[trimmed] = t3id;
-        blog(`Category "${leafName}" → id=${t3id} (leaf word-overlap)`);
+        blog(`Category "${trimmed}" → id=${t3id} (path word-overlap)`);
         return categoryCache[trimmed];
       }
     }
 
-    // ── Tier 4: main category word-intersection against tree column ──
-    //    Handles: "Baby Products" → "Baby & Toddler > …" ──
-    if (segments.length > 1) {
-      const mainWords = keywords(mainCat);
-      if (mainWords.length) {
-        const conditions = mainWords.map((_, i) => `lower(tree) LIKE lower($${i + 1})`).join(' OR ');
-        const params     = mainWords.map(w => `%${w}%`);
-        const { rows: t4candidates } = await db.query(
-          `SELECT category_id, tree FROM onbuy_categories WHERE ${conditions} ORDER BY level DESC`,
-          params
-        );
-        const t4id = bestWordMatch(t4candidates, mainWords, 'tree', 0.4);
-        if (t4id) {
-          categoryCache[trimmed] = t4id;
-          blog(`Category "${mainCat}…" → id=${t4id} (main cat word-overlap)`);
-          return categoryCache[trimmed];
-        }
-      }
-    }
-
-    // ── Tier 5: product name keyword fallback (per-row only, not cached) ──
+    // ── Tier 4: product name keyword fallback (per-row only, not cached).
+    //    Combines product keywords with path words for a broader signal. ──
     if (productName) {
-      const prodWords = keywords(productName, 4).slice(0, 6);
-      for (const kw of prodWords) {
-        const { rows: t5 } = await db.query(
-          `SELECT category_id FROM onbuy_categories
-           WHERE lower(name) LIKE lower($1) OR lower(tree) LIKE lower($1)
-           ORDER BY (lower(name) LIKE lower($1))::int DESC
-           LIMIT 1`,
-          [`%${kw}%`]
-        );
-        if (t5[0]) {
-          blog(`Category fallback via product keyword "${kw}" → id=${t5[0].category_id}`);
-          return t5[0].category_id; // not cached — product-specific
+      const combined = [...new Set([...pathWords, ...extractWords(productName, 4)])].slice(0, 8);
+      if (combined.length) {
+        const t4id = bestCategory(combined, 0.25, 2);
+        if (t4id) {
+          blog(`Category fallback via product name → id=${t4id}`);
+          return t4id; // not cached — product-specific
         }
       }
     }
 
     blog(`Category "${trimmed}" not resolved`);
-    return null; // not cached — allows retry on next per-row call
+    return null;
   }
 
   async function batchPollQueues(queueIds) {
@@ -1784,11 +1743,18 @@ async function processBulkImportJob(job) {
     }));
   }
 
-  // ── Phase 1b: Sync category DB then warm in-memory cache ──
+  // ── Phase 1b: verify categories exist, then preload into memory for fast scoring ──
   await syncCategoriesIfNeeded();
-  const uniqueCats = [...new Set(validRows.map(r => r.category).filter(Boolean))];
-  blog(`Phase 1b: resolving ${uniqueCats.length} unique categories from DB`);
-  for (const cat of uniqueCats) await lookupCategoryId(cat); // pure DB lookups — no delay needed
+  {
+    const { rows: cats } = await db.query('SELECT category_id, name, tree FROM onbuy_categories');
+    categoryList = cats.map(r => ({
+      category_id:   r.category_id,
+      nameLower:     r.name.toLowerCase(),
+      fullPathLower: (r.tree ? `${r.tree} > ${r.name}` : r.name).toLowerCase(),
+      wordSet:       new Set(extractWords(`${r.tree || ''} ${r.name}`)),
+    }));
+    blog(`Phase 1b: ${categoryList.length} categories loaded for in-memory matching`);
+  }
 
   const existingMeta = [], newMeta = [];
   for (const row of validRows) {
