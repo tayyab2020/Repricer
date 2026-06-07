@@ -1634,21 +1634,27 @@ async function processBulkImportJob(job) {
     return weights;
   }
 
-  // Combined weight = depthWeight × IDF.
-  // IDF = log(1 + N/df) where df = number of DB categories containing the word.
-  // Common words like "games" (df=500) get low IDF; rare words like "card" (df=30) get high IDF.
-  // This prevents "playing" (appears in role-playing, sports, music) from outscoring
-  // "card" (appears almost exclusively in card-game categories).
+  // IDF-weighted RECALL: what fraction of the CATEGORY's word importance is covered by the input?
+  //
+  // Precision (old): matched_input_weight / total_input_weight
+  //   → fails when input has specific leaf words ("standard","playing","decks") that don't
+  //     appear in the correct DB category ("Card Games"), inflating the denominator.
+  //
+  // Recall (new): matched_category_idf / total_category_idf
+  //   → "Card Games" has 5 words; input covers toys+games+card = 3/5 ≈ 70% ✓
+  //   → "Erotic Novelty & Games" has 9 words; input covers only "games" = 1/9 ≈ 11% ✗
+  //   → Compact, focused categories win; large ambiguous categories lose.
+  //
+  // wordWeights is used only as a membership set (which input words exist).
   function scoreCategory(cat, wordWeights) {
-    let score = 0, total = 0;
-    for (const [w, depthWeight] of wordWeights) {
-      const df     = wordFreq.get(w) ?? 1;
-      const idfW   = catN > 0 ? Math.log(1 + catN / df) : 1;
-      const weight = depthWeight * idfW;
-      total += weight;
-      if (cat.wordSet.has(w)) score += weight;
+    let catTotal = 0, matched = 0;
+    for (const w of cat.wordSet) {
+      const df   = wordFreq.get(w) ?? 1;
+      const idfW = catN > 0 ? Math.log(1 + catN / df) : 1;
+      catTotal += idfW;
+      if (wordWeights.has(w)) matched += idfW;
     }
-    return total > 0 ? score / total : 0;
+    return catTotal > 0 ? matched / catTotal : 0;
   }
 
   function bestCategory(wordWeights, minFraction = 0.35, minHits = 2) {
@@ -1694,7 +1700,7 @@ async function processBulkImportJob(job) {
     //    intermediate segment (w=1.67) even if both hit 3 words total. ──
     const pathWordWeights = extractPathWords(segments);
     if (pathWordWeights.size) {
-      const t3id = bestCategory(pathWordWeights, 0.40, 2);
+      const t3id = bestCategory(pathWordWeights, 0.35, 2);
       if (t3id) {
         categoryCache[trimmed] = t3id;
         blog(`Category "${trimmed}" → id=${t3id} (path word-overlap)`);
