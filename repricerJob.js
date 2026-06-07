@@ -1575,6 +1575,8 @@ async function processBulkImportJob(job) {
   const results = { product_created: 0, listing_created: 0, listing_updated: 0, skipped: 0, errors: [] };
   const categoryCache = {};
   let   categoryList  = []; // preloaded at Phase 1b — {category_id, nameLower, fullPathLower, wordSet}
+  let   wordFreq      = new Map(); // word → number of DB categories containing it (for IDF)
+  let   catN          = 0;         // total DB categories
   const CHUNK        = 1000; // listing creation (Phase 4) — small payload per item
   const CREATE_CHUNK = 100;  // product creation (Phase 2/3.5) — large payload (desc + images)
   let currentToken = token; // mutable so we can refresh mid-job
@@ -1614,27 +1616,49 @@ async function processBulkImportJob(job) {
     )];
   }
 
-  // Score one DB category against a set of input words.
-  // Returns fraction of inputWords found in the category's full path (name + tree).
-  function scoreCategory(cat, inputWords) {
-    let hits = 0;
-    for (const w of inputWords) {
-      if (cat.wordSet.has(w)) hits++;
-    }
-    return hits / inputWords.length;
+  // Build Map<word, weight> from path segments.
+  // Weight ranges from 1.0 (root segment) to 3.0 (leaf segment).
+  // A word appearing in multiple segments keeps its highest weight.
+  // This ensures leaf words like "Card" (from "Card Games") outweigh
+  // intermediate words like "Accessories" (from "Games & Accessories")
+  // even when both are present in competing DB categories.
+  function extractPathWords(segments) {
+    const n = segments.length;
+    const weights = new Map();
+    segments.forEach((seg, i) => {
+      const w = 1 + (i / Math.max(n - 1, 1)) * 2; // 1.0 → 3.0
+      for (const word of extractWords(seg)) {
+        weights.set(word, Math.max(weights.get(word) ?? 0, w));
+      }
+    });
+    return weights;
   }
 
-  // Pick best-scoring category from the preloaded list.
-  // minFraction: minimum fraction of inputWords that must match.
-  // minHits: absolute minimum hit count (prevents 1/1 = 100% on single noise words).
-  function bestCategory(inputWords, minFraction = 0.35, minHits = 2) {
-    if (!categoryList.length || !inputWords.length) return null;
+  // Combined weight = depthWeight × IDF.
+  // IDF = log(1 + N/df) where df = number of DB categories containing the word.
+  // Common words like "games" (df=500) get low IDF; rare words like "card" (df=30) get high IDF.
+  // This prevents "playing" (appears in role-playing, sports, music) from outscoring
+  // "card" (appears almost exclusively in card-game categories).
+  function scoreCategory(cat, wordWeights) {
+    let score = 0, total = 0;
+    for (const [w, depthWeight] of wordWeights) {
+      const df     = wordFreq.get(w) ?? 1;
+      const idfW   = catN > 0 ? Math.log(1 + catN / df) : 1;
+      const weight = depthWeight * idfW;
+      total += weight;
+      if (cat.wordSet.has(w)) score += weight;
+    }
+    return total > 0 ? score / total : 0;
+  }
+
+  function bestCategory(wordWeights, minFraction = 0.35, minHits = 2) {
+    if (!categoryList.length || !wordWeights.size) return null;
     let best = null, bestScore = 0;
     for (const cat of categoryList) {
-      const score = scoreCategory(cat, inputWords);
+      const score = scoreCategory(cat, wordWeights);
       if (score > bestScore) { bestScore = score; best = cat; }
     }
-    const hits = best ? Math.round(bestScore * inputWords.length) : 0;
+    const hits = best ? [...wordWeights.keys()].filter(w => best.wordSet.has(w)).length : 0;
     if (best && bestScore >= minFraction && hits >= minHits) return best.category_id;
     return null;
   }
@@ -1664,13 +1688,13 @@ async function processBulkImportJob(job) {
       return categoryCache[trimmed];
     }
 
-    // ── Tier 3: score ALL path segments against ALL DB categories.
-    //    Uses the full input path ("toys games card collectible booster packs")
-    //    so "Booster Seats" (only matches "booster" → 1/6 = 17%) loses to
-    //    "Card Games" (matches "toys","games","card" → 3/6 = 50%). ──
-    const pathWords = extractWords(segments.join(' '));
-    if (pathWords.length) {
-      const t3id = bestCategory(pathWords, 0.35, 2);
+    // ── Tier 3: weighted path-word scoring across all DB categories.
+    //    Leaf segments (weight 3.0) outweigh root segments (weight 1.0), so
+    //    "Card" from "Card Games" (leaf, w=3) beats "Accessories" from the
+    //    intermediate segment (w=1.67) even if both hit 3 words total. ──
+    const pathWordWeights = extractPathWords(segments);
+    if (pathWordWeights.size) {
+      const t3id = bestCategory(pathWordWeights, 0.40, 2);
       if (t3id) {
         categoryCache[trimmed] = t3id;
         blog(`Category "${trimmed}" → id=${t3id} (path word-overlap)`);
@@ -1679,11 +1703,14 @@ async function processBulkImportJob(job) {
     }
 
     // ── Tier 4: product name keyword fallback (per-row only, not cached).
-    //    Combines product keywords with path words for a broader signal. ──
+    //    Merges product keywords (weight 1) with the existing path weights. ──
     if (productName) {
-      const combined = [...new Set([...pathWords, ...extractWords(productName, 4)])].slice(0, 8);
-      if (combined.length) {
-        const t4id = bestCategory(combined, 0.25, 2);
+      const combined = new Map(pathWordWeights);
+      for (const w of extractWords(productName, 4).slice(0, 6)) {
+        if (!combined.has(w)) combined.set(w, 1);
+      }
+      if (combined.size) {
+        const t4id = bestCategory(combined, 0.35, 2);
         if (t4id) {
           blog(`Category fallback via product name → id=${t4id}`);
           return t4id; // not cached — product-specific
@@ -1691,7 +1718,7 @@ async function processBulkImportJob(job) {
       }
     }
 
-    blog(`Category "${trimmed}" not resolved`);
+    blog(`Category "${trimmed}" not found in OnBuy categories — listing will be skipped`);
     return null;
   }
 
@@ -1743,7 +1770,7 @@ async function processBulkImportJob(job) {
     }));
   }
 
-  // ── Phase 1b: verify categories exist, then preload into memory for fast scoring ──
+  // ── Phase 1b: verify categories exist, preload into memory, compute IDF frequencies ──
   await syncCategoriesIfNeeded();
   {
     const { rows: cats } = await db.query('SELECT category_id, name, tree FROM onbuy_categories');
@@ -1753,7 +1780,13 @@ async function processBulkImportJob(job) {
       fullPathLower: (r.tree ? `${r.tree} > ${r.name}` : r.name).toLowerCase(),
       wordSet:       new Set(extractWords(`${r.tree || ''} ${r.name}`)),
     }));
-    blog(`Phase 1b: ${categoryList.length} categories loaded for in-memory matching`);
+    // Compute per-word document frequency for IDF scoring
+    catN     = categoryList.length;
+    wordFreq = new Map();
+    for (const cat of categoryList) {
+      for (const w of cat.wordSet) wordFreq.set(w, (wordFreq.get(w) ?? 0) + 1);
+    }
+    blog(`Phase 1b: ${catN} categories loaded, ${wordFreq.size} unique words indexed for IDF`);
   }
 
   const existingMeta = [], newMeta = [];
@@ -1762,7 +1795,7 @@ async function processBulkImportJob(job) {
     const sellingPrice = parseFloat((sourcePrice * 1.20 / 0.85).toFixed(2));
     const categoryId   = await lookupCategoryId(row.category, row.name);
     if (!categoryId) {
-      const errMsg = `Category "${row.category}" not found on OnBuy`;
+      const errMsg = `Skipped — no matching OnBuy category for "${row.category}". Add an equivalent category to the OnBuy categories sheet and re-import.`;
       results.errors.push({ row: row._row, product: row.name, error: errMsg }); results.skipped++;
       db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
         [sessionId,userId,row._row,row.name,row.sku,row.ean,row.category,row.brand,sourcePrice,sellingPrice,parseInt(row.stock)||0,_bulkNormCond(row.condition),errMsg]).catch(() => {});

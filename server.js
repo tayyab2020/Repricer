@@ -2657,6 +2657,22 @@ app.get('/api/import/logs', requireAuth, async (req, res) => {
 // DELETE LISTINGS
 // ─────────────────────────────────────────────
 
+// GET /api/delete-listings/template — blank template with Seller SKU column
+app.get('/api/delete-listings/template', requireAuth, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['Seller SKU'],
+    ['ABC-123'],
+    ['XYZ-456'],
+  ]);
+  ws['!cols'] = [{ wch: 30 }];
+  XLSX.utils.book_append_sheet(wb, ws, 'Delete Listings');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="delete-listings-template.xlsx"');
+  res.send(buf);
+});
+
 // POST /api/delete-listings/preview — parse uploaded Excel, return SKUs from "Seller SKU" column
 app.post('/api/delete-listings/preview', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });

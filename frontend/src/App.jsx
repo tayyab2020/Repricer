@@ -4122,6 +4122,24 @@ function DeleteListingsPage() {
               {loading ? "Parsing file…" : "or click to browse — file must have a 'Seller SKU' column"}
             </div>
           </div>
+          <div style={{ padding: "12px 20px", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end" }}>
+            <Btn small variant="ghost" onClick={async e => {
+              e.stopPropagation();
+              const token = localStorage.getItem("repricer_token");
+              const r = await fetch(`${API}/delete-listings/template`, {
+                headers: token ? { Authorization: `Bearer ${token}` } : {},
+              });
+              if (!r.ok) return;
+              const blob = await r.blob();
+              const url  = URL.createObjectURL(blob);
+              const a    = document.createElement("a");
+              a.href = url; a.download = "delete-listings-template.xlsx";
+              document.body.appendChild(a); a.click();
+              document.body.removeChild(a); URL.revokeObjectURL(url);
+            }}>
+              Download Template
+            </Btn>
+          </div>
         </Section>
       )}
 
