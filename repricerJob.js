@@ -1895,6 +1895,7 @@ async function processBulkImportJob(job) {
   for (let i = 0; i < toCreate.length; i += CREATE_CHUNK) {
     const chunk    = toCreate.slice(i, i + CREATE_CHUNK);
     const products = chunk.map(({ row, sellingPrice, categoryId }) => {
+      if (!row.ean) row.ean = generateEan13(); // generate before payload so DB writes use the same EAN
       const brandVal = row.brand?.trim();
       const addImgs  = (row.images || []).slice(1).filter(Boolean);
       return {
@@ -1906,7 +1907,7 @@ async function processBulkImportJob(job) {
         default_image: row.images[0],
         ...(addImgs.length      ? { additional_images: addImgs }     : {}),
         ...(row.description     ? { description: String(row.description).replace(/[<>]/g, '') } : {}),
-        ...(row.ean             ? { product_codes: [row.ean] }       : {}),
+        product_codes: [row.ean],
         ...(row.mpn             ? { mpn: row.mpn }                   : {}),
         ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
       };
