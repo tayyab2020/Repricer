@@ -3403,16 +3403,30 @@ function OnBuyBulkPage() {
               </div>
             </div>
           </div>
-          <button onClick={() => {
-            api("/onbuy-bulk/pending-queue-status").then(s => {
-              if (s) setPendingStatus(s);
-              if (s && parseInt(s.pending) > 0) startPendingPoll();
-            }).catch(() => {});
-            api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
-          }} style={{ background: "none", border: `1px solid ${C.amber}`, borderRadius: 6,
-            color: C.amber, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
-            ↻ Refresh
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => {
+              api("/onbuy-bulk/pending-queue-status").then(s => {
+                if (s) setPendingStatus(s);
+                if (s && parseInt(s.pending) > 0) startPendingPoll();
+              }).catch(() => {});
+              api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
+            }} style={{ background: "none", border: `1px solid ${C.amber}`, borderRadius: 6,
+              color: C.amber, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
+              ↻ Refresh
+            </button>
+            <button onClick={async () => {
+              if (!confirm(`Cancel all ${parseInt(pendingStatus.pending).toLocaleString()} pending product queues? Listings will not be created for these products.`)) return;
+              try {
+                await api("/onbuy-bulk/cancel-all-pending", { method: "POST" });
+                setPendingStatus(null);
+                if (pendingPollRef.current) { clearInterval(pendingPollRef.current); pendingPollRef.current = null; }
+                api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
+              } catch (e) { alert("Cancel failed: " + e.message); }
+            }} style={{ background: "#ef444422", border: `1px solid #ef444466`, borderRadius: 6,
+              color: C.red, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
+              ✕ Cancel All
+            </button>
+          </div>
         </div>
       )}
 

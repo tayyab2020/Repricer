@@ -2145,6 +2145,31 @@ app.post('/api/onbuy-bulk/sessions/:sessionId/cancel', requireAuth, async (req, 
   }
 });
 
+// POST /api/onbuy-bulk/cancel-all-pending — cancel all pending queues across all sessions for the user
+app.post('/api/onbuy-bulk/cancel-all-pending', requireAuth, async (req, res) => {
+  try {
+    const uid = req.effectiveUserId;
+
+    const { rowCount } = await db.query(
+      `DELETE FROM onbuy_bulk_pending_queues WHERE user_id=$1 AND status='pending'`,
+      [uid]
+    );
+
+    // Mark every non-completed session that still has pending_queues as cancelled
+    await db.query(
+      `UPDATE onbuy_bulk_import_sessions
+          SET status='cancelled', pending_queues=0, completed_at=NOW()
+        WHERE user_id=$1 AND status NOT IN ('completed','failed','cancelled') OR
+              (user_id=$1 AND pending_queues > 0 AND status='completed')`,
+      [uid]
+    );
+
+    res.json({ cancelled: rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/onbuy-bulk/sessions/:sessionId — live status for a background import
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {
