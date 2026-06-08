@@ -2747,6 +2747,123 @@ app.post('/api/delete-listings/delete', requireAuth, async (req, res) => {
   }
 });
 
+// ── Shared helper: paginate all listing SKUs for an account ──────────────────
+async function fetchAllListingSkus(token, siteId, onProgress) {
+  const skus = [];
+  let offset = 0, totalRows = Infinity;
+  while (offset < totalRows) {
+    const r = await fetch(
+      `https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=1000&offset=${offset}`,
+      { headers: { Authorization: token } },
+    );
+    if (!r.ok) throw new Error(`Listings API HTTP ${r.status}`);
+    const data    = await r.json();
+    const results = data.results ?? [];
+    if (!results.length) break;
+    totalRows = data.metadata?.total_rows ?? totalRows;
+    for (const l of results) if (l.sku) skus.push(l.sku);
+    offset += 1000;
+    onProgress(skus.length, totalRows);
+  }
+  return skus;
+}
+
+// POST /api/listings/oos-all — mark every listing OOS (stock=0); streams progress via SSE
+app.post('/api/listings/oos-all', requireAuth, async (req, res) => {
+  const { onbuy_account_id } = req.body;
+  if (!onbuy_account_id) return res.status(400).json({ error: 'No account selected' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = d => res.write(`data: ${JSON.stringify(d)}\n\n`);
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM onbuy_accounts WHERE id = $1 LIMIT 1`, [onbuy_account_id]);
+    if (!rows[0]) { send({ error: 'Account not found' }); return res.end(); }
+    const token  = await getTokenForAccount(rows[0]);
+    if (!token)  { send({ error: 'Could not obtain auth token' }); return res.end(); }
+    const siteId = parseInt(rows[0].site_id) || 2000;
+
+    send({ phase: 'fetching', fetched: 0, total: null });
+    const allSkus = await fetchAllListingSkus(token, siteId, (fetched, total) => {
+      send({ phase: 'fetching', fetched, total });
+    });
+
+    let updated = 0, failed = 0;
+    for (let i = 0; i < allSkus.length; i += 1000) {
+      const batch    = allSkus.slice(i, i + 1000);
+      const r        = await fetch(`https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`, {
+        method:  'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ listings: batch.map(sku => ({ sku, stock: 0 })) }),
+      });
+      const data     = await r.json().catch(() => ({}));
+      const batchRes = Array.isArray(data.results) ? data.results : [];
+      const failCnt  = batchRes.filter(item => item.success === false).length;
+      failed  += failCnt;
+      updated += batch.length - failCnt;
+      if (!batchRes.length) updated += batch.length;
+      send({ phase: 'updating', updated, failed, total: allSkus.length });
+    }
+
+    send({ phase: 'done', total: allSkus.length, updated, failed });
+  } catch (e) {
+    send({ error: e.message });
+  }
+  res.end();
+});
+
+// POST /api/listings/delete-all — delete every listing; streams progress via SSE
+app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
+  const { onbuy_account_id } = req.body;
+  if (!onbuy_account_id) return res.status(400).json({ error: 'No account selected' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = d => res.write(`data: ${JSON.stringify(d)}\n\n`);
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM onbuy_accounts WHERE id = $1 LIMIT 1`, [onbuy_account_id]);
+    if (!rows[0]) { send({ error: 'Account not found' }); return res.end(); }
+    const token  = await getTokenForAccount(rows[0]);
+    if (!token)  { send({ error: 'Could not obtain auth token' }); return res.end(); }
+    const siteId = parseInt(rows[0].site_id) || 2000;
+
+    send({ phase: 'fetching', fetched: 0, total: null });
+    const allSkus = await fetchAllListingSkus(token, siteId, (fetched, total) => {
+      send({ phase: 'fetching', fetched, total });
+    });
+
+    let deleted = 0, notFound = 0, failed = 0;
+    for (let i = 0; i < allSkus.length; i += 1000) {
+      const batch = allSkus.slice(i, i + 1000);
+      const r     = await fetch('https://api.onbuy.com/v2/listings/by-sku', {
+        method:  'DELETE',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ site_id: siteId, skus: batch }),
+      });
+      const data     = await r.json().catch(() => ({}));
+      const batchRes = data.results ?? {};
+      for (const [, v] of Object.entries(batchRes)) {
+        if (v.status === 'ok')                deleted++;
+        else if (v.error === 'SKU not found') notFound++;
+        else                                  failed++;
+      }
+      if (!Object.keys(batchRes).length) deleted += batch.length;
+      send({ phase: 'deleting', deleted, notFound, failed, total: allSkus.length });
+    }
+
+    send({ phase: 'done', total: allSkus.length, deleted, notFound, failed });
+  } catch (e) {
+    send({ error: e.message });
+  }
+  res.end();
+});
+
 // ─────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────

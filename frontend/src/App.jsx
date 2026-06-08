@@ -4021,6 +4021,167 @@ function OnBuyBulkPage() {
   );
 }
 
+// Reads an SSE stream from a fetch response and calls onEvent for each parsed event
+async function readSseStream(response, onEvent) {
+  const reader  = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop(); // keep incomplete line
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        try { onEvent(JSON.parse(line.slice(6))); } catch {}
+      }
+    }
+  }
+}
+
+function BulkActionsSection({ accounts }) {
+  const [accountId, setAccountId]   = useState("");
+  const [confirm, setConfirm]       = useState(null); // "oos" | "delete" | null
+  const [running, setRunning]       = useState(false);
+  const [progress, setProgress]     = useState(null); // { phase, fetched, total, updated, deleted, notFound, failed }
+  const [result, setResult]         = useState(null);
+  const [err, setErr]               = useState("");
+
+  async function runAction(action) {
+    if (!accountId) { setErr("Please select an OnBuy account first"); return; }
+    setConfirm(null);
+    setRunning(true); setErr(""); setResult(null); setProgress({ phase: "fetching", fetched: 0, total: null });
+
+    const token    = localStorage.getItem("repricer_token");
+    const endpoint = action === "oos" ? "/listings/oos-all" : "/listings/delete-all";
+    try {
+      const response = await fetch(`${API}${endpoint}`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body:    JSON.stringify({ onbuy_account_id: accountId }),
+      });
+      if (response.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
+      if (!response.ok) { const t = await response.text(); throw new Error(t); }
+
+      await readSseStream(response, evt => {
+        if (evt.error) { setErr(evt.error); return; }
+        if (evt.phase === "done") { setResult({ action, ...evt }); setProgress(null); }
+        else setProgress(evt);
+      });
+    } catch (e) { setErr(e.message); }
+    setRunning(false);
+  }
+
+  const pct = progress?.total ? Math.round((progress.fetched ?? progress.updated ?? progress.deleted ?? 0) / progress.total * 100) : 0;
+
+  return (
+    <Section title="Bulk Actions">
+      <div style={{ padding: "16px 20px" }}>
+
+      {/* Account selector */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>OnBuy Account</label>
+        <select value={accountId} onChange={e => { setAccountId(e.target.value); setErr(""); }}
+          style={{ background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+            borderRadius: 8, padding: "8px 12px", fontSize: 13, width: "100%", maxWidth: 320 }}>
+          <option value="">Select account…</option>
+          {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+        </select>
+      </div>
+
+      {err && (
+        <div style={{ background: "#ef444422", border: "1px solid #ef4444", borderRadius: 8,
+          padding: "10px 16px", color: "#ef4444", fontSize: 13, marginBottom: 14 }}>{err}</div>
+      )}
+
+      {/* Buttons */}
+      {!running && !result && (
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <Btn variant="secondary" onClick={() => { setErr(""); setConfirm("oos"); }}
+            style={{ borderColor: C.amber + "88", color: C.amber }}>
+            OOS All Listings
+          </Btn>
+          <Btn variant="danger" onClick={() => { setErr(""); setConfirm("delete"); }}>
+            Delete All Listings
+          </Btn>
+        </div>
+      )}
+
+      {/* Progress */}
+      {running && progress && (
+        <div>
+          <div style={{ color: C.textDim, fontSize: 13, marginBottom: 10 }}>
+            {progress.phase === "fetching"
+              ? `Fetching SKUs… ${progress.fetched.toLocaleString()}${progress.total ? ` / ${Number(progress.total).toLocaleString()}` : ""}`
+              : progress.phase === "updating"
+              ? `Marking OOS… ${(progress.updated + progress.failed).toLocaleString()} / ${progress.total.toLocaleString()}`
+              : `Deleting… ${(progress.deleted + progress.notFound + progress.failed).toLocaleString()} / ${progress.total.toLocaleString()}`}
+          </div>
+          <div style={{ background: C.border, borderRadius: 99, height: 8, overflow: "hidden" }}>
+            <div style={{ height: "100%", borderRadius: 99, background: C.accent,
+              width: `${pct}%`, transition: "width 0.4s ease" }} />
+          </div>
+          <div style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>{pct}%</div>
+        </div>
+      )}
+
+      {/* Results */}
+      {result && (
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 10, marginBottom: 14 }}>
+            <StatCard label="Total" value={result.total?.toLocaleString()} color={C.text} />
+            {result.action === "oos" ? (
+              <>
+                <StatCard label="Updated" value={result.updated?.toLocaleString()} color={C.accent} />
+                <StatCard label="Failed"  value={result.failed?.toLocaleString()}  color={C.red} />
+              </>
+            ) : (
+              <>
+                <StatCard label="Deleted"   value={result.deleted?.toLocaleString()}   color={C.accent} />
+                <StatCard label="Not Found" value={result.notFound?.toLocaleString()}  color={C.amber} />
+                <StatCard label="Failed"    value={result.failed?.toLocaleString()}    color={C.red} />
+              </>
+            )}
+          </div>
+          <Btn variant="secondary" small onClick={() => setResult(null)}>Run Again</Btn>
+        </div>
+      )}
+
+      {/* Confirmation modal */}
+      {confirm && (
+        <Modal
+          title={confirm === "oos" ? "Mark All Listings as OOS?" : "Delete All Listings?"}
+          onClose={() => setConfirm(null)}
+        >
+          <div style={{ background: "#ef444415", border: "1px solid #ef444455",
+            borderRadius: 10, padding: "14px 18px", marginBottom: 20,
+            display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 20 }}>⚠️</span>
+            <div>
+              <div style={{ color: "#ef4444", fontWeight: 700, fontSize: 14 }}>This action cannot be undone</div>
+              <div style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>
+                {confirm === "oos"
+                  ? "All listings on OnBuy will have their stock set to 0. They will appear as out of stock to buyers."
+                  : "All listings will be permanently deleted from OnBuy. This cannot be reversed."}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <Btn variant="secondary" onClick={() => setConfirm(null)}>Cancel</Btn>
+            <Btn onClick={() => runAction(confirm)}
+              style={{ background: confirm === "oos" ? C.amber : "#ef4444",
+                borderColor: confirm === "oos" ? C.amber : "#ef4444", color: "#000" }}>
+              {confirm === "oos" ? "Yes, Mark OOS" : "Yes, Delete All"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
+      </div>
+    </Section>
+  );
+}
+
 function DeleteListingsPage() {
   const [step, setStep]           = useState(1);
   const [accounts, setAccounts]   = useState([]);
@@ -4081,6 +4242,8 @@ function DeleteListingsPage() {
 
   return (
     <div>
+      <BulkActionsSection accounts={accounts} />
+
       <div style={{ display: "flex", gap: 8, marginBottom: 28, alignItems: "center" }}>
         {STEPS.map((label, i) => (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
