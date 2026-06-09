@@ -162,6 +162,15 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
         }
 
         jlog(`[Job] Keepa job for "${acct.acct_name}" (account ${aid}) — ${uniqueAsins.length} ASINs`);
+
+        // Skip if a quota-refill job is already pending for this user — the KeepaWorker
+        // sets this key (with TTL) when quota runs out and clears it when fully done.
+        const refillPending = await redis.get(`keepa:refill-pending:${jobUserId}`);
+        if (refillPending) {
+          jlog(`[Job] Skipping Keepa job for account ${aid} — quota refill in progress, next run already scheduled`);
+          continue;
+        }
+
         const beforeCounts = await keepaQueue.getJobCounts('waiting', 'active', 'delayed', 'completed', 'failed');
         jlog(`[Job][DEBUG] keepa queue BEFORE add (account ${aid}): ${JSON.stringify(beforeCounts)}`);
 

@@ -1226,11 +1226,23 @@ async function processKeepaJob(job) {
       redis.set(`repricer:running:${userId}`,     leftover.length, 'EX', ttlSecs).catch(() => {});
       redis.set(`keepa:refill-pending:${userId}`, '1',             'EX', ttlSecs).catch(() => {});
     }
+    // For quota-exhausted retries use a fixed jobId so only one retry can exist in the
+    // queue at a time — prevents cascading duplicates when concurrency > 1 causes multiple
+    // exhausted runs to each schedule their own retry.
+    const nextJobId = realExhausted
+      ? `keepa-${accountId}-quota-refill`
+      : `keepa-${accountId}-r${nextRun}`;
+
+    // Remove any stale job with the same ID before adding (BullMQ rejects duplicate IDs
+    // silently in some states, so explicit removal is safer)
+    const stale = await keepaQueue.getJob(nextJobId);
+    if (stale) await stale.remove().catch(() => {});
+
     await keepaQueue.add('prefetch', {
       userId, accountId, asins, asinToMappingIds,
       pendingAsins: leftover, runNumber: nextRun,
     }, {
-      jobId:            `keepa-${accountId}-r${nextRun}`,
+      jobId:            nextJobId,
       delay:            delayMs,
       removeOnComplete: true, removeOnFail: true, attempts: 1,
     });

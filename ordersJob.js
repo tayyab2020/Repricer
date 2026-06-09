@@ -22,6 +22,7 @@ import IORedis       from 'ioredis';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join, dirname }             from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { resolve }                      from 'path';
 import fetch                         from 'node-fetch';
 import { google }                    from 'googleapis';
 
@@ -272,6 +273,22 @@ const MANUAL_HEADERS = new Set([
   'Source Price', 'Total Fee', 'Total Cost', 'Net Profit',
 ]);
 
+// Formulas written into new rows only (existing rows already have their own formulas)
+// Each value is a function(colIdx, rowNum) → formula string
+const FORMULA_COLUMNS = {
+  'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
+  'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
+  'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
+  'ROI %':      (ci, r) => `=${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Selling Price'])}${r}*100`,
+};
+
+// Coerce a value to a JS number for sheet storage; returns '' for null/empty/NaN
+function toNum(val) {
+  if (val === '' || val == null) return '';
+  const n = Number(val);
+  return isNaN(n) ? '' : n;
+}
+
 // Returns row data as an object keyed by header title.
 // Only non-manual, non-formula columns are included — sheet formulas handle the rest.
 function buildSheetRow(order, product, vatRate, enriched = {}) {
@@ -294,12 +311,12 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
     })(),
     'Sourcing Link':     enriched.source_url  || '',
     'Onbuy Link':        enriched.product_url || '',
-    'Qty':               product.quantity     ?? '',
-    'Unit Price':        product.unit_price   ?? '',
-    'Selling Price':     product.total_price  ?? '',
-    'Onbuy Fee':         fee || '',
+    'Qty':               toNum(product.quantity),
+    'Unit Price':        toNum(product.unit_price),
+    'Selling Price':     toNum(product.total_price),
+    'Onbuy Fee':         toNum(fee),
     'Boosted':           boosted,
-    'VAT':               vat || '',
+    'VAT':               toNum(vat),
     'Status':            status,
     '_apiTracking':      apiTracking,
   };
@@ -407,6 +424,23 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
         if (oid) rowMap.set(oid, i + 1);
       }
 
+      // Count orders whose expected_dispatch_date is today → write next to "Today Dispatch Order:" in row 1
+      const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const todayDispatchCount = items.reduce((acc, { order }) => {
+        const edd = (order.raw_data?.expected_dispatch_date ?? '');
+        return acc + (edd && edd.toString().startsWith(todayStr) ? 1 : 0);
+      }, 0);
+      const todayLabelIdx = colIdx['Today Dispatch Order:'];
+      const todayCountIdx = todayLabelIdx != null ? todayLabelIdx + 1 : null;
+      if (todayCountIdx != null) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `'${tabName}'!${colIdxToLetter(todayCountIdx)}1`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[todayDispatchCount]] },
+        });
+      }
+
       const batchData  = [];
       const newRowObjs = [];
       let   updatedRows = 0;
@@ -437,6 +471,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       }
 
       // New rows: write cell-by-cell so Status (row-2 header column) is included
+      const formulaData = []; // separate batch — needs USER_ENTERED so Sheets parses formulas
       let nextNewRow = existingVals.length + 1; // first row after last existing row
       for (const { rowObj } of newRowObjs) {
         const rowNum = nextNewRow++;
@@ -452,6 +487,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
           const tci = colIdx['Tracking'];
           if (tci != null) batchData.push({ range: `'${tabName}'!${colIdxToLetter(tci)}${rowNum}`, values: [[rowObj._apiTracking]] });
         }
+        // Write formulas for computed columns (Total Fee, Total Cost, Net Profit)
+        for (const [header, formulaFn] of Object.entries(FORMULA_COLUMNS)) {
+          const ci = colIdx[header];
+          if (ci == null) continue;
+          formulaData.push({ range: `'${tabName}'!${colIdxToLetter(ci)}${rowNum}`, values: [[formulaFn(colIdx, rowNum)]] });
+        }
       }
 
       if (batchData.length > 0) {
@@ -460,6 +501,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
           requestBody: { valueInputOption: 'RAW', data: batchData },
         });
         log(`${tabName}: updated ${updatedRows} row(s), appended ${newRowObjs.length} row(s)`);
+      }
+      if (formulaData.length > 0) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: { valueInputOption: 'USER_ENTERED', data: formulaData },
+        });
       }
 
       // Apply formatting, sort, conditional colours, and dropdown validation
@@ -852,7 +899,9 @@ export async function syncAccountsForUser(db, userId) {
 }
 
 // ── Standalone entry point (node ordersJob.js) ────────────────────────────────
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+const _thisFile = resolve(fileURLToPath(import.meta.url));
+const _mainFile = process.argv[1] ? resolve(process.argv[1]) : '';
+if (_thisFile === _mainFile) {
   const db = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
