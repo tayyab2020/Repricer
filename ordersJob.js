@@ -898,20 +898,16 @@ export async function syncAccountsForUser(db, userId) {
   console.log(`[OrdersJob] Manual sync done for user ${userId}`);
 }
 
-// ── Standalone entry point (node ordersJob.js) ────────────────────────────────
-const _thisFile = resolve(fileURLToPath(import.meta.url));
-const _mainFile = process.argv[1] ? resolve(process.argv[1]) : '';
-if (_thisFile === _mainFile) {
+// ── Called by ordersWorker.js (PM2 entry point) and direct node execution ──────
+export function startWorker() {
   const db = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   });
 
-  // Migration: add dispatch tracking column
   db.query(`ALTER TABLE onbuy_orders ADD COLUMN IF NOT EXISTS is_dispatched BOOLEAN NOT NULL DEFAULT false`)
     .catch(() => {});
 
-  // Redis subscriber — listens for manual sync triggers from the server process
   const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
     maxRetriesPerRequest: null,
   });
@@ -930,3 +926,8 @@ if (_thisFile === _mainFile) {
     syncAllAccounts(db).catch(e => console.error('[OrdersJob] Run error:', e));
   });
 }
+
+// Allow direct execution: node ordersJob.js
+const _thisFile = resolve(fileURLToPath(import.meta.url));
+const _mainFile = process.argv[1] ? resolve(process.argv[1]) : '';
+if (_thisFile === _mainFile) startWorker();
