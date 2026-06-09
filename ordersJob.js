@@ -817,7 +817,7 @@ async function syncAllAccounts(db) {
   let accounts;
   try {
     const { rows } = await db.query(
-      `SELECT * FROM onbuy_accounts WHERE is_active = true ORDER BY id`
+      `SELECT * FROM onbuy_accounts WHERE is_active = true AND google_sheet_id IS NOT NULL AND google_sheet_id <> '' ORDER BY id`
     );
     accounts = rows;
   } catch (e) {
@@ -836,7 +836,7 @@ export async function syncAccountsForUser(db, userId) {
   let accounts;
   try {
     const { rows } = await db.query(
-      `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true ORDER BY id`,
+      `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true AND google_sheet_id IS NOT NULL AND google_sheet_id <> '' ORDER BY id`,
       [userId]
     );
     accounts = rows;
