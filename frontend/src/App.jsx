@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Legend
@@ -1839,6 +1839,8 @@ export default function App() {
     { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
     // { id:"sku-change",     label:"🔄 SKU Change" },
     { id:"delete-listings", label:"🗑️ Delete Listings" },
+    { id:"orders",          label:"📋 Orders" },
+    // { id:"sp-api",          label:"🔍 SP-API Lookup" },
     { id:"settings",       label:"⚙️ Settings" },
     { id:"logs",           label:"📋 Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
@@ -2026,6 +2028,8 @@ export default function App() {
             {page === "onbuy-bulk"     && "Create new products and listings directly on your OnBuy store"}
             {page === "sku-change"       && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
             {page === "delete-listings" && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
+            {page === "orders"          && "View and sync OnBuy orders across all accounts"}
+            {page === "sp-api"         && "Fetch Amazon catalog data for any ASIN using SP-API"}
             {page === "settings"       && "Configure proxies and global repricer options"}
             {page === "logs"           && "Real-time output from API server and job worker"}
             {page === "users"          && "Manage user accounts and impersonate users"}
@@ -2042,6 +2046,8 @@ export default function App() {
         {page === "onbuy-bulk"     && <OnBuyBulkPage />}
         {page === "sku-change"       && <SkuChangePage />}
         {page === "delete-listings"  && <DeleteListingsPage />}
+        {page === "orders"           && <OrdersPage />}
+        {page === "sp-api"          && <SpApiPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
@@ -2072,7 +2078,8 @@ export default function App() {
 // ════════════════════════════════════════════
 function AccountsPage() {
   const [accounts, setAccounts] = useState([]);
-  const [form, setForm]         = useState({ account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false });
+  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false, google_sheet_id:"", google_service_account_json:"", _saFileName:"" };
+  const [form, setForm]         = useState(emptyForm);
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
   const [testResult, setResult] = useState({});
@@ -2084,15 +2091,20 @@ function AccountsPage() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false };
-
   async function save() {
     if (!form.account_name || !form.consumer_key || !form.secret_key)
       return setErr("Account name, Consumer Key and Secret Key are required.");
+    if (form.google_service_account_json.trim()) {
+      try { JSON.parse(form.google_service_account_json); }
+      catch { return setErr("Google Service Account JSON is not valid JSON."); }
+    }
     setLoading(true); setErr("");
     try {
-      if (editId) { await api(`/accounts/${editId}`, { method:"PUT", body: JSON.stringify(form) }); }
-      else        { await api("/accounts", { method:"POST", body: JSON.stringify(form) }); }
+      const payload = { ...form, google_service_account: form.google_service_account_json.trim() || null };
+      delete payload.google_service_account_json;
+      delete payload._saFileName;
+      if (editId) { await api(`/accounts/${editId}`, { method:"PUT", body: JSON.stringify(payload) }); }
+      else        { await api("/accounts", { method:"POST", body: JSON.stringify(payload) }); }
       setForm(emptyForm);
       setEditId(null); await load();
     } catch (e) { setErr(e.message); }
@@ -2218,6 +2230,68 @@ function AccountsPage() {
               </div>
             </div>
 
+            {/* ── Google Sheets integration ── */}
+            <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:12, display:"flex", flexDirection:"column", gap:12 }}>
+              <div>
+                <p style={{ color:C.text, fontSize:13, fontWeight:600, margin:"0 0 2px" }}>Google Sheets</p>
+                <p style={{ color:C.muted, fontSize:11, margin:0 }}>
+                  Orders will be synced to the specified spreadsheet every 15 minutes.
+                  Create a Service Account in Google Cloud Console, share the sheet with its email, then paste credentials here.
+                </p>
+              </div>
+              <div>
+                <label style={labelStyle}>Spreadsheet ID or URL</label>
+                <input style={fieldStyle} placeholder="Paste full URL or just the ID"
+                  value={form.google_sheet_id}
+                  onChange={e => {
+                    let val = e.target.value;
+                    const m = val.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+                    if (m) val = m[1];
+                    setForm(f => ({ ...f, google_sheet_id: val }));
+                  }} />
+                <p style={{ color:C.muted, fontSize:11, marginTop:4 }}>
+                  You can paste the full Google Sheets URL — the ID will be extracted automatically.
+                </p>
+              </div>
+              <div>
+                <label style={labelStyle}>Service Account JSON</label>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <input type="file" accept=".json" id="sa-file-input" style={{ display:"none" }}
+                    onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = ev => {
+                        try {
+                          JSON.parse(ev.target.result);
+                          setForm(f => ({ ...f, google_service_account_json: ev.target.result, _saFileName: file.name }));
+                        } catch {
+                          setErr("Selected file is not valid JSON.");
+                        }
+                      };
+                      reader.readAsText(file);
+                      e.target.value = "";
+                    }} />
+                  <label htmlFor="sa-file-input" style={{ ...fieldStyle, display:"inline-flex", alignItems:"center", gap:8, cursor:"pointer", height:38, boxSizing:"border-box", width:"auto", paddingLeft:14, paddingRight:14 }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    Choose JSON file
+                  </label>
+                  <span style={{ fontSize:12, color: form.google_service_account_json ? C.success ?? "#34c759" : C.muted }}>
+                    {form._saFileName
+                      ? form._saFileName
+                      : form.google_service_account_json
+                        ? "Service account loaded"
+                        : "No file selected"}
+                  </span>
+                  {form.google_service_account_json && (
+                    <button onClick={() => setForm(f => ({ ...f, google_service_account_json:"", _saFileName:"" }))}
+                      style={{ background:"none", border:"none", cursor:"pointer", color:C.muted, fontSize:16, lineHeight:1, padding:"0 2px" }}
+                      title="Remove">✕</button>
+                  )}
+                </div>
+              </div>
+            </div>
+
             <div style={{ display:"flex", gap:8 }}>
               <Btn onClick={save} loading={loading}>{editId ? "Update Account" : "Add Account"}</Btn>
               {editId && <Btn variant="secondary" onClick={() => {
@@ -2260,6 +2334,14 @@ function AccountsPage() {
                             </span>
                           );
                         })}
+                        {a.has_google_sheet
+                          ? <span style={{ background:"#22c55e18", color:"#22c55e", borderRadius:5,
+                              padding:"1px 7px", fontSize:11, fontWeight:600 }}>
+                              📊 Sheet Connected
+                            </span>
+                          : <span style={{ background:"#6b728022", color:C.muted, borderRadius:5,
+                              padding:"1px 7px", fontSize:11 }}>No Sheet</span>
+                        }
                       </div>
                       {a.last_tested_at && (
                         <div style={{ fontSize:11, marginTop:4,
@@ -2283,13 +2365,18 @@ function AccountsPage() {
                           keepa_email:a.keepa_email||"", keepa_password:"",
                           enable_puppeteer:a.enable_puppeteer===true,
                           enable_twister:a.enable_twister===true,
-                          enable_cheerio:a.enable_cheerio===true });
+                          enable_cheerio:a.enable_cheerio===true,
+                          google_sheet_id:"", google_service_account_json:"" });
                         try {
                           const full = await api(`/accounts/${a.id}`);
                           if (full) setForm(f => ({ ...f,
                             consumer_key: full.consumer_key || "",
                             secret_key:   full.secret_key   || "",
                             keepa_password: full.keepa_password || "",
+                            google_sheet_id: full.google_sheet_id || "",
+                            google_service_account_json: full.google_service_account
+                              ? JSON.stringify(full.google_service_account, null, 2) : "",
+                            _saFileName: "",
                           }));
                         } catch {}
                       }}>Edit</Btn>
@@ -4425,6 +4512,429 @@ function DeleteListingsPage() {
             <Btn onClick={reset}>Delete More</Btn>
           </div>
         </Section>
+      )}
+    </div>
+  );
+}
+
+// ── SP-API ASIN Lookup ────────────────────────────────────────────────────────
+const SP_CRED_KEY = "sp_api_creds";
+
+function SpApiPage() {
+  const saved = (() => { try { return JSON.parse(localStorage.getItem(SP_CRED_KEY) || "{}"); } catch { return {}; } })();
+
+  const [creds, setCreds] = useState({
+    clientId:        saved.clientId        ?? "",
+    clientSecret:    saved.clientSecret    ?? "",
+    refreshToken:    saved.refreshToken    ?? "",
+    marketplaceCode: saved.marketplaceCode ?? "UK",
+  });
+  const [asinInput,    setAsinInput]    = useState("");
+  const [loading,      setLoading]      = useState(false);
+  const [result,       setResult]       = useState(null);
+  const [err,          setErr]          = useState("");
+  const [marketplaces, setMarketplaces] = useState([]);
+  const [showSecrets,  setShowSecrets]  = useState(false);
+  const [expanded,     setExpanded]     = useState(null);
+
+  useEffect(() => {
+    api("/sp-api/marketplaces").then(setMarketplaces).catch(() => {});
+  }, []);
+
+  function updateCred(key, val) {
+    setCreds(c => {
+      const next = { ...c, [key]: val };
+      localStorage.setItem(SP_CRED_KEY, JSON.stringify(next));
+      return next;
+    });
+  }
+
+  async function lookup() {
+    const asins = asinInput.split(/[\s,\n]+/).map(s => s.trim()).filter(Boolean);
+    if (!asins.length) { setErr("Enter at least one ASIN"); return; }
+    setLoading(true); setErr(""); setResult(null);
+    try {
+      const r = await api("/sp-api/lookup", {
+        method: "POST",
+        body: JSON.stringify({ ...creds, asins }),
+      });
+      setResult(r);
+    } catch (e) { setErr(e.message); }
+    setLoading(false);
+  }
+
+  const inputStyle = {
+    width: "100%", background: C.bg, color: C.text,
+    border: `1px solid ${C.border}`, borderRadius: 8,
+    padding: "9px 12px", fontSize: 13, boxSizing: "border-box",
+  };
+
+  return (
+    <div>
+      {/* Credentials */}
+      <Section title="SP-API Credentials">
+        <div style={{ padding: "16px 20px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+            <div>
+              <label style={{ color: C.muted, fontSize: 11, display: "block", marginBottom: 4 }}>LWA Client ID</label>
+              <input style={inputStyle} value={creds.clientId} placeholder="amzn1.application-oa2-client.xxx"
+                onChange={e => updateCred("clientId", e.target.value)} />
+            </div>
+            <div>
+              <label style={{ color: C.muted, fontSize: 11, display: "block", marginBottom: 4 }}>
+                LWA Client Secret&nbsp;
+                <span style={{ cursor: "pointer", color: C.accent, fontSize: 10 }} onClick={() => setShowSecrets(s => !s)}>
+                  {showSecrets ? "hide" : "show"}
+                </span>
+              </label>
+              <input style={inputStyle} value={creds.clientSecret} placeholder="••••••••"
+                type={showSecrets ? "text" : "password"}
+                onChange={e => updateCred("clientSecret", e.target.value)} />
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <label style={{ color: C.muted, fontSize: 11, display: "block", marginBottom: 4 }}>LWA Refresh Token</label>
+              <input style={inputStyle} value={creds.refreshToken} placeholder="Atzr|IwEBIA…"
+                type={showSecrets ? "text" : "password"}
+                onChange={e => updateCred("refreshToken", e.target.value)} />
+            </div>
+            <div>
+              <label style={{ color: C.muted, fontSize: 11, display: "block", marginBottom: 4 }}>Marketplace</label>
+              <select value={creds.marketplaceCode} onChange={e => updateCred("marketplaceCode", e.target.value)}
+                style={{ ...inputStyle, width: "auto", minWidth: 200 }}>
+                {marketplaces.map(m => (
+                  <option key={m.code} value={m.code}>{m.name} ({m.code})</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div style={{ color: C.muted, fontSize: 11 }}>Credentials are saved in browser local storage only.</div>
+        </div>
+      </Section>
+
+      {/* ASIN input */}
+      <Section title="ASIN Lookup">
+        <div style={{ padding: "16px 20px" }}>
+          <label style={{ color: C.muted, fontSize: 11, display: "block", marginBottom: 6 }}>
+            ASINs — one per line or comma-separated (max 20 per request)
+          </label>
+          <textarea
+            value={asinInput}
+            onChange={e => setAsinInput(e.target.value)}
+            placeholder={"B08N5WRWNW\nB09G9HD6PD\nB07FZ8S74R"}
+            rows={5}
+            style={{ ...inputStyle, resize: "vertical", fontFamily: "monospace" }}
+          />
+          {err && (
+            <div style={{ background: "#ef444422", border: "1px solid #ef4444", borderRadius: 8,
+              padding: "10px 14px", color: C.red, fontSize: 13, marginTop: 10 }}>{err}</div>
+          )}
+          <div style={{ marginTop: 12 }}>
+            <Btn onClick={lookup} disabled={loading}>
+              {loading ? "Looking up…" : "Fetch ASIN Data"}
+            </Btn>
+          </div>
+        </div>
+      </Section>
+
+      {/* Results */}
+      {result && (
+        <Section title={`Results — ${result.marketplace.name} · ${result.items.length} ASIN${result.items.length !== 1 ? "s" : ""}`}>
+          <div style={{ padding: "0 20px 16px" }}>
+            {result.items.map((item, idx) => (
+              <div key={idx} style={{
+                border: `1px solid ${item.ok ? C.border : C.red + "55"}`,
+                borderRadius: 10, marginTop: 12, overflow: "hidden",
+              }}>
+                {/* Header row */}
+                <div
+                  onClick={() => setExpanded(expanded === idx ? null : idx)}
+                  style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px",
+                    cursor: "pointer", background: C.surface,
+                    borderBottom: expanded === idx ? `1px solid ${C.border}` : "none" }}>
+                  {item.ok && item.data.primaryImage && (
+                    <img src={item.data.primaryImage} alt="" style={{ width: 40, height: 40, objectFit: "contain", borderRadius: 4, background: "#fff" }} />
+                  )}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontFamily: "monospace", color: C.accent, fontWeight: 700, fontSize: 13 }}>{item.asin}</span>
+                      {item.ok
+                        ? <span style={{ background: C.accentDim, color: C.accent, fontSize: 11, padding: "1px 7px", borderRadius: 99 }}>OK</span>
+                        : <span style={{ background: "#ef444422", color: C.red, fontSize: 11, padding: "1px 7px", borderRadius: 99 }}>Error</span>}
+                      {item.ok && item.data.ean && (
+                        <span style={{ color: C.muted, fontSize: 11 }}>EAN: <span style={{ color: C.textDim, fontFamily: "monospace" }}>{item.data.ean}</span></span>
+                      )}
+                    </div>
+                    <div style={{ color: C.textDim, fontSize: 13, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.ok ? (item.data.title ?? "—") : item.error}
+                    </div>
+                  </div>
+                  <span style={{ color: C.muted, fontSize: 16, userSelect: "none" }}>{expanded === idx ? "▲" : "▼"}</span>
+                </div>
+
+                {/* Expanded detail */}
+                {expanded === idx && item.ok && (
+                  <div style={{ padding: "14px 16px", background: C.bg, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    {/* Left column */}
+                    <div>
+                      <Row label="Brand"        value={item.data.brand} />
+                      <Row label="Manufacturer" value={item.data.manufacturer} />
+                      <Row label="Color"        value={item.data.color} />
+                      <Row label="Size"         value={item.data.size} />
+                      <Row label="Item Class"   value={item.data.itemClass} />
+                      <Row label="Website Group"value={item.data.website} />
+                      {item.data.topRank && (
+                        <Row label="Best Seller" value={`#${item.data.topRank.rank.toLocaleString()} in ${item.data.topRank.category}`} />
+                      )}
+                      {/* Identifiers */}
+                      {Object.entries(item.data.identifiers).map(([type, vals]) => (
+                        <Row key={type} label={type} value={vals.join(", ")} mono />
+                      ))}
+                    </div>
+
+                    {/* Right column */}
+                    <div>
+                      {item.data.description && (
+                        <div style={{ marginBottom: 10 }}>
+                          <div style={{ color: C.muted, fontSize: 11, marginBottom: 3 }}>Description</div>
+                          <div style={{ color: C.textDim, fontSize: 12, maxHeight: 100, overflowY: "auto", lineHeight: 1.5 }}>{item.data.description}</div>
+                        </div>
+                      )}
+                      {item.data.bullet_points?.length > 0 && (
+                        <div style={{ marginBottom: 10 }}>
+                          <div style={{ color: C.muted, fontSize: 11, marginBottom: 3 }}>Bullet Points</div>
+                          <ul style={{ margin: 0, paddingLeft: 16, color: C.textDim, fontSize: 12, lineHeight: 1.6 }}>
+                            {item.data.bullet_points.map((b, i) => <li key={i}>{b}</li>)}
+                          </ul>
+                        </div>
+                      )}
+                      {/* Image thumbnails */}
+                      {item.data.images?.length > 0 && (
+                        <div>
+                          <div style={{ color: C.muted, fontSize: 11, marginBottom: 6 }}>Images ({item.data.images.length})</div>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                            {item.data.images.map((url, i) => (
+                              <a key={i} href={url} target="_blank" rel="noreferrer">
+                                <img src={url} alt="" style={{ width: 52, height: 52, objectFit: "contain",
+                                  background: "#fff", borderRadius: 4, border: `1px solid ${C.border}` }} />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Error detail */}
+                {expanded === idx && !item.ok && (
+                  <div style={{ padding: "10px 16px", background: C.bg, color: C.red, fontSize: 12, fontFamily: "monospace" }}>
+                    {item.error}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+    </div>
+  );
+}
+
+function Row({ label, value, mono = false }) {
+  if (!value) return null;
+  return (
+    <div style={{ display: "flex", gap: 8, marginBottom: 5, fontSize: 12 }}>
+      <span style={{ color: C.muted, minWidth: 110, flexShrink: 0 }}>{label}</span>
+      <span style={{ color: mono ? C.accent : C.textDim, fontFamily: mono ? "monospace" : "inherit", wordBreak: "break-all" }}>{value}</span>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// ORDERS PAGE
+// ─────────────────────────────────────────────
+
+const ORDER_STATUS_COLORS = {
+  awaiting_dispatch:    "#FFC107",
+  dispatched:           "#34C759",
+  complete:             "#228B22",
+  cancelled:            "#F44336",
+  cancelled_by_seller:  "#F44336",
+  cancelled_by_buyer:   "#F44336",
+  cancelled_by_customer:"#F44336",
+  partially_dispatched: "#03A9F4",
+  partially_refunded:   "#FF9900",
+  refunded:             "#9966CC",
+};
+// Normalise any status format (spaces/hyphens → underscores, lowercase) before colour lookup
+const normalizeStatus = s => (s ?? "").toLowerCase().replace(/[\s-]+/g, "_").trim();
+const fmtStatus = s => (s ?? "").replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+function OrdersPage() {
+  const [orders,   setOrders]   = useState([]);
+  const [total,    setTotal]    = useState(0);
+  const [offset,   setOffset]   = useState(0);
+  const [search,   setSearch]   = useState("");
+  const [status,   setStatus]   = useState("");
+  const [accounts, setAccounts] = useState([]);
+  const [accId,    setAccId]    = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [syncing,  setSyncing]  = useState(false);
+  const [expanded, setExpanded] = useState(null);
+  const LIMIT = 50;
+
+  const load = useCallback(async (off = 0) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: LIMIT, offset: off });
+      if (search) params.set("search", search);
+      if (status) params.set("status", status);
+      if (accId)  params.set("account_id", accId);
+      const data = await api(`/orders?${params}`);
+      setOrders(data.orders ?? []);
+      setTotal(data.total ?? 0);
+      setOffset(off);
+    } catch {}
+    setLoading(false);
+  }, [search, status, accId]);
+
+  useEffect(() => { load(0); }, [load]);
+
+  useEffect(() => {
+    api("/accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  async function triggerSync() {
+    setSyncing(true);
+    try {
+      const r = await api("/orders/sync", { method:"POST" });
+      alert(r.message ?? "Sync triggered");
+      setTimeout(() => load(offset), 3000);
+    } catch (e) { alert(e.message); }
+    setSyncing(false);
+  }
+
+  const inputStyle = { background:"#0b0f1a", border:`1px solid ${C.border}`, borderRadius:8,
+    color:C.text, padding:"8px 12px", fontSize:13 };
+
+  return (
+    <div>
+      {/* Controls */}
+      <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:16, alignItems:"center" }}>
+        <input style={{ ...inputStyle, flex:1, minWidth:180 }} placeholder="Search order ID or customer name…"
+          value={search} onChange={e => { setSearch(e.target.value); }}
+          onKeyDown={e => e.key === "Enter" && load(0)} />
+        <select style={{ ...inputStyle, background:C.surface }} value={status}
+          onChange={e => setStatus(e.target.value)}>
+          <option value="">All statuses</option>
+          <option value="awaiting_dispatch">Awaiting Dispatch</option>
+          <option value="dispatched">Dispatched</option>
+          <option value="partially_dispatched">Partially Dispatched</option>
+          <option value="complete">Complete</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="cancelled_by_seller">Cancelled By Seller</option>
+          <option value="cancelled_by_buyer">Cancelled By Buyer</option>
+          <option value="partially_refunded">Partially Refunded</option>
+          <option value="refunded">Refunded</option>
+        </select>
+        <select style={{ ...inputStyle, background:C.surface }} value={accId}
+          onChange={e => setAccId(e.target.value)}>
+          <option value="">All accounts</option>
+          {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+        </select>
+        <Btn onClick={() => load(0)} loading={loading} variant="secondary">Search</Btn>
+        <Btn onClick={triggerSync} loading={syncing}>⟳ Sync Now</Btn>
+      </div>
+
+      <div style={{ color:C.muted, fontSize:12, marginBottom:10 }}>
+        {total.toLocaleString()} orders total · showing {offset + 1}–{Math.min(offset + LIMIT, total)}
+      </div>
+
+      {/* Table */}
+      <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:10, overflow:"hidden" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+          <thead>
+            <tr style={{ background:"#0b0f1a", borderBottom:`1px solid ${C.border}` }}>
+              {["Order #","Date","Customer","Products","Total","Status","Account"].map(h => (
+                <th key={h} style={{ color:C.muted, fontWeight:600, textAlign:"left",
+                  padding:"10px 14px", fontSize:11, letterSpacing:"0.05em" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr><td colSpan={7} style={{ padding:24, textAlign:"center", color:C.muted }}>Loading…</td></tr>
+            )}
+            {!loading && orders.length === 0 && (
+              <tr><td colSpan={7} style={{ padding:24, textAlign:"center", color:C.muted }}>No orders found.</td></tr>
+            )}
+            {orders.map(o => {
+              const products = Array.isArray(o.products) ? o.products : [];
+              const isOpen   = expanded === o.id;
+              const scol     = ORDER_STATUS_COLORS[normalizeStatus(o.status)] ?? C.muted;
+              return (
+                <Fragment key={o.id}>
+                  <tr onClick={() => setExpanded(isOpen ? null : o.id)}
+                    style={{ borderBottom:`1px solid ${C.border}`, cursor:"pointer",
+                      background: isOpen ? "#ffffff08" : "transparent" }}>
+                    <td style={{ padding:"10px 14px", color:C.accent, fontWeight:600, fontFamily:"monospace" }}>{o.order_id}</td>
+                    <td style={{ padding:"10px 14px", color:C.textDim }}>
+                      {o.order_date ? new Date(o.order_date).toLocaleDateString("en-GB") : "—"}
+                    </td>
+                    <td style={{ padding:"10px 14px", color:C.text }}>{o.buyer_name ?? "—"}</td>
+                    <td style={{ padding:"10px 14px", color:C.textDim }}>{products.length} item{products.length !== 1 ? "s" : ""}</td>
+                    <td style={{ padding:"10px 14px", color:C.text, fontWeight:600 }}>
+                      £{parseFloat(o.price_total ?? 0).toFixed(2)}
+                    </td>
+                    <td style={{ padding:"10px 14px" }}>
+                      <span style={{ background:scol + "22", color:scol, borderRadius:5,
+                        padding:"2px 8px", fontSize:11, fontWeight:600 }}>{fmtStatus(o.status)}</span>
+                    </td>
+                    <td style={{ padding:"10px 14px", color:C.muted, fontSize:12 }}>{o.account_name}</td>
+                  </tr>
+                  {isOpen && (
+                    <tr style={{ background:"#0b0f1a", borderBottom:`1px solid ${C.border}` }}>
+                      <td colSpan={7} style={{ padding:"12px 16px" }}>
+                        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))", gap:8 }}>
+                          {products.map((p, i) => (
+                            <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`,
+                              borderRadius:8, padding:"10px 12px" }}>
+                              <div style={{ color:C.text, fontSize:13, fontWeight:600, marginBottom:4 }}>
+                                {p.name}
+                              </div>
+                              <div style={{ color:C.muted, fontSize:11, display:"flex", gap:12, flexWrap:"wrap" }}>
+                                <span>SKU: {p.sku}</span>
+                                <span>Qty: {p.quantity}</span>
+                                <span>£{p.unit_price} ea</span>
+                                <span>Fee: £{p.fee?.total_sales_fee ?? "—"}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ marginTop:10, color:C.muted, fontSize:11 }}>
+                          Phone: {o.buyer_phone ?? "—"} · Synced: {o.synced_at ? new Date(o.synced_at).toLocaleString("en-GB") : "—"}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Pagination */}
+      {total > LIMIT && (
+        <div style={{ display:"flex", gap:8, justifyContent:"center", marginTop:16 }}>
+          <Btn small variant="secondary" onClick={() => load(Math.max(0, offset - LIMIT))}
+            disabled={offset === 0}>← Prev</Btn>
+          <span style={{ color:C.muted, fontSize:13, alignSelf:"center" }}>
+            Page {Math.floor(offset / LIMIT) + 1} / {Math.ceil(total / LIMIT)}
+          </span>
+          <Btn small variant="secondary" onClick={() => load(offset + LIMIT)}
+            disabled={offset + LIMIT >= total}>Next →</Btn>
+        </div>
       )}
     </div>
   );

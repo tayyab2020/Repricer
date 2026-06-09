@@ -23,6 +23,7 @@ import multer from 'multer';
 import XLSX from 'xlsx';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { getLwaAccessToken, fetchAsinCatalog, parseCatalogItem, MARKETPLACES } from './spApiHelper.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { mkdirSync(join(__dirname, 'logs'), { recursive: true }); } catch {}
@@ -820,7 +821,9 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
               LEFT(consumer_key, 6) || '••••••' AS consumer_key_hint,
               keepa_email,
               CASE WHEN keepa_password IS NOT NULL AND keepa_password != '' THEN true ELSE false END AS has_keepa_password,
-              enable_puppeteer, enable_twister, enable_cheerio
+              enable_puppeteer, enable_twister, enable_cheerio,
+              google_sheet_id,
+              CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet
        FROM onbuy_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.effectiveUserId]
     );
@@ -833,7 +836,8 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, account_name, consumer_key, secret_key, site_id, is_active,
-              keepa_email, keepa_password, enable_puppeteer, enable_twister, enable_cheerio
+              keepa_email, keepa_password, enable_puppeteer, enable_twister, enable_cheerio,
+              google_sheet_id, google_service_account
        FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.effectiveUserId]
     );
@@ -845,19 +849,28 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
 // POST /api/accounts — create account
 app.post('/api/accounts', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id = '2000', keepa_email, keepa_password,
-          enable_puppeteer, enable_twister, enable_cheerio } = req.body;
+          enable_puppeteer, enable_twister, enable_cheerio,
+          google_sheet_id, google_service_account } = req.body;
   if (!account_name || !consumer_key || !secret_key)
     return res.status(400).json({ error: 'account_name, consumer_key and secret_key are required' });
   try {
+    let sheetCreds = null;
+    if (google_service_account) {
+      sheetCreds = typeof google_service_account === 'string'
+        ? JSON.parse(google_service_account) : google_service_account;
+    }
     const { rows } = await db.query(
       `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id, keepa_email, keepa_password,
-                                   enable_puppeteer, enable_twister, enable_cheerio)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                   enable_puppeteer, enable_twister, enable_cheerio,
+                                   google_sheet_id, google_service_account)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id, account_name, site_id, is_active, created_at, keepa_email,
-                 enable_puppeteer, enable_twister, enable_cheerio`,
+                 enable_puppeteer, enable_twister, enable_cheerio, google_sheet_id,
+                 CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name, consumer_key, secret_key, site_id, req.effectiveUserId,
        keepa_email || null, keepa_password || null,
-       enable_puppeteer === true, enable_twister === true, enable_cheerio === true]
+       enable_puppeteer === true, enable_twister === true, enable_cheerio === true,
+       google_sheet_id || null, sheetCreds ? JSON.stringify(sheetCreds) : null]
     );
     res.status(201).json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -866,28 +879,44 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 // PUT /api/accounts/:id — update account
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
-          enable_puppeteer, enable_twister, enable_cheerio } = req.body;
+          enable_puppeteer, enable_twister, enable_cheerio,
+          google_sheet_id, google_service_account } = req.body;
   try {
+    let sheetCreds = undefined; // undefined = don't change; null = clear
+    if (google_service_account !== undefined) {
+      if (!google_service_account || google_service_account === '') {
+        sheetCreds = null;
+      } else {
+        sheetCreds = typeof google_service_account === 'string'
+          ? JSON.parse(google_service_account) : google_service_account;
+        sheetCreds = JSON.stringify(sheetCreds);
+      }
+    }
     const { rows } = await db.query(
       `UPDATE onbuy_accounts SET
-         account_name     = COALESCE($1, account_name),
-         consumer_key     = COALESCE(NULLIF($2,''), consumer_key),
-         secret_key       = COALESCE(NULLIF($3,''), secret_key),
-         site_id          = COALESCE($4, site_id),
-         is_active        = COALESCE($5, is_active),
-         keepa_email      = COALESCE(NULLIF($6,''), keepa_email),
-         keepa_password   = COALESCE(NULLIF($7,''), keepa_password),
-         enable_puppeteer = COALESCE($8, enable_puppeteer),
-         enable_twister   = COALESCE($9, enable_twister),
-         enable_cheerio   = COALESCE($10, enable_cheerio),
-         updated_at       = NOW()
+         account_name           = COALESCE($1, account_name),
+         consumer_key           = COALESCE(NULLIF($2,''), consumer_key),
+         secret_key             = COALESCE(NULLIF($3,''), secret_key),
+         site_id                = COALESCE($4, site_id),
+         is_active              = COALESCE($5, is_active),
+         keepa_email            = COALESCE(NULLIF($6,''), keepa_email),
+         keepa_password         = COALESCE(NULLIF($7,''), keepa_password),
+         enable_puppeteer       = COALESCE($8, enable_puppeteer),
+         enable_twister         = COALESCE($9, enable_twister),
+         enable_cheerio         = COALESCE($10, enable_cheerio),
+         google_sheet_id        = CASE WHEN $13::text IS NOT NULL THEN NULLIF($13,'') ELSE google_sheet_id END,
+         google_service_account = CASE WHEN $14::text IS NOT NULL THEN $14::jsonb ELSE google_service_account END,
+         updated_at             = NOW()
        WHERE id = $11 AND user_id = $12
        RETURNING id, account_name, site_id, is_active, keepa_email,
-                 enable_puppeteer, enable_twister, enable_cheerio`,
+                 enable_puppeteer, enable_twister, enable_cheerio, google_sheet_id,
+                 CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name || null, consumer_key || null, secret_key || null, site_id || null,
        is_active ?? null, keepa_email ?? null, keepa_password ?? null,
        enable_puppeteer ?? null, enable_twister ?? null, enable_cheerio ?? null,
-       req.params.id, req.effectiveUserId]
+       req.params.id, req.effectiveUserId,
+       google_sheet_id !== undefined ? (google_sheet_id || '') : null,
+       sheetCreds !== undefined ? (sheetCreds ?? null) : null]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
@@ -1678,6 +1707,67 @@ async function runMigrations() {
        price_changes    INT  NOT NULL DEFAULT 0,
        PRIMARY KEY (user_id, onbuy_account_id, date)
      )`,
+    // Google Sheets integration per OnBuy account
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS google_sheet_id TEXT`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS google_service_account JSONB`,
+    // Orders sync table
+    `CREATE TABLE IF NOT EXISTS onbuy_orders (
+       id                 SERIAL PRIMARY KEY,
+       account_id         INTEGER NOT NULL REFERENCES onbuy_accounts(id) ON DELETE CASCADE,
+       user_id            INTEGER NOT NULL,
+       order_id           TEXT NOT NULL,
+       onbuy_internal_ref TEXT,
+       order_date         TIMESTAMPTZ,
+       updated_at_onbuy   TIMESTAMPTZ,
+       status             TEXT,
+       site_id            TEXT,
+       buyer_name         TEXT,
+       buyer_email        TEXT,
+       buyer_phone        TEXT,
+       delivery_address   JSONB,
+       billing_address    JSONB,
+       price_subtotal     NUMERIC(10,2),
+       price_total        NUMERIC(10,2),
+       price_delivery     NUMERIC(10,2),
+       sales_fee_ex_vat   NUMERIC(10,2),
+       sales_fee_inc_vat  NUMERIC(10,2),
+       vat_rate           NUMERIC(5,2),
+       currency_code      TEXT,
+       fee                JSONB,
+       products           JSONB,
+       raw_data           JSONB,
+       synced_at          TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(account_id, order_id)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_orders_account ON onbuy_orders(account_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_orders_date    ON onbuy_orders(order_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_orders_status  ON onbuy_orders(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_orders_user    ON onbuy_orders(user_id)`,
+    // Per-line-item enrichment table (product URL, ASIN, source price, financials)
+    `CREATE TABLE IF NOT EXISTS onbuy_order_items (
+       id            SERIAL PRIMARY KEY,
+       order_id      TEXT    NOT NULL,
+       account_id    INTEGER NOT NULL,
+       user_id       INTEGER NOT NULL,
+       sku           TEXT    NOT NULL DEFAULT '',
+       product_name  TEXT,
+       quantity      INTEGER,
+       unit_price    NUMERIC(10,2),
+       total_price   NUMERIC(10,2),
+       onbuy_fee     NUMERIC(10,2),
+       vat           NUMERIC(10,2),
+       total_fee     NUMERIC(10,2),
+       product_url   TEXT,
+       amazon_asin   TEXT,
+       source_url    TEXT,
+       source_price  NUMERIC(10,2),
+       total_cost    NUMERIC(10,2),
+       total_profit  NUMERIC(10,2),
+       enriched_at   TIMESTAMPTZ DEFAULT NOW(),
+       UNIQUE(account_id, order_id, sku)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_ooi_order  ON onbuy_order_items(order_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_ooi_account ON onbuy_order_items(account_id)`,
   ];
   for (const sql of steps) {
     try {
@@ -2887,6 +2977,117 @@ app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
     send({ error: e.message });
   }
   res.end();
+});
+
+// ── OnBuy Orders ──────────────────────────────────────────────────────────────
+
+// GET /api/orders — list orders for current user (paginated)
+app.get('/api/orders', requireAuth, async (req, res) => {
+  const uid    = req.effectiveUserId;
+  const limit  = Math.min(parseInt(req.query.limit  ?? 50), 200);
+  const offset = parseInt(req.query.offset ?? 0);
+  const accountId = req.query.account_id || null;
+  const status    = req.query.status     || null;
+  const search    = req.query.search     || null;
+
+  try {
+    const conditions = ['o.user_id = $1'];
+    const params     = [uid];
+    let   p          = 2;
+
+    if (accountId) { conditions.push(`o.account_id = $${p++}`); params.push(accountId); }
+    if (status)    { conditions.push(`REPLACE(LOWER(o.status), ' ', '_') = $${p++}`); params.push(status.toLowerCase()); }
+    if (search)    {
+      conditions.push(`(o.order_id ILIKE $${p} OR o.buyer_name ILIKE $${p})`);
+      params.push(`%${search}%`); p++;
+    }
+
+    const where = conditions.join(' AND ');
+    const { rows } = await db.query(
+      `SELECT o.id, o.order_id, o.order_date, o.status, o.buyer_name, o.buyer_phone,
+              o.price_total, o.currency_code, o.products, o.synced_at,
+              a.account_name
+       FROM onbuy_orders o
+       JOIN onbuy_accounts a ON a.id = o.account_id
+       WHERE ${where}
+       ORDER BY o.order_date DESC NULLS LAST
+       LIMIT $${p++} OFFSET $${p++}`,
+      [...params, limit, offset]
+    );
+
+    const { rows: [{ total }] } = await db.query(
+      `SELECT COUNT(*)::int AS total FROM onbuy_orders o WHERE ${where}`, params
+    );
+
+    res.json({ orders: rows, total, limit, offset });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/orders/:id — single order detail
+app.get('/api/orders/:id', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows } = await db.query(
+      `SELECT o.*, a.account_name
+       FROM onbuy_orders o
+       JOIN onbuy_accounts a ON a.id = o.account_id
+       WHERE o.id = $1 AND o.user_id = $2`,
+      [req.params.id, uid]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Order not found' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/orders/sync — manual trigger (publishes to Redis; orders job process handles it)
+app.post('/api/orders/sync', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows: accounts } = await db.query(
+      `SELECT id FROM onbuy_accounts WHERE user_id = $1 AND is_active = true`, [uid]
+    );
+    if (!accounts.length) return res.json({ message: 'No active OnBuy accounts found' });
+    await redisPub.publish('orders:sync', String(uid));
+    res.json({ message: `Sync started for ${accounts.length} account(s)` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Amazon SP-API ─────────────────────────────────────────────────────────────
+
+// GET /api/sp-api/marketplaces — return supported marketplace list
+app.get('/api/sp-api/marketplaces', requireAuth, (req, res) => {
+  res.json(Object.entries(MARKETPLACES).map(([code, m]) => ({ code, id: m.id, name: m.name })));
+});
+
+// POST /api/sp-api/lookup — fetch catalog data for a list of ASINs
+// Body: { clientId, clientSecret, refreshToken, marketplaceCode, asins: [] }
+app.post('/api/sp-api/lookup', requireAuth, async (req, res) => {
+  const { clientId, clientSecret, refreshToken, marketplaceCode, asins } = req.body;
+
+  if (!clientId || !clientSecret || !refreshToken) return res.status(400).json({ error: 'LWA credentials required (clientId, clientSecret, refreshToken)' });
+  if (!asins?.length)                              return res.status(400).json({ error: 'At least one ASIN required' });
+
+  const marketplace = MARKETPLACES[marketplaceCode?.toUpperCase()] ?? MARKETPLACES.UK;
+
+  try {
+    const accessToken = await getLwaAccessToken({ clientId, clientSecret, refreshToken });
+
+    const results = await Promise.allSettled(
+      asins.map(asin => fetchAsinCatalog(asin.trim().toUpperCase(), accessToken, marketplace))
+    );
+
+    const items = results.map((r, i) => {
+      const asin = asins[i].trim().toUpperCase();
+      if (r.status === 'fulfilled') {
+        return { asin, ok: true, data: parseCatalogItem(r.value, marketplace.id) };
+      }
+      return { asin, ok: false, error: r.reason?.message ?? String(r.reason) };
+    });
+
+    res.json({ marketplace: { code: marketplaceCode, ...marketplace }, items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────

@@ -9,6 +9,8 @@
     "dev": "node --watch server.js",
     "job": "node repricerJob.js",
     "dev:job": "node --watch repricerJob.js",
+    "orders": "node ordersJob.js",
+    "dev:orders": "node --watch ordersJob.js",
     "db:setup": "psql $DATABASE_URL -f database/schema.sql"
   },
   "overrides": {
@@ -21,6 +23,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "googleapis": "^173.0.0",
     "https-proxy-agent": "^7.0.6",
     "ioredis": "^5.10.1",
     "jsonwebtoken": "^9.0.3",
