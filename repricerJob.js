@@ -236,14 +236,54 @@ class OnBuyUpdater {
 
     ulog(batchUserId, `[OnBuyUpdater] Stock batch ${listingKey.toUpperCase()} ×${items.length}`, JSON.stringify({ listings }));
 
+    const doRequest = (authToken) => fetch(endpoint, {
+      method:  'PUT',
+      headers: { Authorization: authToken, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ listings }),
+    });
+
     try {
-      const res = await fetch(endpoint, {
-        method:  'PUT',
-        headers: { Authorization: token, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ listings }),
-      });
-      const raw = await res.text();
+      let res = await doRequest(token);
+      let raw = await res.text();
       ulog(batchUserId, `[OnBuyUpdater] Stock batch → HTTP ${res.status} ${raw.slice(0, 200)}`);
+
+      // Token expired mid-run — refresh once and retry the batch
+      if (res.status === 401) {
+        let creds = this._creds.get(token)
+                 || this._creds.get(items[0].token)
+                 || (items[0].consumerKey ? { consumerKey: items[0].consumerKey, secretKey: items[0].secretKey } : null);
+
+        if (creds) {
+          ulog(batchUserId, `[OnBuyUpdater] Stock token expired (401) — refreshing for ${creds.consumerKey?.slice(0, 8)}…`);
+          try {
+            const newToken = await getTokenForAccount({ consumer_key: creds.consumerKey, secret_key: creds.secretKey });
+            if (newToken) {
+              this._creds.set(newToken, creds);
+              this._tokenMap.set(token, newToken);
+              const newKey  = `stock||${newToken}||${siteId}||${isSku ? '1' : '0'}`;
+              const waiting = this._stockBatches.get(key) || [];
+              if (!this._stockBatches.has(newKey)) this._stockBatches.set(newKey, []);
+              waiting.forEach(it => { it.token = newToken; this._stockBatches.get(newKey).push(it); });
+              this._stockBatches.set(key, []);
+              if (this._stockTimers.has(key)) {
+                clearTimeout(this._stockTimers.get(key));
+                this._stockTimers.delete(key);
+                if (this._stockBatches.get(newKey).length > 0 && !this._stockTimers.has(newKey)) {
+                  const t = setTimeout(() => { this._stockTimers.delete(newKey); this._enqueueStockFlush(newKey); }, 30_000);
+                  this._stockTimers.set(newKey, t);
+                }
+              }
+              res = await doRequest(newToken);
+              raw = await res.text();
+              ulog(batchUserId, `[OnBuyUpdater] Stock retry with refreshed token → HTTP ${res.status}`, raw.slice(0, 200));
+            }
+          } catch (refreshErr) {
+            ulog(batchUserId, `[OnBuyUpdater] Stock token refresh failed:`, refreshErr.message);
+          }
+        } else {
+          ulog(batchUserId, `[OnBuyUpdater] Stock token expired (401) but no credentials available to refresh — check OnBuy account setup`);
+        }
+      }
 
       if (!res.ok) {
         const err = new Error(`OnBuy stock ${res.status}: ${raw.slice(0, 200)}`);

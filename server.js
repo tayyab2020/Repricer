@@ -517,6 +517,63 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/job/cancel — stop all running/queued repricer jobs for the effective user
+app.post('/api/job/cancel', requireAuth, async (req, res) => {
+  try {
+    const userId = req.effectiveUserId;
+
+    // Get all onbuy account IDs for this user
+    const { rows: accounts } = await db.query(
+      `SELECT id FROM onbuy_accounts WHERE user_id = $1 AND is_active = true`, [userId]
+    );
+    const accountIds = new Set(accounts.map(a => String(a.id)));
+
+    // Remove delayed + waiting keepa jobs belonging to this user's accounts
+    const [delayed, waiting, active] = await Promise.all([
+      keepaQueue.getDelayed(),
+      keepaQueue.getWaiting(),
+      keepaQueue.getActive(),
+    ]);
+
+    let removed = 0;
+    for (const job of [...delayed, ...waiting]) {
+      const byId   = accountIds.has(String(job.data?.accountId));
+      const byName = [...accountIds].some(aid => String(job.id).includes(`-${aid}-`) || String(job.id) === `keepa-${aid}`);
+      if (byId || byName) {
+        await job.remove().catch(() => {});
+        removed++;
+      }
+    }
+    for (const job of active) {
+      if (accountIds.has(String(job.data?.accountId))) {
+        await job.moveToFailed({ message: 'Cancelled by user' }, 'user-cancel', true).catch(() => {});
+        removed++;
+      }
+    }
+
+    // Also drain fast/slow queue jobs for this user
+    const [fw, fa, sw, sa] = await Promise.all([
+      fastQueue.getWaiting(), fastQueue.getActive(),
+      slowQueue.getWaiting(), slowQueue.getActive(),
+    ]);
+    for (const job of [...fw, ...fa, ...sw, ...sa]) {
+      if (String(job.data?.userId) === String(userId)) {
+        await job.remove().catch(() => {});
+        removed++;
+      }
+    }
+
+    // Clear Redis flags
+    await redis.del(`keepa:refill-pending:${userId}`);
+    await redis.del(`repricer:running:${userId}`);
+
+    console.log(`[CancelJob] User ${userId} cancelled ${removed} job(s)`);
+    res.json({ ok: true, removed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/scraper-logs — last 200 scraper log entries (in-memory)
 app.get('/api/scraper-logs', requireAuth, (req, res) => {
   res.json(scraperLogs);

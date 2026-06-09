@@ -263,6 +263,7 @@ const SHEET_HEADERS = [
 
 // Row-2 meta-headers written when creating a new tab (0-based column index → text)
 const SHEET_ROW2_HEADERS = {
+  0:  'Selling Details',
   10: 'Selling Details / Profit',
   21: 'ROI %', 22: 'Status', 23: 'account Name', 24: 'Card',
 };
@@ -396,6 +397,30 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
           valueInputOption: 'RAW',
           requestBody: { values: [row2] },
         });
+
+        // Row 1: account name + yellow separator placeholders + Today Dispatch Order label
+        const row1Raw = [
+          { range: `'${tabName}'!A1`, values: [[account.account_name || '']] },
+          { range: `'${tabName}'!J1`, values: [['_']] },
+          { range: `'${tabName}'!U1`, values: [['_']] },
+          { range: `'${tabName}'!V1`, values: [['Today Dispatch Order:']] },
+          { range: `'${tabName}'!W1`, values: [[0]] },
+        ];
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: { valueInputOption: 'RAW', data: row1Raw },
+        });
+        // SUM formulas for numeric columns in row 1 (Unit Price → Net Profit, cols L–T)
+        const row1Formulas = [];
+        for (let ci = 11; ci <= 19; ci++) {
+          const col = colIdxToLetter(ci);
+          row1Formulas.push({ range: `'${tabName}'!${col}1`, values: [[`=SUM(${col}4:${col}1000)`]] });
+        }
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: { valueInputOption: 'USER_ENTERED', data: row1Formulas },
+        });
+
         knownTabs.add(tabName);
         log(`Created tab: ${tabName}`);
       }
@@ -525,6 +550,19 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
                   userEnteredFormat: {
                     backgroundColor: { red: 1, green: 1, blue: 1 },
                     textFormat: { bold: false },
+                  },
+                },
+                fields: 'userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold',
+              },
+            },
+            // Row 2 (Selling Details / Profit header): #B5D7A8 background, bold
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: numCols },
+                cell: {
+                  userEnteredFormat: {
+                    backgroundColor: { red: 181 / 255, green: 215 / 255, blue: 168 / 255 },
+                    textFormat: { bold: true },
                   },
                 },
                 fields: 'userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold',

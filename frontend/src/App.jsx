@@ -1725,6 +1725,7 @@ export default function App() {
   const [page, setPage]       = useState("dashboard");
   const [stats, setStats]     = useState(null);
   const [syncing, setSyncing]       = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [queueBusy, setQueueBusy]   = useState(false);
   const [queueCounts, setQueueCounts] = useState(null);
   const [chartMapping, setChartMapping] = useState(null);
@@ -1981,6 +1982,36 @@ export default function App() {
                 </button>
               </div>
             </div>
+          )}
+          {queueBusy && (
+            <button
+              onClick={async () => {
+                if (cancelling) return;
+                setCancelling(true);
+                try {
+                  await api("/job/cancel", { method: "POST" });
+                  setQueueBusy(false);
+                  setQueueCounts(null);
+                } catch (e) {
+                  alert("Failed to cancel job: " + (e.message || "Unknown error"));
+                } finally {
+                  setCancelling(false);
+                }
+              }}
+              disabled={cancelling}
+              style={{
+                width: "100%", marginTop: 8,
+                background: "transparent",
+                border: `1px solid #c0392b`,
+                color: cancelling ? C.muted : "#e74c3c",
+                borderRadius: 8, padding: "7px 12px",
+                cursor: cancelling ? "not-allowed" : "pointer",
+                fontSize: 12, fontWeight: 600,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+              }}
+            >
+              {cancelling ? "Cancelling…" : "✕ Cancel Running Job"}
+            </button>
           )}
           <p style={{ color: queueBusy ? C.amber : C.muted, fontSize:10, textAlign:"center", marginTop:8 }}>
             {queueBusy
