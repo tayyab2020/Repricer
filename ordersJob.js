@@ -251,21 +251,23 @@ function formatAddress(addr) {
     .filter(Boolean).join('\n');
 }
 
-// Row-3 column headers for newly-created tabs (A–T)
+// Row-3 column headers for newly-created tabs (A–W)
 // J (index 9) and U (index 20) are yellow separator columns with heading "_"
 const SHEET_HEADERS = [
   'Order Date', 'Order No', 'Customer Details', 'Source Order No.', 'Source Order Date',
   'Tracking', 'Courier Name', 'Sourcing Link', 'Onbuy Link',
-  '', 'Qty', 'Unit Price', 'Source Price',
-  'Onbuy Fee', 'Boosted', 'VAT',
-  'Total Fee', 'Total Cost', 'Selling Price', 'Net Profit',
+  '',                                                               // J (9)  yellow separator
+  'Qty', 'Unit Price', 'Source Price',                             // K-M (10-12)
+  'Onbuy Fee', 'Boosted', 'VAT',                                   // N-P (13-15)
+  'Total Fee', 'Total Cost', 'Selling Price', 'Net Profit',        // Q-T (16-19)
+  '',                                                               // U (20) yellow separator
+  'ROI %', 'Status',                                               // V-W (21-22)
 ];
 
 // Row-2 meta-headers written when creating a new tab (0-based column index → text)
 const SHEET_ROW2_HEADERS = {
   0:  'Selling Details',
   10: 'Selling Details / Profit',
-  21: 'ROI %', 22: 'Status',
 };
 
 // Columns filled manually or computed by sheet formula — never overwritten during sync
@@ -398,13 +400,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
           requestBody: { values: [row2] },
         });
 
-        // Row 1: account name + yellow separator placeholders + Today Dispatch Order label
+        // Row 1: account name + yellow separator placeholders + Total Dispatch counter (V1:W1 merged)
         const row1Raw = [
           { range: `'${tabName}'!A1`, values: [[account.account_name || '']] },
           { range: `'${tabName}'!J1`, values: [['_']] },
           { range: `'${tabName}'!U1`, values: [['_']] },
-          { range: `'${tabName}'!V1`, values: [['Today Dispatch Order:']] },
-          { range: `'${tabName}'!W1`, values: [[0]] },
+          { range: `'${tabName}'!V1`, values: [['Total Dispatch: 0']] },
         ];
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId,
@@ -449,26 +450,35 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
         if (oid) rowMap.set(oid, i + 1);
       }
 
-      // Count orders whose expected_dispatch_date is today → write next to "Today Dispatch Order:" in row 1
+      // Count unique orders whose expected_dispatch_date is today → update V1 (merged V1:W1)
       const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const seenDispatchIds = new Set();
       const todayDispatchCount = items.reduce((acc, { order }) => {
-        const edd = (order.raw_data?.expected_dispatch_date ?? '');
+        if (seenDispatchIds.has(order.order_id)) return acc;
+        seenDispatchIds.add(order.order_id);
+        const rawData = typeof order.raw_data === 'string'
+          ? JSON.parse(order.raw_data) : (order.raw_data ?? {});
+        const edd = rawData.expected_dispatch_date ?? order.expected_dispatch_date ?? '';
         return acc + (edd && edd.toString().startsWith(todayStr) ? 1 : 0);
       }, 0);
-      const todayLabelIdx = colIdx['Today Dispatch Order:'];
-      const todayCountIdx = todayLabelIdx != null ? todayLabelIdx + 1 : null;
-      if (todayCountIdx != null) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId,
-          range: `'${tabName}'!${colIdxToLetter(todayCountIdx)}1`,
-          valueInputOption: 'RAW',
-          requestBody: { values: [[todayDispatchCount]] },
-        });
-      }
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${tabName}'!V1`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[`Total Dispatch: ${todayDispatchCount}`]] },
+      });
 
       const batchData  = [];
       const newRowObjs = [];
       let   updatedRows = 0;
+
+      // Ensure ROI % and Status are in row 3 (V3, W3) not row 2 — fixes existing tabs
+      batchData.push(
+        { range: `'${tabName}'!V2`, values: [['']] },
+        { range: `'${tabName}'!W2`, values: [['']] },
+        { range: `'${tabName}'!V3`, values: [['ROI %']] },
+        { range: `'${tabName}'!W3`, values: [['Status']] },
+      );
 
       for (const { order, product, vatRate } of items) {
         const enrichKey = `${order.order_id}|${product.sku ?? ''}`;
@@ -542,8 +552,31 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       if (sheetId != null) {
         try {
           const formatRequests = [
+            // Center align all cells in the entire sheet
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: numCols },
+                cell: { userEnteredFormat: { horizontalAlignment: 'CENTER' } },
+                fields: 'userEnteredFormat.horizontalAlignment',
+              },
+            },
+            // Row 1: yellow background, bold, font size 13
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: numCols },
+                cell: {
+                  userEnteredFormat: {
+                    backgroundColor: { red: 1, green: 1, blue: 0 },
+                    textFormat: { bold: true, fontSize: 13 },
+                  },
+                },
+                fields: 'userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold,userEnteredFormat.textFormat.fontSize',
+              },
+            },
             // Merge A1:I1 for account name
             { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
+            // Merge V1:W1 for "Total Dispatch: N" counter
+            { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 21, endColumnIndex: 23 }, mergeType: 'MERGE_ALL' } },
             // Merge A2:I2 for "Selling Details"
             { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
             // Merge K2:T2 for "Selling Details / Profit"
@@ -587,7 +620,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
                 fields: 'userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold',
               },
             },
-            // Yellow separator column J (index 9) — all rows, preserves "_" column styling
+            // Yellow separator column J (index 9) — all rows
             {
               repeatCell: {
                 range: { sheetId, startColumnIndex: 9, endColumnIndex: 10 },
@@ -601,6 +634,22 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
                 range: { sheetId, startColumnIndex: 20, endColumnIndex: 21 },
                 cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 0 } } },
                 fields: 'userEnteredFormat.backgroundColor',
+              },
+            },
+            // Column C (Customer Details, index 2): clip text wrap for data rows
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 3, startColumnIndex: 2, endColumnIndex: 3 },
+                cell: { userEnteredFormat: { wrapStrategy: 'CLIP' } },
+                fields: 'userEnteredFormat.wrapStrategy',
+              },
+            },
+            // Column I (Onbuy Link, index 8): clip text wrap for data rows
+            {
+              repeatCell: {
+                range: { sheetId, startRowIndex: 3, startColumnIndex: 8, endColumnIndex: 9 },
+                cell: { userEnteredFormat: { wrapStrategy: 'CLIP' } },
+                fields: 'userEnteredFormat.wrapStrategy',
               },
             },
           ];
