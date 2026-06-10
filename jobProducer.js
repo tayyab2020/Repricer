@@ -282,13 +282,12 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
     if (userId || accountId) {
       await Promise.all(jobs.map(j => fastQueue.remove(j.opts.jobId).catch(() => {})));
     } else {
-      // Global sync: drain waiting jobs from all three queues.
-      // Delayed keepa jobs are intentionally preserved — quota-refill jobs use a fixed jobId
-      // and the producer guard (keepa:refill-pending) prevents duplicates without a purge.
+      // Global sync: drain all three queues so stale keepa/refill/pricing jobs are cleared
       await Promise.all([
         fastQueue.drain(),
         slowQueue.drain(),
         keepaQueue.drain(),
+        keepaQueue.clean(0, 1000, 'delayed').catch(() => {}),  // also clear delayed refill jobs
       ]);
     }
     jlog('[Job] Queues drained — adding fresh jobs');
