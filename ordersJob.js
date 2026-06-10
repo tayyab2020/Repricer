@@ -451,7 +451,8 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       }
 
       // Count unique orders whose expected_dispatch_date is today → update V1 (merged V1:W1)
-      const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      // Use Europe/London timezone — OnBuy expected_dispatch_date is in UK local time
+      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date()); // YYYY-MM-DD
       const seenDispatchIds = new Set();
       const todayDispatchCount = items.reduce((acc, { order }) => {
         if (seenDispatchIds.has(order.order_id)) return acc;
