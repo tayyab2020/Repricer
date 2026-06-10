@@ -181,10 +181,11 @@ async function enrichOrderItems(db, account, token, orders) {
       const productUrl = urlCache[sku] ?? null;
       const asin       = sku || null;
 
-      const fee        = parseFloat(product.fee?.total_sales_fee ?? 0);
-      const vat        = vatRate > 0 ? +(fee * vatRate / 100).toFixed(2) : 0;
+      const zeroed     = isCancelledOrRefunded(order.status);
+      const fee        = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
+      const vat        = parseFloat(product.fee?.fees_tax ?? 0);
       const totalFee   = +(fee + vat).toFixed(2);
-      const totalPrice = parseFloat(product.total_price ?? 0);
+      const totalPrice = zeroed ? 0 : parseFloat(product.total_price ?? 0);
 
       enrichmentMap[`${order.order_id}|${sku}`] = {
         product_url: productUrl,
@@ -234,14 +235,14 @@ function tabForOrder(order) {
   return isNaN(d.getTime()) ? monthTabName() : monthTabName(d);
 }
 
-function formatOrderDate(dateStr) {
+// Convert a date string to a Google Sheets serial number (days since 1899-12-30).
+// Storing dates as serials lets Sheets sort them correctly as numbers.
+// A "D MMMM YYYY" number format applied to the column renders "10 June 2026".
+function toSheetsSerial(dateStr) {
   if (!dateStr) return '';
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return String(dateStr);
-  const day = d.getDate();
-  const sfx = (day % 100 >= 11 && day % 100 <= 13)
-    ? 'th' : (['th', 'st', 'nd', 'rd'][day % 10] ?? 'th');
-  return `${day}${sfx} ${d.toLocaleString('en-US', { month: 'long' })} ${d.getFullYear()}`;
+  return Math.floor((d.getTime() - new Date('1899-12-30T00:00:00.000Z').getTime()) / 86400000);
 }
 
 function formatAddress(addr) {
@@ -270,6 +271,15 @@ const SHEET_ROW2_HEADERS = {
   10: 'Selling Details / Profit',
 };
 
+// Statuses where OnBuy fee and selling price should be treated as 0
+const ZERO_FEE_STATUSES = new Set([
+  'cancelled', 'cancelled_by_seller', 'cancelled_by_buyer', 'cancelled_by_customer', 'refunded', 'partially_refunded',
+]);
+function isCancelledOrRefunded(status) {
+  const normalized = (status ?? '').toLowerCase().replace(/\s+/g, '_');
+  return ZERO_FEE_STATUSES.has(normalized);
+}
+
 // Columns filled manually or computed by sheet formula — never overwritten during sync
 const MANUAL_HEADERS = new Set([
   'Tracking', 'Courier Name', 'Source Order Date', 'Source Order No.',
@@ -282,7 +292,7 @@ const FORMULA_COLUMNS = {
   'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
   'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
-  'ROI %':      (ci, r) => `=${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Selling Price'])}${r}*100`,
+  'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Selling Price'])}${r}=0,0,${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Selling Price'])}${r}*100)`,
 };
 
 // Coerce a value to a JS number for sheet storage; returns '' for null/empty/NaN
@@ -295,16 +305,17 @@ function toNum(val) {
 // Returns row data as an object keyed by header title.
 // Only non-manual, non-formula columns are included — sheet formulas handle the rest.
 function buildSheetRow(order, product, vatRate, enriched = {}) {
-  const fee     = parseFloat(product.fee?.total_sales_fee ?? 0);
-  const vat     = vatRate > 0 ? +(fee * vatRate / 100).toFixed(2) : 0;
-  const boosted = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
+  const zeroed    = isCancelledOrRefunded(order.status);
+  const fee       = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
+  const vat       = parseFloat(product.fee?.fees_tax ?? 0);
+  const boosted   = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
   const rawStatus = (order.status ?? '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const status    = rawStatus === 'Cancelled By Customer' ? 'Cancelled By Buyer' : rawStatus;
   const rawData   = order.raw_data ?? {};
   const dispatches = Array.isArray(rawData.dispatches) ? rawData.dispatches : [];
   const apiTracking = dispatches[0]?.tracking_number ?? '';
   return {
-    'Order Date':        formatOrderDate(order.order_date ?? order.date),
+    'Order Date':        toSheetsSerial(order.order_date ?? order.date),
     'Order No':          order.order_id,
     'Customer Details':  (() => {
       const raw = order.delivery_address;
@@ -316,7 +327,7 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
     'Onbuy Link':        enriched.product_url || '',
     'Qty':               toNum(product.quantity),
     'Unit Price':        toNum(product.unit_price),
-    'Selling Price':     toNum(product.total_price),
+    'Selling Price':     zeroed ? 0 : toNum(product.total_price),
     'Onbuy Fee':         toNum(fee),
     'Boosted':           boosted,
     'VAT':               toNum(vat),
@@ -454,14 +465,24 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       // Use Europe/London timezone — OnBuy expected_dispatch_date is in UK local time
       const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date()); // YYYY-MM-DD
       const seenDispatchIds = new Set();
-      const todayDispatchCount = items.reduce((acc, { order }) => {
-        if (seenDispatchIds.has(order.order_id)) return acc;
+      const todayDispatchOrderIds = [];
+      for (const { order } of items) {
+        if (seenDispatchIds.has(order.order_id)) continue;
         seenDispatchIds.add(order.order_id);
-        const rawData = typeof order.raw_data === 'string'
+        const rawData  = typeof order.raw_data === 'string'
           ? JSON.parse(order.raw_data) : (order.raw_data ?? {});
-        const edd = rawData.expected_dispatch_date ?? order.expected_dispatch_date ?? '';
-        return acc + (edd && edd.toString().startsWith(todayStr) ? 1 : 0);
-      }, 0);
+        if (rawData.dispatched || order.is_dispatched) continue;
+        const orderStatus = (rawData.status ?? order.status ?? '');
+        if (orderStatus !== 'Awaiting Dispatch') continue;
+        const products = Array.isArray(rawData.products) ? rawData.products : [];
+        const hasToday = products.some(p => {
+          const edd = p.expected_dispatch_date ?? '';
+          return edd && edd.toString().startsWith(todayStr);
+        });
+        if (hasToday) todayDispatchOrderIds.push(order.order_id);
+      }
+      const todayDispatchCount = todayDispatchOrderIds.length;
+      log(`Today dispatch orders (${todayDispatchCount}): ${todayDispatchOrderIds.join(', ') || 'none'}`);
       await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `'${tabName}'!V1`,
@@ -653,7 +674,32 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
                 fields: 'userEnteredFormat.wrapStrategy',
               },
             },
+            // Column J (index 9): minimal width separator
+            {
+              updateDimensionProperties: {
+                range: { sheetId, dimension: 'COLUMNS', startIndex: 9, endIndex: 10 },
+                properties: { pixelSize: 20 },
+                fields: 'pixelSize',
+              },
+            },
+            // Column U (index 20): minimal width separator
+            {
+              updateDimensionProperties: {
+                range: { sheetId, dimension: 'COLUMNS', startIndex: 20, endIndex: 21 },
+                properties: { pixelSize: 20 },
+                fields: 'pixelSize',
+              },
+            },
           ];
+
+          // Column A (Order Date) data rows: display serial numbers as "10 June 2026"
+          formatRequests.push({
+            repeatCell: {
+              range: { sheetId, startRowIndex: 3, startColumnIndex: 0, endColumnIndex: 1 },
+              cell: { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: 'D MMMM YYYY' } } },
+              fields: 'userEnteredFormat.numberFormat',
+            },
+          });
 
           // Sort data rows (row 4+) by Order Date (col A) ascending
           if (totalRows > 3) {
