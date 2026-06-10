@@ -265,7 +265,7 @@ const SHEET_HEADERS = [
 const SHEET_ROW2_HEADERS = {
   0:  'Selling Details',
   10: 'Selling Details / Profit',
-  21: 'ROI %', 22: 'Status', 23: 'account Name', 24: 'Card',
+  21: 'ROI %', 22: 'Status',
 };
 
 // Columns filled manually or computed by sheet formula — never overwritten during sync
@@ -542,6 +542,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       if (sheetId != null) {
         try {
           const formatRequests = [
+            // Merge A1:I1 for account name
+            { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
+            // Merge A2:I2 for "Selling Details"
+            { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
+            // Merge K2:T2 for "Selling Details / Profit"
+            { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 10, endColumnIndex: 20 }, mergeType: 'MERGE_ALL' } },
             // Data rows (row 4+): white background, not bold
             {
               repeatCell: {
