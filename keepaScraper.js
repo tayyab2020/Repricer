@@ -513,10 +513,11 @@ function _parseCSV(filePath, log) {
 
   const headers = _csvLine(lines[0]);
   const idx = h => headers.findIndex(c => c.trim() === h);
-  const asinIdx = idx('ASIN');
-  const bbIdx   = idx('Buy Box: Current');
-  const amzIdx  = idx('Amazon: Current');
-  const newIdx  = idx('New: Current');
+  const asinIdx  = idx('ASIN');
+  const bbIdx    = idx('Buy Box: Current');
+  const amzIdx   = idx('Amazon: Current');
+  const newIdx   = idx('New: Current');
+  const titleIdx = idx('Title');
 
   if (asinIdx === -1) { log('[Keepa] CSV missing ASIN column — cannot parse'); return {}; }
 
@@ -535,8 +536,9 @@ function _parseCSV(filePath, log) {
                  : amz ? 'keepa_amazon'
                  : nw  ? 'keepa_new'
                  : null;
+    const title  = titleIdx >= 0 ? (cols[titleIdx]?.trim() || null) : null;
 
-    results[asin] = { price, source, inStock: price !== null };
+    results[asin] = { price, source, inStock: price !== null, title };
   }
 
   const withPrice = Object.values(results).filter(r => r.price !== null).length;

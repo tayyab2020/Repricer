@@ -800,6 +800,14 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
     await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
   }
 
+  // Backfill product name from scraper title when the mapping has none
+  if (scraped.title && !product_name) {
+    db.query(
+      `UPDATE product_mappings SET product_name = $1 WHERE id = $2 AND (product_name IS NULL OR product_name = '')`,
+      [scraped.title, id]
+    ).catch(() => {});
+  }
+
   // ── No price ──
   if (!scraped.price) {
     ulog(userId, `[Worker] ⚠️  ${label} — no price (${scraped.error || 'unknown'})`);
@@ -1190,6 +1198,19 @@ async function processKeepaJob(job) {
       for (const [asin, data] of entries) pipeline.hset(cacheKey, asin, JSON.stringify(data));
       await pipeline.exec();
       await redis.expire(cacheKey, 12 * 3600);
+
+      // Backfill missing product names from Keepa CSV titles
+      for (const [asin, data] of entries) {
+        if (!data.title) continue;
+        const ids = asinToMappingIds[asin];
+        if (!ids?.length) continue;
+        for (const mappingId of ids) {
+          db.query(
+            `UPDATE product_mappings SET product_name = $1 WHERE id = $2 AND (product_name IS NULL OR product_name = '')`,
+            [data.title, mappingId]
+          ).catch(() => {});
+        }
+      }
     }
 
     const chunkPriceCount = Object.values(chunkPrices).filter(r => r.price !== null).length;

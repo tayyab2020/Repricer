@@ -845,18 +845,20 @@ async function dispatchPendingOrders(db, account, token, log) {
           if (key && !(key in hIdx)) hIdx[key] = i;
         });
       }
-      const oidCol = hIdx['Order No'] ?? 1;
-      const trkCol = hIdx['Tracking'];
-      const crcol  = hIdx['Courier Name'];
+      const oidCol  = hIdx['Order No'] ?? 1;
+      const trkCol  = hIdx['Tracking'];
+      const crcol   = hIdx['Courier Name'];
+      const statCol = hIdx['Status'];
       if (trkCol == null || crcol == null) continue;
 
       // Data starts at row 4 (index 3)
       for (let i = 3; i < rows.length; i++) {
-        const row      = rows[i];
-        const orderId  = row[oidCol]?.trim() ?? '';
-        const tracking = row[trkCol]?.trim() ?? '';
-        const courier  = row[crcol]?.trim()  ?? '';
-        if (orderId && tracking && courier && !trackingMap.has(orderId)) {
+        const row       = rows[i];
+        const orderId   = row[oidCol]?.trim()                              ?? '';
+        const tracking  = row[trkCol]?.trim()                              ?? '';
+        const courier   = row[crcol]?.trim()                               ?? '';
+        const statusVal = statCol != null ? (row[statCol]?.trim() ?? '') : '';
+        if (orderId && tracking && courier && statusVal === 'Awaiting Dispatch' && !trackingMap.has(orderId)) {
           trackingMap.set(orderId, { tracking, courier });
         }
       }
@@ -882,6 +884,8 @@ async function dispatchPendingOrders(db, account, token, log) {
     log('Dispatch: all tracked orders already dispatched');
     return;
   }
+
+  log(`Dispatch: ${pending.length} tracked+awaiting order(s) to dispatch`);
 
   // Build dispatch payload
   const orders = pending.map(orderId => {
