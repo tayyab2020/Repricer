@@ -1375,7 +1375,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
     `SELECT pq.*, oa.consumer_key, oa.secret_key,
             COALESCE(oa.site_id, '2000')::int AS acct_site_id
      FROM   onbuy_bulk_pending_queues pq
-     JOIN   onbuy_accounts oa ON oa.id = pq.account_id
+     JOIN   onbuy_accounts oa ON oa.id = pq.account_id AND oa.is_active = true
      WHERE  pq.status = 'pending' AND pq.attempts < 96
      ORDER  BY pq.created_at ASC`
   ).catch(e => { plog(`[QueuePoller] DB query error: ${e.message}`); return { rows: [] }; });
@@ -1397,7 +1397,27 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
     const token   = await getTokenForAccount({ consumer_key: sample.consumer_key, secret_key: sample.secret_key });
     const siteId  = sample.acct_site_id;
 
-    if (!token) { plog(`[QueuePoller] No token for account ${accountId} — skipping`); continue; }
+    if (!sample.consumer_key || !sample.secret_key) {
+      plog(`[QueuePoller] Account ${accountId} has no credentials — marking ${queues.length} queue(s) as failed`);
+      for (const q of queues) {
+        db.query(
+          `UPDATE onbuy_bulk_pending_queues SET status='failed', error_message='Account credentials missing', last_polled_at=NOW() WHERE queue_id=$1`,
+          [q.queue_id]
+        ).catch(() => {});
+      }
+      continue;
+    }
+    if (!token) {
+      plog(`[QueuePoller] No token for account ${accountId} — incrementing attempts for ${queues.length} queue(s)`);
+      stillPending += queues.length;
+      for (const q of queues) {
+        db.query(
+          `UPDATE onbuy_bulk_pending_queues SET attempts=attempts+1, last_polled_at=NOW() WHERE queue_id=$1`,
+          [q.queue_id]
+        ).catch(() => {});
+      }
+      continue;
+    }
 
     for (let i = 0; i < queues.length; i += 1000) {
       const batch   = queues.slice(i, i + 1000);

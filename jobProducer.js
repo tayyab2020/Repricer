@@ -31,21 +31,38 @@ export const keepaQueue       = new Queue('keepa-scrape',   { connection: redis 
 export const queuePollerQueue = new Queue('queue-poller',   { connection: redis });
 export const bulkImportQueue  = new Queue('bulk-import',    { connection: redis });
 
-export async function getTokenForAccount(account) {
-  try {
-    const res = await fetch('https://api.onbuy.com/v2/auth/request-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ consumer_key: account.consumer_key, secret_key: account.secret_key }),
-    });
-    const data = await res.json();
-    const token = data.access_token || data.Result?.token || null;
-    if (!token) console.error(`[Token] "${account.account_name}" — no token:`, JSON.stringify(data).slice(0, 200));
-    return token;
-  } catch (err) {
-    console.error(`[Token] "${account.account_name}" fetch error:`, err.message);
-    return null;
+export async function getTokenForAccount(account, { retries = 2, log = null } = {}) {
+  const label = account.account_name || `id=${account.id}`;
+  const emit  = log ?? console.error;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res  = await fetch('https://api.onbuy.com/v2/auth/request-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ consumer_key: account.consumer_key, secret_key: account.secret_key }),
+      });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = {}; }
+      const token = data.access_token || data.Result?.token || null;
+      if (token) return token;
+      const reason = `HTTP ${res.status} — ${text.slice(0, 200)}`;
+      if (attempt < retries) {
+        emit(`[Token] "${label}" — no token (attempt ${attempt + 1}/${retries + 1}): ${reason} — retrying in ${(attempt + 1) * 2}s…`);
+        await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
+      } else {
+        emit(`[Token] "${label}" — no token after ${retries + 1} attempt(s): ${reason}`);
+      }
+    } catch (err) {
+      if (attempt < retries) {
+        emit(`[Token] "${label}" — fetch error (attempt ${attempt + 1}/${retries + 1}): ${err.message} — retrying in ${(attempt + 1) * 2}s…`);
+        await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
+      } else {
+        emit(`[Token] "${label}" — fetch error after ${retries + 1} attempt(s): ${err.message}`);
+      }
+    }
   }
+  return null;
 }
 
 export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
@@ -222,7 +239,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
           account_name: m.acct_name,
           consumer_key: m.acct_consumer_key,
           secret_key:   m.acct_secret_key,
-        });
+        }, { log: jlog });
         siteCache[aid] = m.acct_site_id || '2000';
         jlog(`[Job] Token for "${m.acct_name}" (id=${aid}): ${tokenCache[aid] ? '✅' : '❌'}`);
       }
@@ -235,7 +252,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
       );
       if (rows[0]) {
         fallbackCreds  = { consumerKey: rows[0].consumer_key, secretKey: rows[0].secret_key };
-        fallbackToken  = await getTokenForAccount(rows[0]);
+        fallbackToken  = await getTokenForAccount(rows[0], { log: jlog });
         fallbackSiteId = rows[0].site_id || '2000';
         jlog(`[Job] Fallback token: ${fallbackToken ? '✅' : '❌'}`);
       }
