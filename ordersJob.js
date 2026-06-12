@@ -295,7 +295,7 @@ const FORMULA_COLUMNS = {
   'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
   'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
-  'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Selling Price'])}${r}=0,0,${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Selling Price'])}${r}*100)`,
+  'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Net Profit'])}${r}*100)`,
 };
 
 // Coerce a value to a JS number for sheet storage; returns '' for null/empty/NaN
@@ -494,6 +494,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       });
 
       const batchData  = [];
+      const formulaData = [];
       const newRowObjs = [];
       let   updatedRows = 0;
 
@@ -528,6 +529,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
             const tci = colIdx['Tracking'];
             if (tci != null) batchData.push({ range: `'${tabName}'!${colIdxToLetter(tci)}${rowNum}`, values: [[rowObj._apiTracking]] });
           }
+          // Re-apply formulas to existing rows so they stay up to date
+          for (const [header, formulaFn] of Object.entries(FORMULA_COLUMNS)) {
+            const ci = colIdx[header];
+            if (ci == null) continue;
+            formulaData.push({ range: `'${tabName}'!${colIdxToLetter(ci)}${rowNum}`, values: [[formulaFn(colIdx, rowNum)]] });
+          }
           updatedRows++;
         } else {
           newRowObjs.push({ orderId: order.order_id, rowObj });
@@ -535,7 +542,6 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       }
 
       // New rows: write cell-by-cell so Status (row-2 header column) is included
-      const formulaData = []; // separate batch — needs USER_ENTERED so Sheets parses formulas
       let nextNewRow = existingVals.length + 1; // first row after last existing row
       for (const { rowObj } of newRowObjs) {
         const rowNum = nextNewRow++;
