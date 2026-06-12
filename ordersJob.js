@@ -180,6 +180,7 @@ async function enrichOrderItems(db, account, token, orders) {
       const sku        = product.sku ?? '';
       const productUrl = urlCache[sku] ?? null;
       const asin       = sku || null;
+      const sourceUrl  = /^B[0-9A-Z]{9}$/i.test(sku) ? `https://www.amazon.co.uk/dp/${sku}` : null;
 
       const zeroed     = isCancelledOrRefunded(order.status);
       const fee        = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
@@ -190,6 +191,7 @@ async function enrichOrderItems(db, account, token, orders) {
       enrichmentMap[`${order.order_id}|${sku}`] = {
         product_url: productUrl,
         amazon_asin: asin,
+        source_url:  sourceUrl,
       };
 
       try {
@@ -197,11 +199,12 @@ async function enrichOrderItems(db, account, token, orders) {
           `INSERT INTO onbuy_order_items (
              order_id, account_id, user_id, sku, product_name, quantity,
              unit_price, total_price, onbuy_fee, vat, total_fee,
-             product_url, amazon_asin
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             product_url, amazon_asin, source_url
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
            ON CONFLICT (account_id, order_id, sku) DO UPDATE SET
              product_url = COALESCE(EXCLUDED.product_url, onbuy_order_items.product_url),
              amazon_asin = COALESCE(EXCLUDED.amazon_asin, onbuy_order_items.amazon_asin),
+             source_url  = COALESCE(EXCLUDED.source_url, onbuy_order_items.source_url),
              onbuy_fee   = EXCLUDED.onbuy_fee,
              vat         = EXCLUDED.vat,
              total_fee   = EXCLUDED.total_fee,
@@ -212,7 +215,7 @@ async function enrichOrderItems(db, account, token, orders) {
             parseInt(product.quantity ?? 1),
             parseFloat(product.unit_price ?? 0), totalPrice,
             fee, vat, totalFee,
-            productUrl, asin,
+            productUrl, asin, sourceUrl,
           ]
         );
       } catch (e) {
@@ -514,6 +517,10 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
             if (MANUAL_HEADERS.has(header)) continue;
             const ci = colIdx[header];
             if (ci == null) continue;
+            if (header === 'Sourcing Link') {
+              const existing = (existingVals[rowNum - 1]?.[ci] ?? '').toString().trim();
+              if (existing) continue;
+            }
             batchData.push({ range: `'${tabName}'!${colIdxToLetter(ci)}${rowNum}`, values: [[value]] });
           }
           // Write tracking from API dispatches when available (won't overwrite if already present)

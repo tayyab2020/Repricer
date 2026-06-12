@@ -4,6 +4,37 @@ crontab -e
 0 * * * * find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +120 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +120 -exec rm -rf {} + 2>/dev/null
 pm2 restart all
 
+----------------------------------------------------------------------------------------
+The active Nginx config is /etc/nginx/sites-enabled/repricer — not default:
+
+
+sudo nano /etc/nginx/sites-enabled/repricer
+Add client_max_body_size 50M; inside the server block:
+
+
+server {
+    listen 80;
+    server_name yourdomain.com;
+    client_max_body_size 50M;      ← add this
+
+    location / {
+        proxy_pass http://127.0.0.1:4000;
+        ...
+    }
+}
+Save, then reload:
+
+
+sudo nginx -t && sudo systemctl reload nginx
+
+Verify it's in the right place:
+
+
+sudo nginx -T | grep client_max_body_size
+Should now show client_max_body_size 50m; with no complaints.
+
+
+----------------------------------------------------------------------------------------
 Find your Redis config file first:
 
 
