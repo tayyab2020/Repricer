@@ -3441,8 +3441,9 @@ function OnBuyBulkPage() {
       });
       if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
       if (!r.ok) {
-        const body = await r.json().catch(() => null);
-        throw new Error(body?.error || await r.text());
+        const t = await r.text();
+        let msg; try { msg = JSON.parse(t)?.error; } catch {}
+        throw new Error(msg || t);
       }
       setPreview(await r.json());
       setStep(2);
@@ -4179,6 +4180,26 @@ function BulkActionsSection({ accounts }) {
   const [progress, setProgress]     = useState(null); // { phase, fetched, total, updated, deleted, notFound, failed }
   const [result, setResult]         = useState(null);
   const [err, setErr]               = useState("");
+  const [confirmPwd, setConfirmPwd] = useState("");
+  const [confirmPwdErr, setConfirmPwdErr] = useState("");
+  const [verifying, setVerifying]   = useState(false);
+
+  function openConfirm(action) {
+    setErr(""); setConfirmPwd(""); setConfirmPwdErr(""); setConfirm(action);
+  }
+
+  async function handleConfirmSubmit() {
+    if (!confirmPwd) { setConfirmPwdErr("Please enter your password"); return; }
+    setVerifying(true); setConfirmPwdErr("");
+    try {
+      const r = await api("/auth/verify-password", { method: "POST", body: JSON.stringify({ password: confirmPwd }) });
+      if (!r?.ok) { setConfirmPwdErr("Incorrect password"); setVerifying(false); return; }
+    } catch (e) { setConfirmPwdErr(e.message || "Incorrect password"); setVerifying(false); return; }
+    setVerifying(false);
+    const action = confirm;
+    setConfirm(null); setConfirmPwd("");
+    runAction(action);
+  }
 
   async function runAction(action) {
     if (!accountId) { setErr("Please select an OnBuy account first"); return; }
@@ -4230,11 +4251,11 @@ function BulkActionsSection({ accounts }) {
       {/* Buttons */}
       {!running && !result && (
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-          <Btn variant="secondary" onClick={() => { setErr(""); setConfirm("oos"); }}
+          <Btn variant="secondary" onClick={() => openConfirm("oos")}
             style={{ borderColor: C.amber + "88", color: C.amber }}>
             OOS All Listings
           </Btn>
-          <Btn variant="danger" onClick={() => { setErr(""); setConfirm("delete"); }}>
+          <Btn variant="danger" onClick={() => openConfirm("delete")}>
             Delete All Listings
           </Btn>
         </div>
@@ -4284,7 +4305,7 @@ function BulkActionsSection({ accounts }) {
       {confirm && (
         <Modal
           title={confirm === "oos" ? "Mark All Listings as OOS?" : "Delete All Listings?"}
-          onClose={() => setConfirm(null)}
+          onClose={() => { setConfirm(null); setConfirmPwd(""); setConfirmPwdErr(""); }}
         >
           <div style={{ background: "#ef444415", border: "1px solid #ef444455",
             borderRadius: 10, padding: "14px 18px", marginBottom: 20,
@@ -4299,12 +4320,31 @@ function BulkActionsSection({ accounts }) {
               </div>
             </div>
           </div>
+          <div style={{ marginBottom: 18 }}>
+            <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>
+              Enter your password to confirm
+            </label>
+            <input
+              type="password"
+              value={confirmPwd}
+              onChange={e => { setConfirmPwd(e.target.value); setConfirmPwdErr(""); }}
+              onKeyDown={e => e.key === "Enter" && handleConfirmSubmit()}
+              placeholder="Your account password"
+              autoFocus
+              style={{ width: "100%", background: C.surface, color: C.text,
+                border: `1px solid ${confirmPwdErr ? "#ef4444" : C.border}`,
+                borderRadius: 8, padding: "8px 12px", fontSize: 13, boxSizing: "border-box" }}
+            />
+            {confirmPwdErr && (
+              <div style={{ color: "#ef4444", fontSize: 12, marginTop: 5 }}>{confirmPwdErr}</div>
+            )}
+          </div>
           <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-            <Btn variant="secondary" onClick={() => setConfirm(null)}>Cancel</Btn>
-            <Btn onClick={() => runAction(confirm)}
+            <Btn variant="secondary" onClick={() => { setConfirm(null); setConfirmPwd(""); setConfirmPwdErr(""); }}>Cancel</Btn>
+            <Btn onClick={handleConfirmSubmit} disabled={verifying}
               style={{ background: confirm === "oos" ? C.amber : "#ef4444",
                 borderColor: confirm === "oos" ? C.amber : "#ef4444", color: "#000" }}>
-              {confirm === "oos" ? "Yes, Mark OOS" : "Yes, Delete All"}
+              {verifying ? "Verifying…" : confirm === "oos" ? "Yes, Mark OOS" : "Yes, Delete All"}
             </Btn>
           </div>
         </Modal>
@@ -4341,7 +4381,7 @@ function DeleteListingsPage() {
         body: fd,
       });
       if (r.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
-      if (!r.ok) throw new Error((await r.json()).error || await r.text());
+      if (!r.ok) { const t = await r.text(); let m; try { m = JSON.parse(t)?.error; } catch {} throw new Error(m || t); }
       const data = await r.json();
       if (!data.total) throw new Error("No SKUs found — make sure the file has a 'Seller SKU' column");
       setPreview(data); setStep(2);

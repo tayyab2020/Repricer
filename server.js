@@ -120,6 +120,20 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/auth/verify-password — confirm the logged-in user's password (used before destructive actions)
+app.post('/api/auth/verify-password', requireAuth, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'Password required' });
+  try {
+    const { rows } = await db.query(
+      `SELECT password_hash FROM users WHERE id = $1`, [req.user.userId]
+    );
+    if (!rows[0] || !await bcrypt.compare(password, rows[0].password_hash))
+      return res.status(401).json({ error: 'Incorrect password' });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/auth/me — validate token + return current user info
 app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({

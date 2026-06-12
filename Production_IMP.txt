@@ -3,3 +3,55 @@ crontab -e
 1
 0 * * * * find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +120 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +120 -exec rm -rf {} + 2>/dev/null
 pm2 restart all
+
+Find your Redis config file first:
+
+
+redis-cli config get dir
+sudo find /etc -name "redis.conf" 2>/dev/null
+Usually at /etc/redis/redis.conf. Open it:
+
+
+sudo nano /etc/redis/redis.conf
+Option 1: AOF (Recommended)
+Logs every write — survives restarts with minimal data loss.
+
+Find and set these lines:
+
+
+appendonly yes
+appendfsync everysec
+Option 2: RDB (Snapshots)
+Saves a snapshot periodically — simpler but can lose last few minutes of data on crash.
+
+Find and set:
+
+
+save 900 1
+save 300 10
+save 60 10000
+(already enabled by default on most installs — just uncomment if commented out)
+
+Enable Both (Best)
+AOF for durability + RDB for fast restarts:
+
+
+appendonly yes
+appendfsync everysec
+save 900 1
+save 300 10
+save 60 10000
+After editing, restart Redis:
+
+
+sudo systemctl restart redis
+redis-cli ping
+Verify persistence is active:
+
+
+redis-cli config get appendonly
+# Should return: appendonly yes
+
+redis-cli info persistence
+# Look for: aof_enabled:1
+AOF is the right choice here — it ensures BullMQ delayed jobs (queue poller, Keepa refill jobs) survive a Redis restart without needing to be manually re-added.
