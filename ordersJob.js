@@ -60,16 +60,26 @@ async function getOnBuyToken({ consumer_key, secret_key }) {
 }
 
 // ── Fetch all orders (paginated) ──────────────────────────────────────────────
-async function fetchAllOrders(token, siteId) {
+// lookbackMinutes: if set, fetch only orders modified in the last N minutes (cron runs).
+// If null, fetch from the start of the current month (manual / first-run full sync).
+async function fetchAllOrders(token, siteId, lookbackMinutes = null) {
   const LIMIT = 100;
   let offset  = 0;
   const all   = [];
 
-  // Restrict to current month — OnBuy expects "YYYY-MM-DD HH:MM:SS" (URL-encoded)
-  const now           = new Date();
-  const modifiedSince = encodeURIComponent(
-    `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01 00:00:00`
-  );
+  let modifiedSince;
+  if (lookbackMinutes != null) {
+    const since = new Date(Date.now() - lookbackMinutes * 60 * 1000);
+    modifiedSince = encodeURIComponent(
+      since.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '')
+    );
+  } else {
+    // Full month fetch — OnBuy expects "YYYY-MM-DD HH:MM:SS" (URL-encoded)
+    const now = new Date();
+    modifiedSince = encodeURIComponent(
+      `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01 00:00:00`
+    );
+  }
 
   while (true) {
     const url = `https://api.onbuy.com/v2/orders?site_id=${siteId}&filter[status]=all&filter[modified_since]=${modifiedSince}&limit=${LIMIT}&offset=${offset}`;
@@ -229,8 +239,9 @@ async function enrichOrderItems(db, account, token, orders) {
 
 // ── Sheet helpers ─────────────────────────────────────────────────────────────
 function monthTabName(date = new Date()) {
-  const m = date.toLocaleString('en-US', { month: 'long' });
-  return `${m}, ${date.getFullYear()}`; // "June, 2026"
+  const m = date.toLocaleString('en-US', { month: 'long', timeZone: 'Europe/London' });
+  const y = date.toLocaleString('en-US', { year: 'numeric', timeZone: 'Europe/London' });
+  return `${m}, ${y}`;
 }
 
 function tabForOrder(order) {
@@ -238,14 +249,17 @@ function tabForOrder(order) {
   return isNaN(d.getTime()) ? monthTabName() : monthTabName(d);
 }
 
-// Convert a date string to a Google Sheets serial number (days since 1899-12-30).
+// Convert a UTC date string to a Google Sheets serial number using Europe/London local date.
 // Storing dates as serials lets Sheets sort them correctly as numbers.
 // A "D MMMM YYYY" number format applied to the column renders "10 June 2026".
 function toSheetsSerial(dateStr) {
   if (!dateStr) return '';
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return String(dateStr);
-  return Math.floor((d.getTime() - new Date('1899-12-30T00:00:00.000Z').getTime()) / 86400000);
+  // Get the calendar date in UK local time (BST/GMT) to avoid off-by-one on midnight-crossing orders
+  const londonDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(d);
+  const midnight = new Date(londonDate + 'T00:00:00.000Z');
+  return Math.floor((midnight.getTime() - new Date('1899-12-30T00:00:00.000Z').getTime()) / 86400000);
 }
 
 function formatAddress(addr) {
@@ -458,11 +472,16 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       const orderNumCol = colIdx['Order No'] ?? 1; // col B
 
       // Data starts at row 4 (index 3); rows 1-3 are title/meta/column-headers
-      const rowMap = new Map(); // orderId → 1-based sheet row number
+      // rowMap stores ALL row numbers per orderId (orders with multiple products have multiple rows)
+      const rowMap = new Map(); // orderId → [rowNum, ...]
       for (let i = 3; i < existingVals.length; i++) {
         const oid = (existingVals[i]?.[orderNumCol] ?? '').toString().trim();
-        if (oid) rowMap.set(oid, i + 1);
+        if (oid) {
+          if (!rowMap.has(oid)) rowMap.set(oid, []);
+          rowMap.get(oid).push(i + 1);
+        }
       }
+      const rowCursor = new Map(); // orderId → how many items consumed so far
 
       // Count unique orders whose expected_dispatch_date is today → update V1 (merged V1:W1)
       // Use Europe/London timezone — OnBuy expected_dispatch_date is in UK local time
@@ -507,10 +526,13 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       );
 
       for (const { order, product, vatRate } of items) {
-        const enrichKey = `${order.order_id}|${product.sku ?? ''}`;
-        const enriched  = enrichmentMap[enrichKey] ?? {};
-        const rowObj    = buildSheetRow(order, product, vatRate, enriched);
-        const rowNum    = rowMap.get(order.order_id);
+        const enrichKey  = `${order.order_id}|${product.sku ?? ''}`;
+        const enriched   = enrichmentMap[enrichKey] ?? {};
+        const rowObj     = buildSheetRow(order, product, vatRate, enriched);
+        const existingRows = rowMap.get(order.order_id) ?? [];
+        const cursor     = rowCursor.get(order.order_id) ?? 0;
+        rowCursor.set(order.order_id, cursor + 1);
+        const rowNum     = existingRows[cursor];
 
         if (rowNum) {
           for (const [header, value] of Object.entries(rowObj)) {
@@ -978,12 +1000,14 @@ async function dispatchPendingOrders(db, account, token, log) {
 }
 
 // ── Sync one account ──────────────────────────────────────────────────────────
-async function syncAccount(db, account) {
+// fullSync=true fetches the full current month (manual trigger / first run).
+// fullSync=false (default) fetches only orders modified in the last 25 min (cron runs) to stay within API rate limits.
+async function syncAccount(db, account, { fullSync = false } = {}) {
   const log = makeLogger(account.account_name);
   try {
-    log('Starting sync');
+    log(`Starting sync (${fullSync ? 'full month' : 'incremental 25 min'})`);
     const token  = await getOnBuyToken(account);
-    const orders = await fetchAllOrders(token, account.site_id || '2000');
+    const orders = await fetchAllOrders(token, account.site_id || '2000', fullSync ? null : 25);
     log(`API: ${orders.length} orders fetched`);
 
     const { inserted, updated } = await upsertOrders(db, account, orders);
@@ -1050,7 +1074,7 @@ export async function syncAccountsForUser(db, userId) {
   }
   console.log(`[OrdersJob] Manual sync for user ${userId}: ${accounts.length} account(s)`);
   for (const account of accounts) {
-    await syncAccount(db, account);
+    await syncAccount(db, account, { fullSync: true });
   }
   console.log(`[OrdersJob] Manual sync done for user ${userId}`);
 }

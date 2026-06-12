@@ -1587,10 +1587,10 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
   }
 
   if (stillPending > 0) {
-    plog(`[QueuePoller] ${stillPending} queue(s) still pending — next poll in 15 min`);
+    plog(`[QueuePoller] ${stillPending} queue(s) still pending — next poll in 30 min`);
     await queuePollerQueue.add('poll', {}, {
       jobId:            `queue-poller-${Date.now()}`,
-      delay:            15 * 60 * 1000,
+      delay:            30 * 60 * 1000,
       removeOnComplete: true,
       removeOnFail:     true,
       attempts:         1,
@@ -2126,7 +2126,7 @@ async function processBulkImportJob(job) {
       }
       results.pending_queues = pendingToSave.length;
       db.query(`UPDATE onbuy_bulk_import_sessions SET pending_queues=$1 WHERE id=$2`, [pendingToSave.length, sessionId]).catch(() => {});
-      await queuePollerQueue.add('poll', {}, { jobId: `queue-poller-${Date.now()}`, delay: 15*60*1000, removeOnComplete: true, removeOnFail: true, attempts: 1 }).catch(() => {});
+      await queuePollerQueue.add('poll', {}, { jobId: `queue-poller-${Date.now()}`, delay: 30*60*1000, removeOnComplete: true, removeOnFail: true, attempts: 1 }).catch(() => {});
     }
   }
   // Update counters after Phase 3 so the UI shows live progress while processing
