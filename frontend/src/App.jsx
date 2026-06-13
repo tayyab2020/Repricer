@@ -1836,7 +1836,7 @@ export default function App() {
     { id:"mappings",       label:"🔗 Mappings" },
     { id:"current-prices", label:"💷 Current Prices" },
     { id:"accounts",       label:"🏪 OnBuy Accounts" },
-    { id:"import",         label:"📥 Import Listings" },
+    { id:"import",         label:"📥 Repricer Listings" },
     { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
     // { id:"sku-change",     label:"🔄 SKU Change" },
     { id:"delete-listings", label:"🗑️ Delete Listings" },
@@ -3518,7 +3518,7 @@ function OnBuyBulkPage() {
                 {parseInt(pendingStatus.pending).toLocaleString()} product queue{parseInt(pendingStatus.pending) !== 1 ? "s" : ""} pending on OnBuy
               </div>
               <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
-                Background worker polls every 15 min and creates listings when queues resolve.
+                Background worker polls every 30 min and creates listings when queues resolve.
               </div>
             </div>
           </div>
@@ -4128,7 +4128,7 @@ function OnBuyBulkPage() {
               {parseInt(result.pending_queues) > 0 && (
                 <div style={{ color: C.amber, fontSize: 14, marginBottom: 6 }}>
                   {parseInt(result.pending_queues)} product queue{parseInt(result.pending_queues) !== 1 ? "s" : ""} still pending —
-                  background worker will create listings automatically every 15 min
+                  background worker will create listings automatically every 30 min
                 </div>
               )}
               {parseInt(result.skipped) > 0 && (

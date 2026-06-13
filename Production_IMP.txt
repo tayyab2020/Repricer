@@ -1,4 +1,17 @@
+Install chrome for puppeteer
 npx puppeteer browsers install chrome
+
+----------------------------------------------------------------------------------------
+Install Google Chrome for system
+wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+sudo apt-get update
+sudo apt-get install -y google-chrome-stable
+
+pm2 restart all
+
+
+----------------------------------------------------------------------------------------
 crontab -e
 1
 0 * * * * find /tmp -maxdepth 1 -name "puppeteer_dev_profile-*" -mmin +120 -exec rm -rf {} + 2>/dev/null; find /tmp -maxdepth 1 -name "com.google.Chrome.*" -mmin +120 -exec rm -rf {} + 2>/dev/null

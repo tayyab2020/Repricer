@@ -1455,12 +1455,14 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
         const listings = await fetchOnBuyListingsBySkus(onbuyToken, siteId, chunk);
         if (!listings) continue;
         for (const listing of listings) {
-          const row   = skuMap.get(listing.sku);
+          const row       = skuMap.get(listing.sku);
           if (!row) continue;
-          const title = listing.name || listing.product_name || listing.title || null;
-          const opc   = listing.opc || listing.product_encoded_id || null;
-          if (title && !row.product_name) row.product_name = title;
-          if (opc   && !row.onbuy_opc)   row.onbuy_opc    = opc;
+          const title     = listing.name || listing.product_name || listing.title || null;
+          const opc       = listing.opc || listing.product_encoded_id || null;
+          const listingId = listing.uid || listing.listing_uid || listing.id || listing.product_listing_id || null;
+          if (title     && !row.product_name)     row.product_name     = title;
+          if (opc       && !row.onbuy_opc)        row.onbuy_opc        = opc;
+          if (listingId && !row.onbuy_listing_id) row.onbuy_listing_id = String(listingId);
         }
       }
     }
@@ -1590,23 +1592,18 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
         const listings = await fetchOnBuyListingsBySkus(onbuyToken, siteId, chunk).catch(() => null);
         if (!listings?.length) continue;
         for (const listing of listings) {
-          const opc   = listing.opc || listing.product_encoded_id;
-          const title = listing.name || listing.product_name || listing.title || null;
+          const opc       = listing.opc || listing.product_encoded_id;
+          const title     = listing.name || listing.product_name || listing.title || null;
+          const listingId = listing.uid || listing.listing_uid || listing.id || listing.product_listing_id || null;
           if (!listing.sku || !opc) continue;
-          if (title) {
-            db.query(
-              `UPDATE product_mappings
-               SET onbuy_opc = $1, product_name = COALESCE(NULLIF(product_name,''), $3)
-               WHERE user_id = $2 AND (onbuy_sku = $4 OR primary_asin = $4) AND onbuy_opc IS NULL`,
-              [opc, req.effectiveUserId, title, listing.sku]
-            ).catch(() => {});
-          } else {
-            db.query(
-              `UPDATE product_mappings SET onbuy_opc = $1
-               WHERE user_id = $2 AND (onbuy_sku = $3 OR primary_asin = $3) AND onbuy_opc IS NULL`,
-              [opc, req.effectiveUserId, listing.sku]
-            ).catch(() => {});
-          }
+          db.query(
+            `UPDATE product_mappings
+             SET onbuy_opc        = $1,
+                 onbuy_listing_id = COALESCE(NULLIF(onbuy_listing_id,''), $3),
+                 product_name     = COALESCE(NULLIF(product_name,''), $4)
+             WHERE user_id = $2 AND (onbuy_sku = $5 OR primary_asin = $5) AND onbuy_opc IS NULL`,
+            [opc, req.effectiveUserId, listingId ? String(listingId) : null, title, listing.sku]
+          ).catch(() => {});
         }
       }
     }
