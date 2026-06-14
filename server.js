@@ -1836,6 +1836,12 @@ async function runMigrations() {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_ooi_order  ON onbuy_order_items(order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_ooi_account ON onbuy_order_items(account_id)`,
+    `CREATE TABLE IF NOT EXISTS restricted_brands (
+   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+   brand_name TEXT    NOT NULL,
+   uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+   PRIMARY KEY (user_id, brand_name)
+)`,
   ];
   for (const sql of steps) {
     try {
@@ -2130,7 +2136,7 @@ app.post('/api/settings/categories/upload', requireAuth, requireAdmin, upload.si
 });
 
 // POST /api/onbuy-bulk/preview — parse uploaded Excel, validate and return rows
-app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -2150,6 +2156,16 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, re
     for (const [key, aliases] of Object.entries(BULK_COL_ALIASES)) {
       idx[key] = findBulkColIdx(headers, aliases);
     }
+
+    // Load restricted brands for this user (async, but preview is already async-capable via db)
+    let restrictedBrands = new Set();
+    try {
+      const { rows: rb } = await db.query(
+        'SELECT brand_name FROM restricted_brands WHERE user_id = $1',
+        [req.effectiveUserId]
+      );
+      restrictedBrands = new Set(rb.map(r => r.brand_name.toLowerCase()));
+    } catch {}
 
     const getCell = (row, key) => {
       const i = idx[key];
@@ -2190,6 +2206,7 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), (req, re
       if (!price)    errors.push('Price (£) required');
       if (!sku)      errors.push('SKU required');
       if (!stock)    errors.push('Stock must be > 0');
+      if (brand && restrictedBrands.has(brand.toLowerCase())) errors.push(`Brand "${brand}" is restricted`);
 
       // images stored positionally (no filter) so export slots stay aligned
       const images = [img1, img2, img3, img4, img5, img6];
@@ -3044,6 +3061,155 @@ app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
   } catch (e) {
     send({ error: e.message });
   }
+  res.end();
+});
+
+// ── Restricted Brands ────────────────────────────────────────────────────────
+
+// GET /api/restricted-brands/template — download template Excel
+app.get('/api/restricted-brands/template', requireAuth, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([['Restricted brands'], ['Example Brand']]);
+  XLSX.utils.book_append_sheet(wb, ws, 'Restricted Brands');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="restricted-brands-template.xlsx"');
+  res.send(buf);
+});
+
+// POST /api/restricted-brands/upload — parse CSV/Excel and store brands
+app.post('/api/restricted-brands/upload', requireAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    // Skip header row, collect non-empty brand names
+    const brands = rows.slice(1)
+      .map(r => String(r[0] || '').trim())
+      .filter(Boolean);
+    if (!brands.length) return res.status(400).json({ error: 'No brands found in file' });
+    const uid = req.effectiveUserId;
+    // Replace all brands for this user
+    await db.query('DELETE FROM restricted_brands WHERE user_id = $1', [uid]);
+    if (brands.length > 0) {
+      await db.query(
+        `INSERT INTO restricted_brands (user_id, brand_name)
+         SELECT $1, unnest($2::text[])
+         ON CONFLICT DO NOTHING`,
+        [uid, brands]
+      );
+    }
+    res.json({ count: brands.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/restricted-brands — get current user's restricted brands
+app.get('/api/restricted-brands', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT brand_name FROM restricted_brands WHERE user_id = $1 ORDER BY brand_name',
+      [req.effectiveUserId]
+    );
+    res.json({ brands: rows.map(r => r.brand_name), count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/restricted-brands/delete-job — SSE stream: scan all OnBuy listings and delete restricted brand ones
+app.post('/api/restricted-brands/delete-job', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+
+  // Load restricted brands
+  const { rows: brandRows } = await db.query(
+    'SELECT brand_name FROM restricted_brands WHERE user_id = $1',
+    [uid]
+  );
+  if (!brandRows.length) return res.status(400).json({ error: 'No restricted brands uploaded for your account' });
+  const restrictedSet = new Set(brandRows.map(r => r.brand_name.toLowerCase()));
+
+  // Load active OnBuy accounts for this user
+  const { rows: accounts } = await db.query(
+    'SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true',
+    [uid]
+  );
+  if (!accounts.length) return res.status(400).json({ error: 'No active OnBuy accounts found' });
+
+  // SSE setup
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  const send = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  };
+
+  let totalDeleted = 0;
+  let totalScanned = 0;
+
+  for (const account of accounts) {
+    send({ type: 'account', name: account.account_name });
+    let token;
+    try {
+      const tr = await fetch('https://api.onbuy.com/v2/auth/request-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ consumer_key: account.consumer_key, secret_key: account.secret_key }),
+      });
+      const td = await tr.json();
+      token = td.access_token || td.Result?.token || null;
+    } catch {}
+    if (!token) { send({ type: 'error', message: `Could not get token for ${account.account_name}` }); continue; }
+
+    const siteId = parseInt(account.site_id) || 2000;
+    const toDelete = [];
+    let offset = 0;
+    let totalRows = null;
+
+    // Paginate through all listings
+    while (true) {
+      let data;
+      try {
+        const r = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=1000&offset=${offset}`, {
+          headers: { Authorization: token },
+        });
+        data = await r.json();
+      } catch (e) { send({ type: 'error', message: `Fetch error: ${e.message}` }); break; }
+
+      const listings = data.payload ?? data.results ?? data.listings ?? (Array.isArray(data) ? data : []);
+      if (totalRows === null) totalRows = parseInt(data.metadata?.total_rows ?? data.total ?? listings.length);
+
+      for (const listing of listings) {
+        const brand = (listing.manufacturer || listing.brand || listing.brand_name || '').toLowerCase().trim();
+        if (brand && restrictedSet.has(brand)) toDelete.push(listing.sku || listing.seller_sku);
+      }
+
+      totalScanned += listings.length;
+      offset += listings.length;
+      send({ type: 'progress', scanned: totalScanned, found: toDelete.length });
+      if (listings.length === 0 || offset >= totalRows) break;
+    }
+
+    // Delete in batches of 1000
+    const BATCH = 1000;
+    for (let i = 0; i < toDelete.length; i += BATCH) {
+      const batch = toDelete.slice(i, i + BATCH);
+      try {
+        await fetch('https://api.onbuy.com/v2/listings/by-sku', {
+          method: 'DELETE',
+          headers: { Authorization: token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ site_id: siteId, skus: batch }),
+        });
+        totalDeleted += batch.length;
+        send({ type: 'deleted', count: batch.length, total: totalDeleted });
+      } catch (e) { send({ type: 'error', message: `Delete error: ${e.message}` }); }
+    }
+  }
+
+  send({ type: 'done', totalScanned, totalDeleted });
   res.end();
 });
 

@@ -3276,9 +3276,14 @@ function OnBuyBulkPage() {
   const [exportMenuOpen, setExportMenuOpen] = useState(null); // sessionId with open menu
   const [exportLoading, setExportLoading]   = useState(false);
   const [catExportLoading, setCatExportLoading] = useState(false);
+  const [restrictedBrands, setRestrictedBrands]         = useState({ count: 0 });
+  const [rbUploading, setRbUploading]                   = useState(false);
+  const [deleteJobRunning, setDeleteJobRunning]          = useState(false);
+  const [deleteJobLog, setDeleteJobLog]                  = useState([]);
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
+    api("/restricted-brands").then(d => { if (d) setRestrictedBrands(d); }).catch(() => {});
     // Load global pending queue status on mount and start live poll if queues exist
     api("/onbuy-bulk/pending-queue-status").then(s => {
       if (s && parseInt(s.pending) > 0) { setPendingStatus(s); startPendingPoll(); }
@@ -3386,6 +3391,64 @@ function OnBuyBulkPage() {
       URL.revokeObjectURL(url);
     } catch (e) { alert("Failed to download categories: " + e.message); }
     finally { setCatExportLoading(false); }
+  }
+
+  async function uploadRestrictedBrands(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRbUploading(true);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const form = new FormData();
+      form.append("file", file);
+      const r = await fetch(`${API}/restricted-brands/upload`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
+      const t = await r.text();
+      let d; try { d = JSON.parse(t); } catch {}
+      if (!r.ok) throw new Error(d?.error || t);
+      setRestrictedBrands({ count: d.count });
+      alert(`✅ ${d.count} restricted brands uploaded successfully.`);
+    } catch (e) { alert("Upload failed: " + e.message); }
+    setRbUploading(false);
+    e.target.value = "";
+  }
+
+  async function downloadRestrictedBrandsTemplate() {
+    const token = localStorage.getItem("repricer_token");
+    const r = await fetch(`${API}/restricted-brands/template`, { headers: { Authorization: `Bearer ${token}` } });
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = "restricted-brands-template.xlsx"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runDeleteRestrictedJob() {
+    if (!window.confirm("This will scan ALL your OnBuy listings and delete any that match restricted brands. Continue?")) return;
+    setDeleteJobRunning(true);
+    setDeleteJobLog([]);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const r = await fetch(`${API}/restricted-brands/delete-job`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } });
+      if (!r.ok) { const t = await r.text(); let d; try { d = JSON.parse(t); } catch {}; throw new Error(d?.error || t); }
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop();
+        for (const part of parts) {
+          const line = part.replace(/^data: /, "").trim();
+          if (!line) continue;
+          try {
+            const ev = JSON.parse(line);
+            setDeleteJobLog(prev => [...prev, ev]);
+          } catch {}
+        }
+      }
+    } catch (e) { alert("Job failed: " + e.message); }
+    setDeleteJobRunning(false);
   }
 
   async function exportSession(sessionId, type) {
@@ -3562,6 +3625,27 @@ function OnBuyBulkPage() {
         ))}
         <div style={{ flex: 1 }} />
         <button
+          onClick={downloadRestrictedBrandsTemplate}
+          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}
+        >
+          <span style={{ fontSize: 13 }}>📋</span> Restricted Brands Template
+        </button>
+        <label style={{ cursor: rbUploading ? "not-allowed" : "pointer", marginBottom: 4 }}>
+          <input type="file" accept=".xlsx,.csv" style={{ display: "none" }} onChange={uploadRestrictedBrands} disabled={rbUploading} />
+          <span style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: rbUploading ? C.muted : C.text, padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 13 }}>{rbUploading ? "⏳" : "📤"}</span>
+            {rbUploading ? "Uploading…" : `Upload Restricted Brands${restrictedBrands.count ? ` (${restrictedBrands.count})` : ""}`}
+          </span>
+        </label>
+        <button
+          onClick={runDeleteRestrictedJob}
+          disabled={deleteJobRunning || !restrictedBrands.count}
+          style={{ background: deleteJobRunning ? C.surface : "#ef444415", border: `1px solid ${deleteJobRunning || !restrictedBrands.count ? C.border : "#ef444466"}`, borderRadius: 6, color: deleteJobRunning || !restrictedBrands.count ? C.muted : "#ef4444", cursor: deleteJobRunning || !restrictedBrands.count ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}
+        >
+          <span style={{ fontSize: 13 }}>{deleteJobRunning ? "⏳" : "🗑️"}</span>
+          {deleteJobRunning ? "Scanning & Deleting…" : "Delete Restricted Brand Listings"}
+        </button>
+        <button
           onClick={downloadCategoriesSheet}
           disabled={catExportLoading}
           style={{
@@ -3580,6 +3664,24 @@ function OnBuyBulkPage() {
           }
         </button>
       </div>
+
+      {/* ── Delete Restricted Brands Job Log ── */}
+      {deleteJobLog.length > 0 && (
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 20, fontSize: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 8, color: C.text }}>🗑️ Delete Restricted Brands Job</div>
+          <div style={{ maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+            {deleteJobLog.map((ev, i) => (
+              <div key={i} style={{ color: ev.type === "error" ? C.red : ev.type === "done" ? "#22c55e" : C.muted }}>
+                {ev.type === "account"   && `📦 Processing account: ${ev.name}`}
+                {ev.type === "progress"  && `🔍 Scanned ${ev.scanned} listings — ${ev.found} restricted found`}
+                {ev.type === "deleted"   && `🗑️ Deleted ${ev.count} listings (total: ${ev.total})`}
+                {ev.type === "error"     && `❌ ${ev.message}`}
+                {ev.type === "done"      && `✅ Done — Scanned ${ev.totalScanned}, deleted ${ev.totalDeleted} listings`}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ── History Tab ── */}
       {tab === "history" && (
