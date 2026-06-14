@@ -309,7 +309,7 @@ const FORMULA_COLUMNS = {
   'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
   'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
-  'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Source Price'])}${r}/${colIdxToLetter(ci['Net Profit'])}${r}*100)`,
+  'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Net Profit'])}${r}/${colIdxToLetter(ci['Source Price'])}${r}*100)`,
 };
 
 // Coerce a value to a JS number for sheet storage; returns '' for null/empty/NaN
