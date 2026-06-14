@@ -1,26 +1,122 @@
-import { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import { useState, useEffect, useCallback, useRef, Fragment, useMemo } from "react";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, Legend
+  LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
+import {
+  LayoutDashboard, Link2, TrendingUp, Store, Upload,
+  Package, Trash2, ClipboardList, Settings, Terminal,
+  Users, Zap, RefreshCw, X, LogOut,
+} from "lucide-react";
+
+// ── Nav icon map ─────────────────────────────
+const NAV_ICONS = {
+  "dashboard":       LayoutDashboard,
+  "mappings":        Link2,
+  "current-prices":  TrendingUp,
+  "accounts":        Store,
+  "import":          Upload,
+  "onbuy-bulk":      Package,
+  "delete-listings": Trash2,
+  "orders":          ClipboardList,
+  "settings":        Settings,
+  "logs":            Terminal,
+  "users":           Users,
+};
 
 // ── Config ──────────────────────────────────
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:4000/api";
 
 // ── Colour palette ───────────────────────────
 const C = {
-  bg:       "#0b0f1a",
-  surface:  "#111827",
-  border:   "#1e2d45",
-  accent:   "#00d4aa",
-  accentDim:"#00d4aa22",
-  amber:    "#f59e0b",
-  red:      "#ef4444",
-  blue:     "#3b82f6",
-  muted:    "#6b7280",
-  text:     "#e2e8f0",
-  textDim:  "#94a3b8",
+  bg:       "#0f172a",   // slate-900 — semi-dark navy base
+  surface:  "#1e293b",   // slate-800 — card / section surfaces
+  panel:    "#243347",   // slightly lighter — tooltips, hover panels
+  border:   "#334155",   // slate-700 — visible separators
+  accent:   "#22c55e",   // green-500 — primary CTA / active
+  accentDim:"#22c55e20",
+  amber:    "#f59e0b",   // amber-500
+  red:      "#ef4444",   // red-500
+  blue:     "#3b82f6",   // blue-500
+  purple:   "#8b5cf6",   // violet-500
+  muted:    "#64748b",   // slate-500 — secondary text
+  text:     "#f1f5f9",   // slate-100 — primary text
+  textDim:  "#94a3b8",   // slate-400 — tertiary text
 };
+
+// ── Theme Palettes ─────────────────────────────
+// Each palette has:
+//   vars → CSS custom property channel tuples (R G B, no commas) used by Tailwind
+//   C    → hex values used by inline-style components throughout the app
+const THEME_PALETTES = {
+  dark: {
+    vars: {
+      "--col-bg":      "11 15 26",
+      "--col-surface": "17 24 39",
+      "--col-panel":   "26 34 54",
+      "--col-accent":  "34 197 94",
+      "--col-fg":      "226 232 240",
+      "--col-muted":   "26 34 54",
+      "--col-sep":     "30 45 69",
+      "--col-danger":  "239 68 68",
+      "--col-subdued": "148 163 184",
+      "--col-amber":   "245 158 11",
+      "--col-info":    "59 130 246",
+    },
+    C: {
+      bg:"#0b0f1a", surface:"#111827", panel:"#1a2236", border:"#1e2d45",
+      accent:"#22c55e", accentDim:"#22c55e20", amber:"#f59e0b", red:"#ef4444",
+      blue:"#3b82f6", purple:"#8b5cf6", muted:"#64748b", text:"#e2e8f0", textDim:"#94a3b8",
+    },
+  },
+  "semi-dark": {
+    vars: {
+      "--col-bg":      "15 23 42",
+      "--col-surface": "30 41 59",
+      "--col-panel":   "36 51 71",
+      "--col-accent":  "34 197 94",
+      "--col-fg":      "241 245 249",
+      "--col-muted":   "36 51 71",
+      "--col-sep":     "51 65 85",
+      "--col-danger":  "239 68 68",
+      "--col-subdued": "148 163 184",
+      "--col-amber":   "245 158 11",
+      "--col-info":    "59 130 246",
+    },
+    C: {
+      bg:"#0f172a", surface:"#1e293b", panel:"#243347", border:"#334155",
+      accent:"#22c55e", accentDim:"#22c55e20", amber:"#f59e0b", red:"#ef4444",
+      blue:"#3b82f6", purple:"#8b5cf6", muted:"#64748b", text:"#f1f5f9", textDim:"#94a3b8",
+    },
+  },
+  light: {
+    vars: {
+      "--col-bg":      "248 250 252",
+      "--col-surface": "255 255 255",
+      "--col-panel":   "241 245 249",
+      "--col-accent":  "22 163 74",
+      "--col-fg":      "15 23 42",
+      "--col-muted":   "226 232 240",
+      "--col-sep":     "226 232 240",
+      "--col-danger":  "220 38 38",
+      "--col-subdued": "100 116 139",
+      "--col-amber":   "217 119 6",
+      "--col-info":    "37 99 235",
+    },
+    C: {
+      bg:"#f8fafc", surface:"#ffffff", panel:"#f1f5f9", border:"#e2e8f0",
+      accent:"#16a34a", accentDim:"#16a34a15", amber:"#d97706", red:"#dc2626",
+      blue:"#2563eb", purple:"#7c3aed", muted:"#94a3b8", text:"#0f172a", textDim:"#475569",
+    },
+  },
+};
+
+// Mutates the live C object + updates Tailwind CSS vars on :root instantly.
+function applyThemePalette(name) {
+  const p = THEME_PALETTES[name] || THEME_PALETTES["semi-dark"];
+  Object.entries(p.vars).forEach(([k, v]) => document.documentElement.style.setProperty(k, v));
+  Object.assign(C, p.C);
+}
 
 // ── Helpers ──────────────────────────────────
 const fmt  = v  => v != null ? `£${parseFloat(v).toFixed(2)}` : "—";
@@ -59,18 +155,39 @@ async function api(path, opts = {}) {
 // ════════════════════════════════════════════
 
 // ── Stat Card ────────────────────────────────
-function StatCard({ label, value, sub, color = C.accent }) {
+function StatCard({ label, value, sub, color = C.accent, icon: Icon }) {
   return (
     <div style={{
       background: C.surface, border: `1px solid ${C.border}`,
-      borderRadius: 12, padding: "20px 24px",
-      borderTop: `3px solid ${color}`,
+      borderRadius: 14, padding: "22px 24px",
+      position: "relative", overflow: "hidden",
     }}>
-      <p style={{ color: C.muted, fontSize: 12, letterSpacing: "0.08em",
-        textTransform: "uppercase", marginBottom: 8 }}>{label}</p>
-      <p style={{ color, fontSize: 32, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace",
-        lineHeight: 1 }}>{value ?? "—"}</p>
-      {sub && <p style={{ color: C.textDim, fontSize: 12, marginTop: 6 }}>{sub}</p>}
+      <div style={{
+        position: "absolute", top: 0, left: 0, right: 0, height: 3,
+        background: `linear-gradient(90deg, ${color}, ${color}88)`,
+        borderRadius: "14px 14px 0 0",
+      }} />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{
+            color: C.muted, fontSize: 11, letterSpacing: "0.08em",
+            textTransform: "uppercase", marginBottom: 10, fontWeight: 600,
+          }}>{label}</p>
+          <p style={{
+            color, fontSize: 34, fontWeight: 700,
+            fontFamily: "'JetBrains Mono', monospace", lineHeight: 1,
+          }}>{value ?? "—"}</p>
+          {sub && <p style={{ color: C.textDim, fontSize: 12, marginTop: 8 }}>{sub}</p>}
+        </div>
+        {Icon && (
+          <div style={{
+            background: color + "1a", borderRadius: 10, padding: 10,
+            flexShrink: 0, marginLeft: 12,
+          }}>
+            <Icon size={20} color={color} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -229,9 +346,9 @@ function PriceChart({ mappingId }) {
 const LOG_PAGE_SIZE = 50;
 
 function DashboardPage({ stats }) {
-  const [logs, setLogs]         = useState([]);
+  const [logs, setLogs]           = useState([]);
   const [logsTotal, setLogsTotal] = useState(0);
-  const [logsPage, setLogsPage] = useState(1);
+  const [logsPage, setLogsPage]   = useState(1);
   const [logsStatus, setLogsStatus] = useState("");
   const [logsLoading, setLogsLoading] = useState(false);
 
@@ -248,6 +365,41 @@ function DashboardPage({ stats }) {
 
   const totalPages = Math.max(1, Math.ceil(logsTotal / LOG_PAGE_SIZE));
 
+  // ── Chart data derived from existing logs state (no extra API calls) ──
+  const statusPieData = useMemo(() => {
+    const counts = { success: 0, failed: 0, skipped: 0 };
+    logs.forEach(l => { if (counts[l.status] !== undefined) counts[l.status]++; });
+    return [
+      { name: "Success", value: counts.success, color: C.accent },
+      { name: "Failed",  value: counts.failed,  color: C.red },
+      { name: "Skipped", value: counts.skipped, color: C.amber },
+    ].filter(d => d.value > 0);
+  }, [logs]);
+
+  const dailyBarData = useMemo(() => {
+    const map = {};
+    logs.forEach(l => {
+      const d = new Date(l.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+      if (!map[d]) map[d] = { date: d, Success: 0, Failed: 0, Skipped: 0 };
+      if (l.status === "success")      map[d].Success++;
+      else if (l.status === "failed")  map[d].Failed++;
+      else if (l.status === "skipped") map[d].Skipped++;
+    });
+    return Object.values(map).slice(-7);
+  }, [logs]);
+
+  const priceTrendData = useMemo(() =>
+    logs
+      .filter(l => l.amazon_price && l.onbuy_price)
+      .slice(0, 20)
+      .reverse()
+      .map((l, i) => ({
+        i: i + 1,
+        Amazon: parseFloat(l.amazon_price),
+        OnBuy:  parseFloat(l.onbuy_price),
+      })),
+  [logs]);
+
   const filterBtns = [
     { label: "All",     value: "" },
     { label: "Success", value: "success" },
@@ -255,23 +407,128 @@ function DashboardPage({ stats }) {
     { label: "Skipped", value: "skipped" },
   ];
 
+  const chartCard = {
+    background: C.surface, border: `1px solid ${C.border}`,
+    borderRadius: 14, padding: "20px 24px",
+  };
+
+  const chartLabel = {
+    color: C.muted, fontSize: 11, fontWeight: 600,
+    letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 16,
+  };
+
+  const emptyChart = {
+    color: C.muted, textAlign: "center",
+    padding: "40px 0", fontSize: 13,
+  };
+
+  const tooltipStyle = {
+    contentStyle: {
+      background: C.panel, border: `1px solid ${C.border}`,
+      borderRadius: 8, color: C.text, fontSize: 12,
+    },
+  };
+
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 32 }}>
-        <StatCard label="Active Listings"    value={stats?.activeListings}      color={C.accent} />
-        <StatCard label="Syncs (24h)"        value={stats?.syncedLast24h}       color={C.blue} />
-        <StatCard label="Price Changes (24h)" value={stats?.priceChangesLast24h} color={C.amber} />
+      {/* ── KPI Cards ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+        <StatCard label="Active Listings"     value={stats?.activeListings}      color={C.accent} icon={Package} />
+        <StatCard label="Syncs (24h)"         value={stats?.syncedLast24h}       color={C.blue}   icon={RefreshCw} />
+        <StatCard label="Price Changes (24h)" value={stats?.priceChangesLast24h} color={C.amber}  icon={TrendingUp} />
       </div>
 
+      {/* ── Charts Row: Pie + Line ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr", gap: 16, marginBottom: 16 }}>
+
+        {/* Status Distribution — Donut Pie */}
+        <div style={chartCard}>
+          <p style={chartLabel}>Status Distribution</p>
+          {statusPieData.length === 0 ? (
+            <p style={emptyChart}>No data yet — run a sync first.</p>
+          ) : (
+            <ResponsiveContainer width="100%" height={220}>
+              <PieChart>
+                <Pie
+                  data={statusPieData}
+                  cx="50%" cy="50%"
+                  innerRadius={52} outerRadius={88}
+                  paddingAngle={3} dataKey="value"
+                >
+                  {statusPieData.map((d, i) => <Cell key={i} fill={d.color} />)}
+                </Pie>
+                <Tooltip {...tooltipStyle} />
+                <Legend
+                  iconType="circle" iconSize={8}
+                  wrapperStyle={{ fontSize: 12, color: C.textDim }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+
+        {/* Price Trend — Line Chart */}
+        <div style={chartCard}>
+          <p style={chartLabel}>Amazon vs OnBuy — Recent 20 Records</p>
+          {priceTrendData.length === 0 ? (
+            <p style={emptyChart}>No price data yet — run a sync first.</p>
+          ) : (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={priceTrendData}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis
+                  dataKey="i" stroke={C.muted} tick={{ fontSize: 10, fill: C.muted }}
+                  tickFormatter={v => `#${v}`}
+                />
+                <YAxis
+                  stroke={C.muted} tick={{ fontSize: 10, fill: C.muted }}
+                  tickFormatter={v => `£${v}`} width={52}
+                />
+                <Tooltip
+                  {...tooltipStyle}
+                  formatter={v => [`£${parseFloat(v).toFixed(2)}`]}
+                />
+                <Legend iconType="line" wrapperStyle={{ fontSize: 12, color: C.textDim }} />
+                <Line type="monotone" dataKey="Amazon" stroke={C.blue}  strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                <Line type="monotone" dataKey="OnBuy"  stroke={C.accent} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+
+      {/* ── Daily Sync Activity — Grouped Bar ── */}
+      <div style={{ ...chartCard, marginBottom: 24 }}>
+        <p style={chartLabel}>Daily Sync Activity</p>
+        {dailyBarData.length === 0 ? (
+          <p style={emptyChart}>No activity data yet — run a sync first.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={dailyBarData} barSize={12} barGap={2}>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false} />
+              <XAxis dataKey="date" stroke={C.muted} tick={{ fontSize: 11, fill: C.muted }} />
+              <YAxis stroke={C.muted} tick={{ fontSize: 11, fill: C.muted }} allowDecimals={false} width={36} />
+              <Tooltip {...tooltipStyle} />
+              <Legend iconType="square" iconSize={10} wrapperStyle={{ fontSize: 12, color: C.textDim }} />
+              <Bar dataKey="Success" fill={C.accent} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Failed"  fill={C.red}    radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Skipped" fill={C.amber}  radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* ── Recent Sync Activity Table ── */}
       <Section title="Recent Sync Activity">
         {/* Filter + record count row */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
           {filterBtns.map(b => (
             <button key={b.value} onClick={() => { setLogsStatus(b.value); setLogsPage(1); }} style={{
-              padding: "4px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
+              padding: "5px 14px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
               border: `1px solid ${logsStatus === b.value ? C.accent : C.border}`,
               background: logsStatus === b.value ? C.accentDim : "none",
               color: logsStatus === b.value ? C.accent : C.muted,
+              transition: "all .15s",
             }}>{b.label}</button>
           ))}
           <span style={{ marginLeft: "auto", color: C.muted, fontSize: 12 }}>
@@ -283,40 +540,43 @@ function DashboardPage({ stats }) {
           <thead>
             <tr style={{ borderBottom: `1px solid ${C.border}` }}>
               {["Product", "ASIN", "Amazon £", "OnBuy £", "Status", "Time"].map(h => (
-                <th key={h} style={{ color: C.muted, textAlign: "left",
-                  padding: "8px 12px", fontWeight: 500, fontSize: 11,
-                  textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
+                <th key={h} style={{
+                  color: C.muted, textAlign: "left",
+                  padding: "8px 12px", fontWeight: 600, fontSize: 11,
+                  textTransform: "uppercase", letterSpacing: "0.06em",
+                }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {logsLoading && (
-              <tr><td colSpan={6} style={{ color: C.muted, padding: "24px 12px", textAlign: "center" }}>
+              <tr><td colSpan={6} style={{ color: C.muted, padding: "32px 12px", textAlign: "center" }}>
                 Loading…
               </td></tr>
             )}
             {!logsLoading && logs.length === 0 && (
-              <tr><td colSpan={6} style={{ color: C.muted, padding: "24px 12px", textAlign: "center" }}>
+              <tr><td colSpan={6} style={{ color: C.muted, padding: "32px 12px", textAlign: "center" }}>
                 No sync activity yet. Run a sync to get started.
               </td></tr>
             )}
             {!logsLoading && logs.map(l => (
-              <tr key={l.id} style={{ borderBottom: `1px solid ${C.border}10` }}>
-                <td style={{ padding: "10px 12px", color: C.text }}>{l.product_name || "—"}</td>
-                <td style={{ padding: "10px 12px", color: C.muted, fontFamily: "monospace" }}>{l.primary_asin}</td>
-                <td style={{ padding: "10px 12px", color: C.blue }}>{fmt(l.amazon_price)}</td>
-                <td style={{ padding: "10px 12px", color: C.accent }}>{fmt(l.onbuy_price)}</td>
-                <td style={{ padding: "10px 12px" }}><Badge status={l.status} /></td>
-                <td style={{ padding: "10px 12px", color: C.muted }}>{ago(l.created_at)}</td>
+              <tr key={l.id} style={{ borderBottom: `1px solid ${C.border}40` }}>
+                <td style={{ padding: "11px 12px", color: C.text }}>{l.product_name || "—"}</td>
+                <td style={{ padding: "11px 12px", color: C.muted, fontFamily: "monospace", fontSize: 12 }}>{l.primary_asin}</td>
+                <td style={{ padding: "11px 12px", color: C.blue, fontFamily: "monospace" }}>{fmt(l.amazon_price)}</td>
+                <td style={{ padding: "11px 12px", color: C.accent, fontFamily: "monospace" }}>{fmt(l.onbuy_price)}</td>
+                <td style={{ padding: "11px 12px" }}><Badge status={l.status} /></td>
+                <td style={{ padding: "11px 12px", color: C.muted }}>{ago(l.created_at)}</td>
               </tr>
             ))}
           </tbody>
         </table>
 
-        {/* Pagination controls */}
         {totalPages > 1 && (
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-            marginTop: 14, gap: 8 }}>
+          <div style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            marginTop: 16, gap: 8,
+          }}>
             <Btn variant="secondary" small disabled={logsPage <= 1}
               onClick={() => setLogsPage(p => p - 1)}>← Prev</Btn>
             <span style={{ color: C.muted, fontSize: 12 }}>
@@ -1073,15 +1333,8 @@ function LoginPage({ onLogin }) {
     <div style={{
       minHeight: "100vh", background: C.bg, display: "flex",
       alignItems: "center", justifyContent: "center", padding: 24,
-      fontFamily: "'DM Sans', system-ui, sans-serif",
+      fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif",
     }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        input { outline: none; }
-        input:focus { border-color: ${C.accent} !important; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-      `}</style>
       <div style={{
         background: C.surface, border: `1px solid ${C.border}`,
         borderRadius: 16, padding: "40px 36px", width: "100%", maxWidth: 400,
@@ -1382,7 +1635,7 @@ function Section({ title, action, children }) {
           {action}
         </div>
       )}
-      <div>{children}</div>
+      <div style={{ padding: "16px 20px" }}>{children}</div>
     </div>
   );
 }
@@ -1401,7 +1654,7 @@ const INTERVAL_OPTIONS = [
   { value: "720", label: "Every 12 hours" },
 ];
 
-function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin }) {
+function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTheme = "semi-dark", onThemeChange }) {
   const [proxyUrl,      setProxyUrl]      = useState("");
   const [feePercent,    setFeePercent]    = useState("15");
   const [defaultRoi,    setDefaultRoi]    = useState("20");
@@ -1440,6 +1693,7 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin }) {
           min_roi_percent:      minRoi,
           job_interval_minutes: interval,
           job_start_time:       startTime,
+          app_theme:            appTheme,
         }),
       });
       setStatus(s._proxy_status);
@@ -1461,8 +1715,109 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin }) {
   const intervalLabel = INTERVAL_OPTIONS.find(o => o.value === String(interval))?.label || `Every ${interval} min`;
   const startLabel    = startTime === "00:00" ? "midnight" : startTime;
 
+  const THEME_OPTS = [
+    {
+      id: "dark", label: "Dark", desc: "Deep navy black",
+      preview: { bg: "#0b0f1a", surface: "#111827", border: "#1e2d45", accent: "#22c55e", text: "#e2e8f0" },
+    },
+    {
+      id: "semi-dark", label: "Semi Dark", desc: "Slate navy blue",
+      preview: { bg: "#0f172a", surface: "#1e293b", border: "#334155", accent: "#22c55e", text: "#f1f5f9" },
+    },
+    {
+      id: "light", label: "Light", desc: "Clean white",
+      preview: { bg: "#f8fafc", surface: "#ffffff", border: "#e2e8f0", accent: "#16a34a", text: "#0f172a" },
+    },
+  ];
+
   return (
     <div style={{ maxWidth: 660, display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* App Theme — super admin only */}
+      {isSuperAdmin && (
+        <Section title="App Theme">
+          <p style={{ color: C.textDim, fontSize: 13, marginBottom: 16, lineHeight: 1.5 }}>
+            Sets the visual theme for the entire application. All users see the updated theme after their next page load.
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+            {THEME_OPTS.map(t => {
+              const p = t.preview;
+              const active = appTheme === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => onThemeChange?.(t.id)}
+                  style={{
+                    background: p.surface,
+                    border: `2px solid ${active ? p.accent : p.border}`,
+                    borderRadius: 12, padding: "14px 14px",
+                    cursor: "pointer", textAlign: "left",
+                    transition: "border-color .15s, box-shadow .15s",
+                    boxShadow: active ? `0 0 0 3px ${p.accent}30` : "none",
+                    outline: "none",
+                  }}
+                >
+                  {/* Mini UI preview */}
+                  <div style={{
+                    background: p.bg, borderRadius: 8, padding: 8,
+                    marginBottom: 12, display: "flex", gap: 5, height: 60,
+                  }}>
+                    {/* Sidebar strip */}
+                    <div style={{
+                      width: 26, background: p.surface, borderRadius: 4,
+                      border: `1px solid ${p.border}`, padding: "5px 4px",
+                      display: "flex", flexDirection: "column", gap: 3, flexShrink: 0,
+                    }}>
+                      <div style={{ height: 4, background: p.accent, borderRadius: 2, width: "75%" }} />
+                      {[0,1,2].map(i => (
+                        <div key={i} style={{ height: 3, background: p.border, borderRadius: 2 }} />
+                      ))}
+                    </div>
+                    {/* Content area */}
+                    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {/* KPI cards */}
+                      <div style={{ display: "flex", gap: 3 }}>
+                        {[p.accent, "#3b82f6", "#f59e0b"].map((c, i) => (
+                          <div key={i} style={{
+                            flex: 1, height: 18, background: p.surface,
+                            borderRadius: 3, border: `1px solid ${p.border}`,
+                            borderTop: `2px solid ${c}`,
+                          }} />
+                        ))}
+                      </div>
+                      {/* Chart placeholder */}
+                      <div style={{
+                        flex: 1, background: p.surface, borderRadius: 3,
+                        border: `1px solid ${p.border}`,
+                        display: "flex", alignItems: "flex-end", gap: 2, padding: "3px 4px",
+                      }}>
+                        {[60, 80, 45, 90, 55, 70, 85].map((h, i) => (
+                          <div key={i} style={{
+                            flex: 1, height: `${h}%`,
+                            background: i % 3 === 0 ? p.accent : i % 3 === 1 ? "#ef4444" : "#f59e0b",
+                            borderRadius: "1px 1px 0 0", opacity: 0.7,
+                          }} />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Label */}
+                  <p style={{ color: active ? p.accent : p.text, fontSize: 13, fontWeight: 700, margin: 0 }}>
+                    {t.label}
+                  </p>
+                  <p style={{ color: active ? p.accent : "#94a3b8", fontSize: 11, marginTop: 3, fontWeight: active ? 600 : 400 }}>
+                    {active ? "✓ Active" : t.desc}
+                  </p>
+                </button>
+              );
+            })}
+          </div>
+          <p style={{ color: C.muted, fontSize: 11, marginTop: 14, lineHeight: 1.5 }}>
+            Click a theme to preview it instantly. Save Settings below to persist it for all users.
+          </p>
+        </Section>
+      )}
 
       {/* Schedule */}
       <Section title="Repricer Schedule">
@@ -1732,6 +2087,13 @@ export default function App() {
   const [jobInterval, setJobInterval]     = useState(null);
   const [jobStartTime, setJobStartTime]   = useState("00:00");
   const [defaultRoi, setDefaultRoi]       = useState(20);
+  const [appTheme, setAppTheme]           = useState("semi-dark");
+
+  const changeTheme = useCallback((name) => {
+    if (!THEME_PALETTES[name]) return;
+    applyThemePalette(name);
+    setAppTheme(name);
+  }, []);
 
   // ── Auth state ──────────────────────────────
   const [authToken,    setAuthToken]    = useState(() => localStorage.getItem("repricer_token"));
@@ -1787,11 +2149,12 @@ export default function App() {
     loadDashboard();
     api("/settings").then(s => {
       if (!s) return;
+      if (s.app_theme)                          changeTheme(s.app_theme);
       if (s.job_interval_minutes !== undefined) setJobInterval(parseInt(s.job_interval_minutes));
       if (s.job_start_time       !== undefined) setJobStartTime(s.job_start_time || "00:00");
       if (s.default_roi_percent)                setDefaultRoi(parseFloat(s.default_roi_percent));
     }).catch(() => {});
-  }, [authToken, loadDashboard]);
+  }, [authToken, loadDashboard, changeTheme]);
 
   useEffect(() => {
     if (!authToken) return;
@@ -1832,157 +2195,101 @@ export default function App() {
   };
 
   const nav = [
-    { id:"dashboard",      label:"📊 Dashboard" },
-    { id:"mappings",       label:"🔗 Mappings" },
-    { id:"current-prices", label:"💷 Current Prices" },
-    { id:"accounts",       label:"🏪 OnBuy Accounts" },
-    { id:"import",         label:"📥 Repricer Listings" },
-    { id:"onbuy-bulk",     label:"📦 OnBuy Bulk Listings" },
-    // { id:"sku-change",     label:"🔄 SKU Change" },
-    { id:"delete-listings", label:"🗑️ Delete Listings" },
-    { id:"orders",          label:"📋 Orders" },
-    // { id:"sp-api",          label:"🔍 SP-API Lookup" },
-    { id:"settings",       label:"⚙️ Settings" },
-    { id:"logs",           label:"📋 Live Logs" },
-    ...(isAdmin && !isImpersonating ? [{ id:"users", label:"👥 Users" }] : []),
+    { id:"dashboard",       label:"Dashboard" },
+    { id:"mappings",        label:"Mappings" },
+    { id:"current-prices",  label:"Current Prices" },
+    { id:"accounts",        label:"OnBuy Accounts" },
+    { id:"import",          label:"Repricer Listings" },
+    { id:"onbuy-bulk",      label:"OnBuy Bulk Listings" },
+    { id:"delete-listings", label:"Delete Listings" },
+    { id:"orders",          label:"Orders" },
+    { id:"settings",        label:"Settings" },
+    { id:"logs",            label:"Live Logs" },
+    ...(isAdmin && !isImpersonating ? [{ id:"users", label:"Users" }] : []),
   ];
 
   return (
-    <div style={{
-      minHeight:"100vh", background:C.bg, color:C.text,
-      fontFamily:"'DM Sans', system-ui, sans-serif",
-    }}>
-      {/* Google Font */}
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: ${C.bg}; }
-        ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 3px; }
-        input, select { outline: none; }
-        input:focus, select:focus { border-color: ${C.accent} !important; }
-      `}</style>
+    <div className="min-h-screen bg-background text-foreground font-sans">
 
       {/* Impersonation banner */}
       {isImpersonating && (
-        <div style={{
-          position: "fixed", top: 0, left: 0, right: 0, zIndex: 200,
-          background: "#f59e0b", color: "#000", padding: "8px 24px",
-          display: "flex", alignItems: "center", justifyContent: "space-between",
-          fontSize: 13, fontWeight: 600,
-        }}>
+        <div className="fixed top-0 left-0 right-0 z-[200] bg-amber text-black px-6 py-2 flex items-center justify-between text-[13px] font-semibold">
           <span>
             Viewing as <strong>{currentUser.impersonatedUsername}</strong> — you are impersonating this user
           </span>
-          <button onClick={exitImpersonation} style={{
-            background: "#0006", border: "none", borderRadius: 6, color: "#fff",
-            padding: "4px 14px", cursor: "pointer", fontWeight: 700, fontSize: 12,
-          }}>
+          <button
+            onClick={exitImpersonation}
+            className="bg-black/20 rounded-md px-3 py-1 text-white font-bold text-[12px] cursor-pointer hover:bg-black/30 transition-colors duration-150"
+          >
             Exit Impersonation
           </button>
         </div>
       )}
 
       {/* Sidebar */}
-      <div style={{
-        position:"fixed", left:0, top: isImpersonating ? 38 : 0, bottom:0, width:220,
-        background:C.surface, borderRight:`1px solid ${C.border}`,
-        display:"flex", flexDirection:"column", padding:"24px 0",
-        zIndex:50,
-      }}>
+      <aside
+        className="fixed left-0 bottom-0 w-56 bg-surface border-r border-separator flex flex-col z-50"
+        style={{ top: isImpersonating ? 38 : 0 }}
+      >
         {/* Logo */}
-        <div style={{ padding:"0 20px 24px" }}>
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div style={{
-              width:36, height:36, borderRadius:8,
-              background:`linear-gradient(135deg, ${C.accent}, #0090ff)`,
-              display:"flex", alignItems:"center", justifyContent:"center",
-              fontSize:16,
-            }}>⚡</div>
-            <div>
-              <p style={{ color:C.text, fontWeight:700, fontSize:14, lineHeight:1.2 }}>OnBuy</p>
-              <p style={{ color:C.muted, fontSize:11 }}>Re-Pricer</p>
+        <div className="px-5 pt-6 pb-5 border-b border-separator">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-accent to-info flex items-center justify-center shrink-0">
+              <Zap className="w-4 h-4 text-black" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-foreground font-bold text-sm leading-tight">OnBuy</p>
+              <p className="text-subdued text-[11px] font-medium">Re-Pricer</p>
             </div>
           </div>
         </div>
 
         {/* Nav */}
-        <nav style={{ flex:1 }}>
-          {nav.map(n => (
-            <button key={n.id} onClick={() => setPage(n.id)} style={{
-              display:"block", width:"100%", textAlign:"left",
-              padding:"10px 20px", fontSize:13, fontWeight:500,
-              cursor:"pointer", border:"none", transition:"all .15s",
-              background: page === n.id ? C.accentDim : "none",
-              color: page === n.id ? C.accent : C.textDim,
-              borderLeft: page === n.id ? `2px solid ${C.accent}` : "2px solid transparent",
-            }}>{n.label}</button>
-          ))}
+        <nav className="flex-1 px-3 py-3 space-y-0.5 overflow-y-auto">
+          {nav.map(n => {
+            const Icon = NAV_ICONS[n.id] || LayoutDashboard;
+            const active = page === n.id;
+            return (
+              <button
+                key={n.id}
+                onClick={() => setPage(n.id)}
+                className={[
+                  "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-[13px] font-medium",
+                  "transition-all duration-150 cursor-pointer text-left border-l-2",
+                  active
+                    ? "bg-accent/10 text-accent border-l-accent"
+                    : "text-subdued hover:bg-panel hover:text-foreground border-l-transparent",
+                ].join(" ")}
+              >
+                <Icon className="w-4 h-4 shrink-0" />
+                <span className="truncate">{n.label}</span>
+              </button>
+            );
+          })}
         </nav>
 
-        {/* Sync + user info */}
-        <div style={{ padding:"16px 20px", borderTop:`1px solid ${C.border}` }}>
-          <Btn
+        {/* Bottom — sync + user */}
+        <div className="px-4 py-4 border-t border-separator space-y-2">
+          {/* Sync button */}
+          <button
             onClick={() => { if (!syncing && !queueBusy) setSyncModalOpen(true); }}
             disabled={syncing || queueBusy}
             title={queueBusy
               ? `Queue busy — fast: ${queueCounts?.fast?.waiting ?? 0}w/${queueCounts?.fast?.active ?? 0}a, slow: ${queueCounts?.slow?.waiting ?? 0}w/${queueCounts?.slow?.active ?? 0}a, keepa: ${queueCounts?.keepa?.waiting ?? 0}w/${queueCounts?.keepa?.active ?? 0}a`
               : "Run repricer now"}
-            style={{ width:"100%", justifyContent:"center" }}
+            className={[
+              "w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg",
+              "text-[13px] font-semibold transition-all duration-150",
+              (syncing || queueBusy)
+                ? "bg-accent/20 text-accent/60 cursor-not-allowed"
+                : "bg-accent text-black hover:bg-accent/90 active:scale-95 cursor-pointer",
+            ].join(" ")}
           >
-            {syncing ? "⏳ Syncing…" : queueBusy ? "⏳ Jobs Running…" : "↺ Sync All Now"}
-          </Btn>
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${(syncing || queueBusy) ? "animate-spin" : ""}`} />
+            {syncing ? "Syncing…" : queueBusy ? "Jobs Running…" : "Sync All Now"}
+          </button>
 
-          {/* Sync scope modal */}
-          {syncModalOpen && (
-            <div style={{
-              position:"fixed", inset:0, zIndex:1000,
-              background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center",
-            }} onClick={() => setSyncModalOpen(false)}>
-              <div style={{
-                background: C.surface, border:`1px solid ${C.border}`, borderRadius:12,
-                padding:28, width:340, display:"flex", flexDirection:"column", gap:16,
-              }} onClick={e => e.stopPropagation()}>
-                <h3 style={{ color:C.text, margin:0, fontSize:16 }}>Choose Sync Scope</h3>
-                <p style={{ color:C.muted, margin:0, fontSize:13, lineHeight:1.5 }}>
-                  Which listings should be synced?
-                </p>
-                <button
-                  onClick={() => triggerSync(false)}
-                  style={{
-                    background:C.accent, color:"#000", border:"none", borderRadius:8,
-                    padding:"12px 16px", cursor:"pointer", fontWeight:600, fontSize:14, textAlign:"left",
-                  }}
-                >
-                  ↺ Sync All Listings
-                  <div style={{ fontWeight:400, fontSize:12, marginTop:3, opacity:0.7 }}>
-                    Re-sync every active listing
-                  </div>
-                </button>
-                <button
-                  onClick={() => triggerSync(true)}
-                  style={{
-                    background:"#1a2535", color:C.text, border:`1px solid ${C.border}`,
-                    borderRadius:8, padding:"12px 16px", cursor:"pointer", fontWeight:600, fontSize:14, textAlign:"left",
-                  }}
-                >
-                  ✦ Sync Unsynced Only
-                  <div style={{ fontWeight:400, fontSize:12, marginTop:3, opacity:0.7 }}>
-                    Only listings with Last Sync = Never
-                  </div>
-                </button>
-                <button
-                  onClick={() => setSyncModalOpen(false)}
-                  style={{
-                    background:"transparent", color:C.muted, border:"none",
-                    cursor:"pointer", fontSize:13, padding:"4px 0",
-                  }}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
+          {/* Cancel running job */}
           {queueBusy && (
             <button
               onClick={async () => {
@@ -1999,21 +2306,15 @@ export default function App() {
                 }
               }}
               disabled={cancelling}
-              style={{
-                width: "100%", marginTop: 8,
-                background: "transparent",
-                border: `1px solid #c0392b`,
-                color: cancelling ? C.muted : "#e74c3c",
-                borderRadius: 8, padding: "7px 12px",
-                cursor: cancelling ? "not-allowed" : "pointer",
-                fontSize: 12, fontWeight: 600,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-              }}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-[12px] font-semibold border border-danger/50 text-danger hover:bg-danger/10 transition-all duration-150 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {cancelling ? "Cancelling…" : "✕ Cancel Running Job"}
+              <X className="w-3.5 h-3.5 shrink-0" />
+              {cancelling ? "Cancelling…" : "Cancel Running Job"}
             </button>
           )}
-          <p style={{ color: queueBusy ? C.amber : C.muted, fontSize:10, textAlign:"center", marginTop:8 }}>
+
+          {/* Schedule info */}
+          <p className={`text-[10px] text-center ${queueBusy ? "text-amber" : "text-subdued"}`}>
             {queueBusy
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
               : jobInterval === null
@@ -2024,46 +2325,94 @@ export default function App() {
           </p>
 
           {/* User info + logout */}
-          <div style={{ marginTop: 14, borderTop: `1px solid ${C.border}`, paddingTop: 12,
-            display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div>
-              <p style={{ color: C.text, fontSize: 12, fontWeight: 600 }}>
+          <div className="pt-2 border-t border-separator flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-foreground text-[12px] font-semibold truncate">
                 {isImpersonating ? currentUser.impersonatedUsername : currentUser.username}
               </p>
-              <p style={{ color: C.muted, fontSize: 10 }}>
+              <p className="text-subdued text-[10px]">
                 {isImpersonating ? "Impersonation" : currentUser.role === "super_admin" ? "Super Admin" : "User"}
               </p>
             </div>
-            <button onClick={logout} title="Logout" style={{
-              background: "none", border: `1px solid ${C.border}`, borderRadius: 6,
-              color: C.muted, padding: "4px 8px", cursor: "pointer", fontSize: 11,
-            }}>Logout</button>
+            <button
+              onClick={logout}
+              title="Logout"
+              className="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] text-subdued border border-separator hover:text-danger hover:border-danger/50 transition-all duration-150 cursor-pointer"
+            >
+              <LogOut className="w-3 h-3" />
+              Logout
+            </button>
           </div>
         </div>
-      </div>
+
+        {/* Sync scope modal */}
+        {syncModalOpen && (
+          <div
+            className="fixed inset-0 z-[1000] bg-black/60 flex items-center justify-center"
+            onClick={() => setSyncModalOpen(false)}
+          >
+            <div
+              className="bg-surface border border-separator rounded-xl p-7 w-[340px] flex flex-col gap-4"
+              onClick={e => e.stopPropagation()}
+            >
+              <h3 className="text-foreground text-base font-bold">Choose Sync Scope</h3>
+              <p className="text-subdued text-[13px] leading-relaxed">Which listings should be synced?</p>
+              <button
+                onClick={() => triggerSync(false)}
+                className="bg-accent text-black rounded-lg px-4 py-3 font-semibold text-[14px] text-left hover:bg-accent/90 transition-all duration-150 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <RefreshCw className="w-4 h-4" />
+                  Sync All Listings
+                </div>
+                <div className="font-normal text-[12px] mt-1 opacity-70">Re-sync every active listing</div>
+              </button>
+              <button
+                onClick={() => triggerSync(true)}
+                className="bg-panel text-foreground border border-separator rounded-lg px-4 py-3 font-semibold text-[14px] text-left hover:bg-panel/80 transition-all duration-150 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Upload className="w-4 h-4" />
+                  Sync Unsynced Only
+                </div>
+                <div className="font-normal text-[12px] mt-1 opacity-70">Only listings with Last Sync = Never</div>
+              </button>
+              <button
+                onClick={() => setSyncModalOpen(false)}
+                className="text-subdued text-[13px] cursor-pointer hover:text-foreground transition-colors duration-150"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </aside>
 
       {/* Main */}
-      <div style={{ marginLeft:220, padding:`${isImpersonating ? 70 : 32}px 32px 32px` }}>
+      <div className="ml-56 px-8 pb-8" style={{ paddingTop: isImpersonating ? 70 : 32 }}>
         {/* Header */}
-        <div style={{ marginBottom:28 }}>
-          <h1 style={{ color:C.text, fontSize:22, fontWeight:700 }}>
-            {nav.find(n => n.id === page)?.label}
-          </h1>
-          <p style={{ color:C.muted, fontSize:13, marginTop:4 }}>
-            {page === "dashboard"      && "Overview of your re-pricer activity"}
-            {page === "mappings"       && "Manage your OnBuy ↔ Amazon product links"}
-            {page === "compare"        && "Compare all suppliers for a product"}
-            {page === "current-prices" && "Fetch real-time price for any Amazon ASIN"}
-            {page === "accounts"       && "Connect and manage your OnBuy seller accounts"}
-            {page === "import"         && "Bulk import listings from an Excel spreadsheet"}
-            {page === "onbuy-bulk"     && "Create new products and listings directly on your OnBuy store"}
-            {page === "sku-change"       && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
+        <div className="mb-7">
+          <div className="flex items-center gap-2.5 mb-1">
+            {(() => { const Icon = NAV_ICONS[page]; return Icon ? <Icon className="w-5 h-5 text-accent" /> : null; })()}
+            <h1 className="text-foreground text-[22px] font-bold">
+              {nav.find(n => n.id === page)?.label ?? page}
+            </h1>
+          </div>
+          <p className="text-subdued text-[13px] ml-7">
+            {page === "dashboard"       && "Overview of your re-pricer activity"}
+            {page === "mappings"        && "Manage your OnBuy ↔ Amazon product links"}
+            {page === "compare"         && "Compare all suppliers for a product"}
+            {page === "current-prices"  && "Fetch real-time price for any Amazon ASIN"}
+            {page === "accounts"        && "Connect and manage your OnBuy seller accounts"}
+            {page === "import"          && "Bulk import listings from an Excel spreadsheet"}
+            {page === "onbuy-bulk"      && "Create new products and listings directly on your OnBuy store"}
+            {page === "sku-change"      && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
             {page === "delete-listings" && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
             {page === "orders"          && "View and sync OnBuy orders across all accounts"}
-            {page === "sp-api"         && "Fetch Amazon catalog data for any ASIN using SP-API"}
-            {page === "settings"       && "Configure proxies and global repricer options"}
-            {page === "logs"           && "Real-time output from API server and job worker"}
-            {page === "users"          && "Manage user accounts and impersonate users"}
+            {page === "sp-api"          && "Fetch Amazon catalog data for any ASIN using SP-API"}
+            {page === "settings"        && "Configure proxies and global repricer options"}
+            {page === "logs"            && "Real-time output from API server and job worker"}
+            {page === "users"           && "Manage user accounts and impersonate users"}
           </p>
         </div>
 
@@ -2079,7 +2428,7 @@ export default function App() {
         {page === "delete-listings"  && <DeleteListingsPage />}
         {page === "orders"           && <OrdersPage />}
         {page === "sp-api"          && <SpApiPage />}
-        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} />}
+        {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} appTheme={appTheme} onThemeChange={changeTheme} />}
         {page === "logs"           && <LiveLogsPage />}
         {page === "users"          && isAdmin && <UsersPage currentUser={currentUser} />}
         {page === "chart"          && chartMapping && (
