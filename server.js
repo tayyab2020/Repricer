@@ -3273,7 +3273,7 @@ app.get('/api/orders/chart', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
   try {
     const { rows } = await db.query(
-      `SELECT DATE(order_date) AS day, status, COUNT(*)::int AS count
+      `SELECT to_char(order_date, 'YYYY-MM-DD') AS day, status, COUNT(*)::int AS count
        FROM onbuy_orders
        WHERE user_id = $1 AND order_date >= NOW() - INTERVAL '7 days'
        GROUP BY day, status

@@ -352,6 +352,7 @@ function DashboardPage({ stats }) {
   const [logsStatus, setLogsStatus] = useState("");
   const [logsLoading, setLogsLoading] = useState(false);
   const [orderBarData, setOrderBarData] = useState([]);
+  const [orderBarLoaded, setOrderBarLoaded] = useState(false);
 
   const loadLogs = useCallback((pg = 1, status = "") => {
     setLogsLoading(true);
@@ -368,24 +369,32 @@ function DashboardPage({ stats }) {
   useEffect(() => {
     api('/orders/chart')
       .then(rows => {
-        const map = {};
         const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled By Seller', 'Cancelled By Customer'];
+        // Build map keyed by ISO date string (YYYY-MM-DD) to avoid any Date/timezone parsing issues.
+        // Server returns to_char(order_date, 'YYYY-MM-DD') which is always a plain string.
+        const map = {};
+        const orderedKeys = [];
         for (let i = 6; i >= 0; i--) {
           const d = new Date();
           d.setDate(d.getDate() - i);
-          const key = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-          map[key] = { date: key };
-          ORDER_STATUSES.forEach(s => { map[key][s] = 0; });
+          const iso = [
+            d.getFullYear(),
+            String(d.getMonth() + 1).padStart(2, '0'),
+            String(d.getDate()).padStart(2, '0'),
+          ].join('-');
+          const label = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+          map[iso] = { date: label };
+          ORDER_STATUSES.forEach(s => { map[iso][s] = 0; });
+          orderedKeys.push(iso);
         }
         rows.forEach(r => {
-          // Append T00:00:00 so the date-only string is parsed as local midnight,
-          // not UTC midnight — prevents a timezone shift that moves orders to the wrong day.
-          const key = new Date(r.day + 'T00:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-          if (map[key] && r.status) map[key][r.status] = (map[key][r.status] || 0) + r.count;
+          const iso = String(r.day).slice(0, 10); // guaranteed "YYYY-MM-DD" from server
+          if (map[iso] && r.status) map[iso][r.status] = (map[iso][r.status] || 0) + r.count;
         });
-        setOrderBarData(Object.values(map));
+        setOrderBarData(orderedKeys.map(k => map[k]));
       })
-      .catch(console.error);
+      .catch(console.error)
+      .finally(() => setOrderBarLoaded(true));
   }, []);
 
   const totalPages = Math.max(1, Math.ceil(logsTotal / LOG_PAGE_SIZE));
@@ -517,8 +526,10 @@ function DashboardPage({ stats }) {
       {/* ── Orders Last 7 Days — Grouped Bar ── */}
       <div style={{ ...chartCard, marginBottom: 24 }}>
         <p style={chartLabel}>Orders (Last 7 Days)</p>
-        {orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Customer']) ? (
+        {orderBarLoaded && orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Customer']) ? (
           <p style={emptyChart}>No orders in the last 7 days.</p>
+        ) : !orderBarLoaded ? (
+          <p style={emptyChart}>Loading…</p>
         ) : (
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={orderBarData} barSize={12} barGap={2}>
