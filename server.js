@@ -229,11 +229,19 @@ app.post('/api/admin/users/:id/impersonate', requireAuth, requireAdmin, async (r
 app.get('/api/stats', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
   try {
-    const [mappings, syncStats] = await Promise.all([
+    const [mappings, syncStats, stockStats] = await Promise.all([
       db.query('SELECT COUNT(*) FROM product_mappings WHERE is_active = true AND user_id = $1', [uid]),
       db.query(
         `SELECT COALESCE(SUM(synced_count), 0) AS synced, COALESCE(SUM(price_changes), 0) AS changed
          FROM daily_sync_stats WHERE user_id = $1 AND date = CURRENT_DATE`,
+        [uid]
+      ),
+      db.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE amazon_in_stock IS DISTINCT FROM false) AS in_stock,
+           COUNT(*) FILTER (WHERE amazon_in_stock = false) AS out_of_stock
+         FROM product_mappings
+         WHERE user_id = $1 AND last_synced_at >= NOW() - INTERVAL '24 hours'`,
         [uid]
       ),
     ]);
@@ -241,6 +249,8 @@ app.get('/api/stats', requireAuth, async (req, res) => {
       activeListings:      parseInt(mappings.rows[0].count),
       syncedLast24h:       parseInt(syncStats.rows[0].synced),
       priceChangesLast24h: parseInt(syncStats.rows[0].changed),
+      stockInLast24h:      parseInt(stockStats.rows[0].in_stock),
+      stockOutLast24h:     parseInt(stockStats.rows[0].out_of_stock),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3255,6 +3265,22 @@ app.get('/api/orders', requireAuth, async (req, res) => {
     );
 
     res.json({ orders: rows, total, limit, offset });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/orders/chart — last-7-day order counts grouped by day and status
+app.get('/api/orders/chart', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows } = await db.query(
+      `SELECT DATE(order_date) AS day, status, COUNT(*)::int AS count
+       FROM onbuy_orders
+       WHERE user_id = $1 AND order_date >= NOW() - INTERVAL '7 days'
+       GROUP BY day, status
+       ORDER BY day`,
+      [uid]
+    );
+    res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

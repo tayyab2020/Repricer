@@ -351,6 +351,7 @@ function DashboardPage({ stats }) {
   const [logsPage, setLogsPage]   = useState(1);
   const [logsStatus, setLogsStatus] = useState("");
   const [logsLoading, setLogsLoading] = useState(false);
+  const [orderBarData, setOrderBarData] = useState([]);
 
   const loadLogs = useCallback((pg = 1, status = "") => {
     setLogsLoading(true);
@@ -363,41 +364,54 @@ function DashboardPage({ stats }) {
 
   useEffect(() => { loadLogs(logsPage, logsStatus); }, [loadLogs, logsPage, logsStatus]);
 
+  // Load last-7-day orders grouped by status for bar chart
+  useEffect(() => {
+    api('/orders/chart')
+      .then(rows => {
+        const map = {};
+        const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled By Seller', 'Cancelled By Buyer'];
+        for (let i = 6; i >= 0; i--) {
+          const d = new Date();
+          d.setDate(d.getDate() - i);
+          const key = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+          map[key] = { date: key };
+          ORDER_STATUSES.forEach(s => { map[key][s] = 0; });
+        }
+        rows.forEach(r => {
+          const key = new Date(r.day).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+          if (map[key] && r.status) map[key][r.status] = (map[key][r.status] || 0) + r.count;
+        });
+        setOrderBarData(Object.values(map));
+      })
+      .catch(console.error);
+  }, []);
+
   const totalPages = Math.max(1, Math.ceil(logsTotal / LOG_PAGE_SIZE));
 
-  // ── Chart data derived from existing logs state (no extra API calls) ──
-  const statusPieData = useMemo(() => {
-    const counts = { success: 0, failed: 0, skipped: 0 };
-    logs.forEach(l => { if (counts[l.status] !== undefined) counts[l.status]++; });
+  // In-stock vs out-of-stock from last 24h syncs (from stats prop)
+  const stockPieData = useMemo(() => {
+    const inStock  = stats?.stockInLast24h  ?? 0;
+    const outStock = stats?.stockOutLast24h ?? 0;
     return [
-      { name: "Success", value: counts.success, color: C.accent },
-      { name: "Failed",  value: counts.failed,  color: C.red },
-      { name: "Skipped", value: counts.skipped, color: C.amber },
+      { name: "In Stock",     value: inStock,  color: C.accent },
+      { name: "Out of Stock", value: outStock, color: C.red },
     ].filter(d => d.value > 0);
-  }, [logs]);
-
-  const dailyBarData = useMemo(() => {
-    const map = {};
-    logs.forEach(l => {
-      const d = new Date(l.created_at).toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
-      if (!map[d]) map[d] = { date: d, Success: 0, Failed: 0, Skipped: 0 };
-      if (l.status === "success")      map[d].Success++;
-      else if (l.status === "failed")  map[d].Failed++;
-      else if (l.status === "skipped") map[d].Skipped++;
-    });
-    return Object.values(map).slice(-7);
-  }, [logs]);
+  }, [stats]);
 
   const priceTrendData = useMemo(() =>
     logs
       .filter(l => l.amazon_price && l.onbuy_price)
       .slice(0, 20)
       .reverse()
-      .map((l, i) => ({
-        i: i + 1,
-        Amazon: parseFloat(l.amazon_price),
-        OnBuy:  parseFloat(l.onbuy_price),
-      })),
+      .map((l, i) => {
+        const name = l.product_name || "";
+        return {
+          i: i + 1,
+          title: name.length > 15 ? name.slice(0, 15) + "…" : name,
+          Amazon: parseFloat(l.amazon_price),
+          OnBuy:  parseFloat(l.onbuy_price),
+        };
+      }),
   [logs]);
 
   const filterBtns = [
@@ -441,21 +455,21 @@ function DashboardPage({ stats }) {
       {/* ── Charts Row: Pie + Line ── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr", gap: 16, marginBottom: 16 }}>
 
-        {/* Status Distribution — Donut Pie */}
+        {/* Stock Status — Donut Pie (last 24h syncs) */}
         <div style={chartCard}>
-          <p style={chartLabel}>Status Distribution</p>
-          {statusPieData.length === 0 ? (
-            <p style={emptyChart}>No data yet — run a sync first.</p>
+          <p style={chartLabel}>Stock Status (Last 24h)</p>
+          {stockPieData.length === 0 ? (
+            <p style={emptyChart}>No sync data in the last 24 hours.</p>
           ) : (
             <ResponsiveContainer width="100%" height={220}>
               <PieChart>
                 <Pie
-                  data={statusPieData}
+                  data={stockPieData}
                   cx="50%" cy="50%"
                   innerRadius={52} outerRadius={88}
                   paddingAngle={3} dataKey="value"
                 >
-                  {statusPieData.map((d, i) => <Cell key={i} fill={d.color} />)}
+                  {stockPieData.map((d, i) => <Cell key={i} fill={d.color} />)}
                 </Pie>
                 <Tooltip {...tooltipStyle} />
                 <Legend
@@ -487,6 +501,7 @@ function DashboardPage({ stats }) {
                 <Tooltip
                   {...tooltipStyle}
                   formatter={v => [`£${parseFloat(v).toFixed(2)}`]}
+                  labelFormatter={(_, payload) => payload?.[0]?.payload?.title || ""}
                 />
                 <Legend iconType="line" wrapperStyle={{ fontSize: 12, color: C.textDim }} />
                 <Line type="monotone" dataKey="Amazon" stroke={C.blue}  strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
@@ -497,22 +512,23 @@ function DashboardPage({ stats }) {
         </div>
       </div>
 
-      {/* ── Daily Sync Activity — Grouped Bar ── */}
+      {/* ── Orders Last 7 Days — Grouped Bar ── */}
       <div style={{ ...chartCard, marginBottom: 24 }}>
-        <p style={chartLabel}>Daily Sync Activity</p>
-        {dailyBarData.length === 0 ? (
-          <p style={emptyChart}>No activity data yet — run a sync first.</p>
+        <p style={chartLabel}>Orders (Last 7 Days)</p>
+        {orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Buyer']) ? (
+          <p style={emptyChart}>No orders in the last 7 days.</p>
         ) : (
           <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={dailyBarData} barSize={12} barGap={2}>
+            <BarChart data={orderBarData} barSize={12} barGap={2}>
               <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false} />
               <XAxis dataKey="date" stroke={C.muted} tick={{ fontSize: 11, fill: C.muted }} />
               <YAxis stroke={C.muted} tick={{ fontSize: 11, fill: C.muted }} allowDecimals={false} width={36} />
               <Tooltip {...tooltipStyle} />
               <Legend iconType="square" iconSize={10} wrapperStyle={{ fontSize: 12, color: C.textDim }} />
-              <Bar dataKey="Success" fill={C.accent} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Failed"  fill={C.red}    radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Skipped" fill={C.amber}  radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Awaiting Dispatch"   fill={C.amber}  radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Dispatched"          fill={C.accent} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Cancelled By Seller" fill={C.red}    radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Cancelled By Buyer"  fill={C.purple} radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         )}
