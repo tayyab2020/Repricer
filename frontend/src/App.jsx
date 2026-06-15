@@ -369,7 +369,7 @@ function DashboardPage({ stats }) {
     api('/orders/chart')
       .then(rows => {
         const map = {};
-        const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled By Seller', 'Cancelled By Buyer'];
+        const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled By Seller', 'Cancelled By Customer'];
         for (let i = 6; i >= 0; i--) {
           const d = new Date();
           d.setDate(d.getDate() - i);
@@ -378,7 +378,9 @@ function DashboardPage({ stats }) {
           ORDER_STATUSES.forEach(s => { map[key][s] = 0; });
         }
         rows.forEach(r => {
-          const key = new Date(r.day).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+          // Append T00:00:00 so the date-only string is parsed as local midnight,
+          // not UTC midnight — prevents a timezone shift that moves orders to the wrong day.
+          const key = new Date(r.day + 'T00:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
           if (map[key] && r.status) map[key][r.status] = (map[key][r.status] || 0) + r.count;
         });
         setOrderBarData(Object.values(map));
@@ -467,7 +469,7 @@ function DashboardPage({ stats }) {
                   data={stockPieData}
                   cx="50%" cy="50%"
                   innerRadius={52} outerRadius={88}
-                  paddingAngle={3} dataKey="value"
+                  paddingAngle={3} dataKey="value" stroke="none"
                 >
                   {stockPieData.map((d, i) => <Cell key={i} fill={d.color} />)}
                 </Pie>
@@ -515,7 +517,7 @@ function DashboardPage({ stats }) {
       {/* ── Orders Last 7 Days — Grouped Bar ── */}
       <div style={{ ...chartCard, marginBottom: 24 }}>
         <p style={chartLabel}>Orders (Last 7 Days)</p>
-        {orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Buyer']) ? (
+        {orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Customer']) ? (
           <p style={emptyChart}>No orders in the last 7 days.</p>
         ) : (
           <ResponsiveContainer width="100%" height={200}>
@@ -528,7 +530,7 @@ function DashboardPage({ stats }) {
               <Bar dataKey="Awaiting Dispatch"   fill={C.amber}  radius={[4, 4, 0, 0]} />
               <Bar dataKey="Dispatched"          fill={C.accent} radius={[4, 4, 0, 0]} />
               <Bar dataKey="Cancelled By Seller" fill={C.red}    radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Cancelled By Buyer"  fill={C.purple} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Cancelled By Customer" fill={C.purple} radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         )}
