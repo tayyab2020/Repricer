@@ -1907,19 +1907,20 @@ async function loadSettingsFromDb() {
 
 app.get('/api/settings', requireAuth, async (req, res) => {
   try {
-    const { rows } = await db.query(
-      'SELECT key, value FROM settings WHERE user_id = $1',
-      [req.effectiveUserId]
-    );
-    const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-    // Load proxy for status display if this user has one configured
+    const [{ rows: userRows }, { rows: themeRows }] = await Promise.all([
+      db.query('SELECT key, value FROM settings WHERE user_id = $1', [req.effectiveUserId]),
+      db.query(`SELECT s.value FROM settings s JOIN users u ON u.id = s.user_id WHERE u.role = 'super_admin' AND s.key = 'app_theme' LIMIT 1`),
+    ]);
+    const s = Object.fromEntries(userRows.map(r => [r.key, r.value]));
+    // app_theme is global — always serve the super admin's value to all users
+    if (themeRows[0]) s.app_theme = themeRows[0].value;
     if (s.webshare_proxy_api) setProxyApiUrl(s.webshare_proxy_api);
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/settings', requireAuth, async (req, res) => {
-  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time'];
+  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time', 'app_theme'];
   const uid = req.effectiveUserId;
   try {
     for (const key of allowed) {

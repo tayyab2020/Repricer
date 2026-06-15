@@ -1119,12 +1119,18 @@ async function processKeepaJob(job) {
     }
   }
 
-  const toFetch   = pendingAsins ?? asins;
-  const quota     = runNumber === 1 ? KEEPA_QUOTA_FULL : KEEPA_HOURLY_FILL;
-  const thisBatch = toFetch.slice(0, quota);
-  let   leftover  = toFetch.slice(quota);
+  const toFetch         = pendingAsins ?? asins;
+  // wasQuotaExhausted=true means the PREVIOUS run hit the ≤5% ceiling and we waited 1 hour
+  // for quota to refill — only 1,800 new tokens are available (5%/hr × 36,000 products).
+  // wasQuotaExhausted=false (initial run or continuation) means quota was NOT exhausted so
+  // we attempt ALL remaining ASINs and let the internal ≤5% pre-batch check stop us naturally.
+  // This prevents the 36,000 hard cap from causing unnecessary 1,800-per-30s drip runs when
+  // the account has >100% quota available.
+  const wasQuotaExhausted = job.data.wasQuotaExhausted ?? false;
+  const thisBatch = wasQuotaExhausted ? toFetch.slice(0, KEEPA_HOURLY_FILL) : toFetch;
+  let   leftover  = wasQuotaExhausted ? toFetch.slice(KEEPA_HOURLY_FILL)    : [];
 
-  log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}`);
+  log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
 
   const cacheKey           = `keepa:prices:${accountId}`;
   const SUB_BATCH          = 1000;          // one Keepa browser session per sub-batch
@@ -1302,6 +1308,7 @@ async function processKeepaJob(job) {
     await keepaQueue.add('prefetch', {
       userId, accountId, asins, asinToMappingIds,
       pendingAsins: leftover, runNumber: nextRun,
+      wasQuotaExhausted: realExhausted,
     }, {
       jobId:            nextJobId,
       delay:            delayMs,

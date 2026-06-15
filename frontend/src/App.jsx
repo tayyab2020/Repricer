@@ -106,7 +106,7 @@ const THEME_PALETTES = {
     C: {
       bg:"#f8fafc", surface:"#ffffff", panel:"#f1f5f9", border:"#e2e8f0",
       accent:"#16a34a", accentDim:"#16a34a15", amber:"#d97706", red:"#dc2626",
-      blue:"#2563eb", purple:"#7c3aed", muted:"#94a3b8", text:"#0f172a", textDim:"#475569",
+      blue:"#2563eb", purple:"#7c3aed", muted:"#64748b", text:"#0f172a", textDim:"#475569",
     },
   },
 };
@@ -2514,14 +2514,14 @@ function AccountsPage() {
     load();
   }
 
-  const fieldStyle = { background:"#0b0f1a", border:`1px solid ${C.border}`, borderRadius:8,
+  const fieldStyle = { background:C.bg, border:`1px solid ${C.border}`, borderRadius:8,
     color:C.text, padding:"9px 12px", fontSize:14, width:"100%" };
   const labelStyle = { color:C.textDim, fontSize:12, letterSpacing:"0.06em",
     textTransform:"uppercase", marginBottom:4, display:"block" };
 
   return (
     <div>
-      <div style={{ background:"#0d1f35", border:`1px solid ${C.blue}33`, borderRadius:10,
+      <div style={{ background:C.surface, border:`1px solid ${C.blue}55`, borderRadius:10,
         padding:"14px 18px", marginBottom:24, display:"flex", gap:12, alignItems:"flex-start" }}>
         <span style={{ fontSize:20 }}>ℹ️</span>
         <div style={{ fontSize:13, color:C.textDim, lineHeight:1.6 }}>
@@ -2688,7 +2688,7 @@ function AccountsPage() {
             : accounts.map(a => {
               const tr = testResult[a.id];
               return (
-                <div key={a.id} style={{ background:"#0b0f1a", border:`1px solid ${C.border}`,
+                <div key={a.id} style={{ background:C.bg, border:`1px solid ${C.border}`,
                   borderRadius:10, padding:"14px 16px", marginBottom:10 }}>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
                     <div>
@@ -2902,23 +2902,23 @@ function LiveLogsPage() {
         fontSize:12, lineHeight:1.6,
       }}>
         {lines.length === 0 && (
-          <div style={{ color:C.muted, textAlign:"center", marginTop:40 }}>
+          <div style={{ color:"#64748b", textAlign:"center", marginTop:40 }}>
             Waiting for log output…
           </div>
         )}
         {lines.map((l, i) => (
           <div key={i} style={{ display:"flex", gap:12, marginBottom:2, wordBreak:"break-all" }}>
-            <span style={{ color:C.muted, flexShrink:0, fontSize:11 }}>
+            <span style={{ color:"#64748b", flexShrink:0, fontSize:11 }}>
               {l.ts ? l.ts.slice(11,19) : ""}
             </span>
             <span style={{
               flexShrink:0, fontSize:10, fontWeight:700, padding:"1px 6px",
               borderRadius:4, background:`${LOG_COLORS[l.source]}22`,
-              color: LOG_COLORS[l.source] || C.muted,
+              color: LOG_COLORS[l.source] || "#64748b",
             }}>
               {LOG_LABELS[l.source] || l.source}
             </span>
-            <span style={{ color: l.source?.includes("err") ? "#fca5a5" : C.text }}>
+            <span style={{ color: l.source?.includes("err") ? "#fca5a5" : "#e2e8f0" }}>
               {l.line}
             </span>
           </div>
@@ -2926,7 +2926,7 @@ function LiveLogsPage() {
         <div ref={bottomRef} />
       </div>
 
-      <p style={{ color:C.muted, fontSize:11, marginTop:8 }}>
+      <p style={{ color:C.textDim, fontSize:11, marginTop:8 }}>
         {import.meta.env.DEV
           ? "Dev mode — streaming scraper.log · Showing last 500 lines · Pause to freeze output"
           : "Showing last 500 lines · Auto-scrolls · Pause to freeze output"}
@@ -3365,7 +3365,7 @@ function ImportPage() {
           <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
             <Section title="Link to OnBuy Account">
               <select value={accountId} onChange={e => setAccountId(e.target.value)}
-                style={{ background:"#0b0f1a", border:`1px solid ${C.border}`, borderRadius:8,
+                style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:8,
                   color:C.text, padding:"9px 12px", fontSize:14, width:"100%" }}>
                 <option value="">— No account linked —</option>
                 {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name} (Site {a.site_id})</option>)}
@@ -3379,7 +3379,7 @@ function ImportPage() {
               <p style={{ color:C.textDim, fontSize:13, marginBottom:10 }}>
                 Download and fill in this template. Columns marked * are required.
               </p>
-              <div style={{ fontSize:12, color:C.muted, background:"#0b0f1a",
+              <div style={{ fontSize:12, color:C.muted, background:C.bg,
                 borderRadius:8, padding:"10px 12px", marginBottom:12 }}>
                 <div style={{ marginBottom:3 }}><span style={{ color:C.red }}>*</span> OnBuy Listing ID</div>
                 <div style={{ marginBottom:3 }}><span style={{ color:C.red }}>*</span> Amazon URL or ASIN</div>
@@ -4356,7 +4356,7 @@ function OnBuyBulkPage() {
             <Section title="Select OnBuy Account">
               <select value={accountId} onChange={e => setAccountId(e.target.value)}
                 style={{
-                  background: "#0b0f1a", border: `1px solid ${C.border}`, borderRadius: 8,
+                  background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
                   color: C.text, padding: "9px 12px", fontSize: 14, width: "100%",
                 }}>
                 <option value="">— Select account —</option>
@@ -4373,7 +4373,7 @@ function OnBuyBulkPage() {
               <p style={{ color: C.textDim, fontSize: 13, marginBottom: 10 }}>
                 Fill in the template and upload it. Columns marked * are required.
               </p>
-              <div style={{ fontSize: 12, color: C.muted, background: "#0b0f1a",
+              <div style={{ fontSize: 12, color: C.muted, background: C.bg,
                 borderRadius: 8, padding: "10px 12px", marginBottom: 12, lineHeight: 1.8 }}>
                 <div><span style={{ color: C.red }}>*</span> Product Name · Category Name</div>
                 <div><span style={{ color: C.red }}>*</span> SKU · Price (£) · Stock</div>
@@ -5336,7 +5336,7 @@ function OrdersPage() {
     setSyncing(false);
   }
 
-  const inputStyle = { background:"#0b0f1a", border:`1px solid ${C.border}`, borderRadius:8,
+  const inputStyle = { background:C.bg, border:`1px solid ${C.border}`, borderRadius:8,
     color:C.text, padding:"8px 12px", fontSize:13 };
 
   return (
@@ -5376,7 +5376,7 @@ function OrdersPage() {
       <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:10, overflow:"hidden" }}>
         <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
           <thead>
-            <tr style={{ background:"#0b0f1a", borderBottom:`1px solid ${C.border}` }}>
+            <tr style={{ background:C.bg, borderBottom:`1px solid ${C.border}` }}>
               {["Order #","Date","Customer","Products","Total","Status","Account"].map(h => (
                 <th key={h} style={{ color:C.muted, fontWeight:600, textAlign:"left",
                   padding:"10px 14px", fontSize:11, letterSpacing:"0.05em" }}>{h}</th>
@@ -5415,7 +5415,7 @@ function OrdersPage() {
                     <td style={{ padding:"10px 14px", color:C.muted, fontSize:12 }}>{o.account_name}</td>
                   </tr>
                   {isOpen && (
-                    <tr style={{ background:"#0b0f1a", borderBottom:`1px solid ${C.border}` }}>
+                    <tr style={{ background:C.bg, borderBottom:`1px solid ${C.border}` }}>
                       <td colSpan={7} style={{ padding:"12px 16px" }}>
                         <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))", gap:8 }}>
                           {products.map((p, i) => (
