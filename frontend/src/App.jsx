@@ -369,7 +369,7 @@ function DashboardPage({ stats }) {
   useEffect(() => {
     api('/orders/chart')
       .then(rows => {
-        const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled By Seller', 'Cancelled By Customer'];
+        const ORDER_STATUSES = ['Awaiting Dispatch', 'Dispatched', 'Cancelled by Seller', 'Cancelled by Customer'];
         // Build map keyed by ISO date string (YYYY-MM-DD) to avoid any Date/timezone parsing issues.
         // Server returns to_char(order_date, 'YYYY-MM-DD') which is always a plain string.
         const map = {};
@@ -526,7 +526,7 @@ function DashboardPage({ stats }) {
       {/* ── Orders Last 7 Days — Grouped Bar ── */}
       <div style={{ ...chartCard, marginBottom: 24 }}>
         <p style={chartLabel}>Orders (Last 7 Days)</p>
-        {orderBarLoaded && orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled By Seller'] && !d['Cancelled By Customer']) ? (
+        {orderBarLoaded && orderBarData.every(d => !d['Awaiting Dispatch'] && !d['Dispatched'] && !d['Cancelled by Seller'] && !d['Cancelled by Customer']) ? (
           <p style={emptyChart}>No orders in the last 7 days.</p>
         ) : !orderBarLoaded ? (
           <p style={emptyChart}>Loading…</p>
@@ -538,10 +538,10 @@ function DashboardPage({ stats }) {
               <YAxis stroke={C.muted} tick={{ fontSize: 11, fill: C.muted }} allowDecimals={false} width={36} />
               <Tooltip {...tooltipStyle} />
               <Legend iconType="square" iconSize={10} wrapperStyle={{ fontSize: 12, color: C.textDim }} />
-              <Bar dataKey="Awaiting Dispatch"   fill={C.amber}  radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Dispatched"          fill={C.accent} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Cancelled By Seller" fill={C.red}    radius={[4, 4, 0, 0]} />
-              <Bar dataKey="Cancelled By Customer" fill={C.purple} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Awaiting Dispatch"    fill={C.amber}  radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Dispatched"           fill={C.accent} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Cancelled by Seller"  fill={C.red}    radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Cancelled by Customer" fill={C.purple} radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         )}
