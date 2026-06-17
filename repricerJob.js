@@ -34,7 +34,7 @@ import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from 'fs'
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, getTokenForAccount } from './jobProducer.js';
 import { getKeepaPrice, createKeepaSession } from './keepaScraper.js';
 
 dotenv.config();
@@ -835,13 +835,16 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   const storedBelowFloor = minRoiFloor != null && last_onbuy_price
     ? parseFloat(last_onbuy_price) < minRoiFloor
     : false;
+  const forceReprice    = userSettings.forceReprice ?? false;
   const alreadyCorrect  = !storedBelowFloor && last_onbuy_price && parseFloat(last_onbuy_price) === newOnBuyPrice;
-  const priceUnchanged  = !hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect;
+  const priceUnchanged  = !forceReprice && !hasPriceChangedSignificantly(last_amazon_price, amazonPrice) && alreadyCorrect;
   // Always enqueue — check-winning adjusts the price even when Amazon hasn't moved.
   // noChangeEnqueue=true tells the batch to skip the PUT if check-winning also makes
   // no adjustment, so unchanged-and-already-winning listings cost zero API calls.
   if (priceUnchanged) {
     ulog(userId, `[Worker] ↩  ${label} — Amazon £${amazonPrice} / OnBuy £${newOnBuyPrice} unchanged — check-winning will adjust if not winning`);
+  } else if (forceReprice && alreadyCorrect) {
+    ulog(userId, `[Worker] 🔄 ${label} — pricing settings changed since last run, forcing reprice`);
   }
 
   // ── Push to OnBuy (batched + rate-limited, fire-and-forget) ──
@@ -1133,8 +1136,9 @@ async function processKeepaJob(job) {
   log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
 
   const cacheKey           = `keepa:prices:${accountId}`;
-  const SUB_BATCH          = 1000;          // one Keepa browser session per sub-batch
-  const FLUSH_PRICE_COUNT  = 1000;          // trigger OnBuy update after this many prices accumulated
+  const SUB_BATCH          = 1800;          // one Keepa browser session per sub-batch (5% hourly quota = 1 800 tokens)
+  const ONBUY_FLUSH_BATCH  = 1000;          // max mapping IDs per runRepricerJob call to OnBuy
+  const FLUSH_PRICE_COUNT  = 1800;          // trigger OnBuy update after a full sub-batch is processed
   const FLUSH_INTERVAL_MS  = 5 * 60 * 1000; // …or after 5 minutes, whichever comes first
 
   let totalPriceCount  = 0;
@@ -1142,19 +1146,24 @@ async function processKeepaJob(job) {
   let lastFlushTime    = Date.now();
   const hasAsinMap     = Object.keys(asinToMappingIds).length > 0;
 
-  // Flush accumulated mapping IDs to the OnBuy pricing phase.
+  // Flush accumulated mapping IDs to the OnBuy pricing phase in ≤1000 batches.
+  // Capping at 1000 keeps each runRepricerJob call within API limits — e.g. a 1800-ASIN
+  // Keepa sub-batch triggers two OnBuy requests (first 1000, then 800).
   // skipCounter=true prevents overwriting the DECRBY-managed counter.
   // fromKeepaFlush=true prevents the fast worker from double-decrementing per job.
   const flushToOnBuy = async (ids) => {
     if (!ids.length) return;
-    log(`[KeepaWorker] Flushing ${ids.length} mapping(s) to OnBuy pricing phase`);
-    try {
-      await runRepricerJob({
-        userId, accountId, mappingIds: ids,
-        skipKeepa: true, skipCounter: true, fromKeepaFlush: true, log,
-      });
-    } catch (err) {
-      log(`[KeepaWorker] OnBuy flush error: ${err.message}`);
+    for (let i = 0; i < ids.length; i += ONBUY_FLUSH_BATCH) {
+      const batch = ids.slice(i, i + ONBUY_FLUSH_BATCH);
+      log(`[KeepaWorker] Flushing ${batch.length} mapping(s) to OnBuy pricing phase (${i + 1}–${i + batch.length} of ${ids.length})`);
+      try {
+        await runRepricerJob({
+          userId, accountId, mappingIds: batch,
+          skipKeepa: true, skipCounter: true, fromKeepaFlush: true, log,
+        });
+      } catch (err) {
+        log(`[KeepaWorker] OnBuy flush error: ${err.message}`);
+      }
     }
   };
 
@@ -1236,15 +1245,13 @@ async function processKeepaJob(job) {
         for (const id of (asinToMappingIds[asin] || [])) pendingMappingIds.push(id);
       }
 
-      // Flush when ≥ FLUSH_PRICE_COUNT prices have accumulated, or 5 min have passed
+      // Flush when a full sub-batch worth of prices has accumulated, or 5 min have passed.
+      // flushToOnBuy splits into ≤1000 per runRepricerJob call internally.
       const byCount = pendingMappingIds.length >= FLUSH_PRICE_COUNT;
       const byTime  = (Date.now() - lastFlushTime) >= FLUSH_INTERVAL_MS;
 
       if (byCount || byTime) {
-        // Time-based: flush everything; count-based: flush first FLUSH_PRICE_COUNT, keep remainder
-        const toFlush = byTime
-          ? pendingMappingIds.splice(0)
-          : pendingMappingIds.splice(0, FLUSH_PRICE_COUNT);
+        const toFlush = pendingMappingIds.splice(0); // flush all pending; splitting handled inside flushToOnBuy
         await flushToOnBuy(toFlush);
         lastFlushTime = Date.now();
       }
@@ -1661,7 +1668,15 @@ async function processBulkImportJob(job) {
   if (!sess?.rows_data) throw new Error(`Session ${sessionId} has no rows_data`);
   const validRows = sess.rows_data;
 
-  // rows_data is kept for export — cleared when user cancels or after 30 days
+  // Guard: abort if a delete-brands job is running for this user
+  const { rows: activeDeleteJobs } = await db.query(
+    `SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [userId]
+  );
+  if (activeDeleteJobs.length) {
+    blog('⚠️  Delete Restricted Brands job is running — aborting bulk import to prevent conflicts');
+    await db.query(`UPDATE onbuy_bulk_import_sessions SET status='failed', completed_at=NOW() WHERE id=$1`, [sessionId]);
+    return;
+  }
 
   // Get fresh account + token
   const { rows: [account] } = await db.query(
@@ -1922,6 +1937,13 @@ async function processBulkImportJob(job) {
   }
   blog(`Phase 1 complete: ${existingMeta.length} existing, ${newMeta.length} new`);
 
+  // Abort if the user cancelled while Phase 1 was running
+  async function checkCancelled() {
+    const { rows: [s] } = await db.query(`SELECT status FROM onbuy_bulk_import_sessions WHERE id=$1`, [sessionId]);
+    if (s?.status === 'cancelled') throw Object.assign(new Error('Session cancelled by user'), { _cancelled: true });
+  }
+  await checkCancelled();
+
   // ── Phase 2: Create new products ──
   const queueItems = [];
   for (const m of newMeta) {
@@ -2038,8 +2060,10 @@ async function processBulkImportJob(job) {
   // skips updating them — the Phase 2 POST already sent all required fields.
   const newlyCreatedMeta = [];
   if (queueItems.length > 0) {
+    await checkCancelled();
     blog(`Phase 3: waiting 15 s before polling ${queueItems.length} queue(s)…`);
     await new Promise(res => setTimeout(res, 15_000));
+    await checkCancelled();
     const pendingToSave = [];
     const eanRetries   = []; // collected during poll; sent in batch after all queues are processed
     for (let i = 0; i < queueItems.length; i += 1000) {
@@ -2132,7 +2156,7 @@ async function processBulkImportJob(job) {
         ).catch(e => blog(`Failed to save pending queue ${queueId}: ${e.message}`));
       }
       results.pending_queues = pendingToSave.length;
-      db.query(`UPDATE onbuy_bulk_import_sessions SET pending_queues=$1 WHERE id=$2`, [pendingToSave.length, sessionId]).catch(() => {});
+      db.query(`UPDATE onbuy_bulk_import_sessions SET pending_queues=$1 WHERE id=$2 AND status!='cancelled'`, [pendingToSave.length, sessionId]).catch(() => {});
       await queuePollerQueue.add('poll', {}, { jobId: `queue-poller-${Date.now()}`, delay: 30*60*1000, removeOnComplete: true, removeOnFail: true, attempts: 1 }).catch(() => {});
     }
   }
@@ -2142,6 +2166,7 @@ async function processBulkImportJob(job) {
     [results.product_created, results.skipped, results.errors.length, sessionId]
   ).catch(() => {});
 
+  await checkCancelled();
   // ── Phase 3.5: Update pre-existing products only ──
   // Newly created products (newlyCreatedMeta) are skipped — Phase 2 already sent all fields.
   const toUpdate = existingMeta.filter(m => m.opc);
@@ -2179,6 +2204,7 @@ async function processBulkImportJob(job) {
     }
   }
 
+  await checkCancelled();
   // ── Phase 4: Create listings ──
   // Covers both pre-existing products (existingMeta) and newly created ones (newlyCreatedMeta).
   const allListingMeta = [...existingMeta, ...newlyCreatedMeta];
@@ -2266,11 +2292,15 @@ async function processBulkImportJob(job) {
 
   // Finalize session
   await db.query(
-    `UPDATE onbuy_bulk_import_sessions SET products_created=$1, listings_created=$2, listings_updated=$3, skipped=$4, errors_count=$5, status='completed', completed_at=NOW() WHERE id=$6`,
+    `UPDATE onbuy_bulk_import_sessions SET products_created=$1, listings_created=$2, listings_updated=$3, skipped=$4, errors_count=$5, status='completed', completed_at=NOW() WHERE id=$6 AND status!='cancelled'`,
     [results.product_created, results.listing_created, results.listing_updated, results.skipped, results.errors.length, sessionId]
   );
   blog(`Import complete — products:${results.product_created} listings:${results.listing_created} skipped:${results.skipped} errors:${results.errors.length}`);
   } catch (err) {
+    if (err._cancelled) {
+      blog('Session cancelled by user — job aborted cleanly');
+      return; // do not mark as failed; DB already has status='cancelled'
+    }
     blog(`Fatal error: ${err.message}`);
     console.error(`[BulkImport][session=${sessionId}] Fatal error:`, err.message);
     try {
@@ -2289,6 +2319,154 @@ const bulkImportWorker = new Worker('bulk-import', processBulkImportJob, {
 });
 bulkImportWorker.on('failed', (job, err) =>
   console.error(`[BulkImport] ❌ job ${job?.id} failed: ${err.message}`)
+);
+
+// ── Delete Restricted Brands Worker ──────────────────────────────────────────
+
+async function processDeleteBrandsJob(job) {
+  const { jobId, userId } = job.data;
+  const logFile = join(LOGS_DIR, `user-${userId}-delete-brands.log`);
+
+  function dlog(message, level = 'info') {
+    rotatingAppend(logFile, `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}\n`);
+    console.log(`[DeleteBrands][job=${jobId}]`, message);
+    db.query(
+      `INSERT INTO onbuy_delete_brand_job_logs (job_id, user_id, message, level) VALUES ($1, $2, $3, $4)`,
+      [jobId, userId, message, level]
+    ).catch(() => {});
+  }
+
+  async function checkCancelled() {
+    const { rows: [j] } = await db.query(`SELECT status FROM onbuy_delete_brand_jobs WHERE id=$1`, [jobId]);
+    if (j?.status === 'cancelled') throw Object.assign(new Error('Job cancelled'), { _cancelled: true });
+  }
+
+  try {
+    const { rows: brandRows } = await db.query(`SELECT brand_name FROM restricted_brands WHERE user_id=$1`, [userId]);
+    if (!brandRows.length) throw new Error('No restricted brands found');
+    const brandNames = brandRows.map(r => r.brand_name);
+    await db.query(`UPDATE onbuy_delete_brand_jobs SET brands_count=$1 WHERE id=$2`, [brandNames.length, jobId]);
+    dlog(`Starting — ${brandNames.length} restricted brand(s): ${brandNames.join(', ')}`);
+
+    const { rows: accounts } = await db.query(
+      `SELECT * FROM onbuy_accounts WHERE user_id=$1 AND is_active=true`, [userId]
+    );
+    if (!accounts.length) throw new Error('No active OnBuy accounts found');
+
+    for (const account of accounts) {
+      await checkCancelled();
+      dlog(`── Account: ${account.account_name} ──`);
+
+      let token = await getTokenForAccount(account, { log: (...a) => dlog(a.join(' '), 'warn') });
+      if (!token) { dlog(`Could not get token for ${account.account_name} — skipping`, 'error'); continue; }
+      const siteId = parseInt(account.site_id) || 2000;
+
+      // ── Pass 1: DB lookup — find SKUs imported via this tool whose brand matches a restricted brand ──
+      const brandNamesLower = brandNames.map(b => b.toLowerCase());
+      const { rows: dbMatches } = await db.query(
+        `SELECT DISTINCT i.sku
+         FROM onbuy_bulk_import_items i
+         JOIN onbuy_bulk_import_sessions s ON i.session_id = s.id
+         WHERE i.user_id = $1
+           AND s.account_id = $2
+           AND i.sku IS NOT NULL
+           AND LOWER(i.brand) = ANY($3::text[])`,
+        [userId, account.id, brandNamesLower]
+      );
+      const toDeleteSet = new Set(dbMatches.map(r => r.sku));
+      await db.query(`UPDATE onbuy_delete_brand_jobs SET opcs_found=$1 WHERE id=$2`, [toDeleteSet.size, jobId]);
+      dlog(`Pass 1 (DB lookup) — ${toDeleteSet.size} SKU(s) matched via imported items`);
+
+      // ── Pass 2: listing title scan — check brand name as substring in listing title ──
+      dlog('Pass 2: scanning all listings for brand names in title…');
+      let lOffset = 0, lTotal = Infinity;
+
+      while (lOffset < lTotal) {
+        await checkCancelled();
+        let r;
+        try {
+          r = await fetch(
+            `https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=1000&offset=${lOffset}`,
+            { headers: { Authorization: token } }
+          );
+        } catch (e) { dlog(`Error scanning listings: ${e.message}`, 'error'); break; }
+
+        if (r.status === 429) {
+          dlog('Rate limit (429) while scanning listings — waiting 1 hour', 'warn');
+          await new Promise(res => setTimeout(res, 3_600_000));
+          const t = await getTokenForAccount(account); if (t) token = t;
+          continue;
+        }
+        if (r.status === 500) {
+          dlog(`HTTP 500 while scanning listings at offset ${lOffset} — retrying in 10s`, 'warn');
+          await new Promise(res => setTimeout(res, 10_000));
+          continue;
+        }
+        if (!r.ok) { dlog(`HTTP ${r.status} while scanning listings — stopping scan`, 'error'); break; }
+
+        let data;
+        try { data = await r.json(); } catch (e) { dlog(`JSON error: ${e.message}`, 'error'); break; }
+
+        const listings = data.results ?? data.payload ?? data.listings ?? (Array.isArray(data) ? data : []);
+        if (!listings.length) break;
+        lTotal = parseInt(data.metadata?.total_rows ?? listings.length);
+
+        let newThisPage = 0;
+        for (const listing of listings) {
+          const sku   = listing.sku || listing.seller_sku;
+          const title = (listing.name || listing.product_name || listing.title || '').toLowerCase();
+          if (!sku || toDeleteSet.has(sku)) continue;
+          if (brandNamesLower.some(b => title.includes(b))) {
+            toDeleteSet.add(sku);
+            newThisPage++;
+          }
+        }
+        lOffset += listings.length;
+        await db.query(`UPDATE onbuy_delete_brand_jobs SET listings_scanned=$1, opcs_found=$2 WHERE id=$3`, [lOffset, toDeleteSet.size, jobId]);
+        dlog(`Scanned ${lOffset}/${lTotal} listings — ${toDeleteSet.size} flagged for deletion${newThisPage ? ` (+${newThisPage} this page)` : ''}`);
+        if (lOffset >= lTotal) break;
+      }
+
+      const toDelete = [...toDeleteSet];
+      dlog(`Scan complete — ${toDelete.length} listing(s) to delete (Pass 1: ${dbMatches.length}, Pass 2 additions: ${toDelete.length - dbMatches.length})`);
+
+      // ── Phase 3: delete in batches of 1000 ──
+      let deleted = 0;
+      for (let i = 0; i < toDelete.length; i += 1000) {
+        await checkCancelled();
+        const batch = toDelete.slice(i, i + 1000);
+        try {
+          await fetch('https://api.onbuy.com/v2/listings/by-sku', {
+            method: 'DELETE',
+            headers: { Authorization: token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ site_id: siteId, skus: batch }),
+          });
+          deleted += batch.length;
+          await db.query(`UPDATE onbuy_delete_brand_jobs SET listings_deleted=$1 WHERE id=$2`, [deleted, jobId]);
+          dlog(`Deleted ${deleted}/${toDelete.length} listings`);
+        } catch (e) { dlog(`Delete batch error: ${e.message}`, 'error'); }
+      }
+
+      dlog(`Account ${account.account_name} done — deleted ${deleted} listings`);
+    }
+
+    await db.query(`UPDATE onbuy_delete_brand_jobs SET status='completed', completed_at=NOW() WHERE id=$1`, [jobId]);
+    dlog('All accounts processed — job complete');
+
+  } catch (err) {
+    if (err._cancelled) { dlog('Job cancelled by user'); return; }
+    dlog(`Fatal error: ${err.message}`, 'error');
+    await db.query(`UPDATE onbuy_delete_brand_jobs SET status='failed', completed_at=NOW() WHERE id=$1`, [jobId]).catch(() => {});
+    throw err;
+  }
+}
+
+const deleteBrandsWorker = new Worker('delete-brands', processDeleteBrandsJob, {
+  connection:  redis,
+  concurrency: 1,
+});
+deleteBrandsWorker.on('failed', (job, err) =>
+  console.error(`[DeleteBrands] ❌ job ${job?.id} failed: ${err.message}`)
 );
 
 // ─────────────────────────────────────────────

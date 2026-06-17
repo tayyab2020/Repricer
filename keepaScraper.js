@@ -37,7 +37,7 @@ puppeteer.use(StealthPlugin());
 
 const KEEPA_HOME   = 'https://keepa.com/#!';
 const KEEPA_VIEWER = 'https://keepa.com/#!viewer';
-const BATCH_SIZE   = 1000;
+const BATCH_SIZE   = 1800;
 
 const _sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -127,9 +127,11 @@ export async function getKeepaPrice(asins, { email, password, log = console.log 
   const session = await createKeepaSession(email, password, log);
   const results = {};
   try {
-    // Check quota before any scraping — ≤5% means ~0 products can be fetched
+    // Check quota before any scraping.
+    // At exactly 5% quota = 1,800 tokens = one full batch → allow it through.
+    // Below 5% = not enough for a full batch → defer and wait for the hourly refill.
     const quotaPct = await session.checkQuota();
-    if (quotaPct !== null && quotaPct <= 5) {
+    if (quotaPct !== null && quotaPct < 5) {
       const err = new Error('KEEPA_QUOTA_EXHAUSTED');
       err.quota = quotaPct;
       throw err;

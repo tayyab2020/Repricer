@@ -3656,12 +3656,13 @@ function OnBuyBulkPage() {
   const [catExportLoading, setCatExportLoading] = useState(false);
   const [restrictedBrands, setRestrictedBrands]         = useState({ count: 0 });
   const [rbUploading, setRbUploading]                   = useState(false);
-  const [deleteJobRunning, setDeleteJobRunning]          = useState(false);
-  const [deleteJobLog, setDeleteJobLog]                  = useState([]);
+  const [liveJobData, setLiveJobData]                   = useState(null); // { job, logs }
+  const liveLogsPollRef                                  = useRef(null);
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
     api("/restricted-brands").then(d => { if (d) setRestrictedBrands(d); }).catch(() => {});
+    api("/delete-brands/active").then(d => { if (d) setLiveJobData(d); }).catch(() => {});
     // Load global pending queue status on mount and start live poll if queues exist
     api("/onbuy-bulk/pending-queue-status").then(s => {
       if (s && parseInt(s.pending) > 0) { setPendingStatus(s); startPendingPoll(); }
@@ -3678,7 +3679,21 @@ function OnBuyBulkPage() {
 
   useEffect(() => {
     if (tab === "history") loadHistory();
+    if (tab === "logs") {
+      fetchLiveJob();
+      liveLogsPollRef.current = setInterval(fetchLiveJob, 5000);
+    } else {
+      if (liveLogsPollRef.current) { clearInterval(liveLogsPollRef.current); liveLogsPollRef.current = null; }
+    }
+    return () => { if (liveLogsPollRef.current) { clearInterval(liveLogsPollRef.current); liveLogsPollRef.current = null; } };
   }, [tab]);
+
+  async function fetchLiveJob() {
+    try {
+      const data = await api("/delete-brands/active");
+      if (data) setLiveJobData(data);
+    } catch {}
+  }
 
   // Start polling pending queue status every 30 s when there are pending queues
   function startPendingPoll() {
@@ -3800,33 +3815,21 @@ function OnBuyBulkPage() {
   }
 
   async function runDeleteRestrictedJob() {
-    if (!window.confirm("This will scan ALL your OnBuy listings and delete any that match restricted brands. Continue?")) return;
-    setDeleteJobRunning(true);
-    setDeleteJobLog([]);
+    if (!window.confirm("This will search all OnBuy product catalogues for restricted brands and delete matching listings. This runs in the background and may take a long time. Continue?")) return;
     try {
-      const token = localStorage.getItem("repricer_token");
-      const r = await fetch(`${API}/restricted-brands/delete-job`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } });
-      if (!r.ok) { const t = await r.text(); let d; try { d = JSON.parse(t); } catch {}; throw new Error(d?.error || t); }
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const parts = buf.split("\n\n");
-        buf = parts.pop();
-        for (const part of parts) {
-          const line = part.replace(/^data: /, "").trim();
-          if (!line) continue;
-          try {
-            const ev = JSON.parse(line);
-            setDeleteJobLog(prev => [...prev, ev]);
-          } catch {}
-        }
+      const data = await api("/restricted-brands/delete-job", { method: "POST" });
+      if (data?.jobId) {
+        setTab("logs");
+        await fetchLiveJob();
       }
-    } catch (e) { alert("Job failed: " + e.message); }
-    setDeleteJobRunning(false);
+    } catch (e) { alert("Failed to start job: " + (e.message || "Unknown error")); }
+  }
+
+  async function cancelDeleteJob(jobId) {
+    try {
+      await api(`/delete-brands/${jobId}/cancel`, { method: "POST" });
+      await fetchLiveJob();
+    } catch (e) { alert("Cancel failed: " + e.message); }
   }
 
   async function exportSession(sessionId, type) {
@@ -3991,8 +3994,8 @@ function OnBuyBulkPage() {
       )}
 
       {/* Tab switcher */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 24, borderBottom: `1px solid ${C.border}`, paddingBottom: 0, alignItems: "center" }}>
-        {[["import","📦 Import"], ["history","📋 History"]].map(([t, label]) => (
+      <div style={{ display: "flex", gap: 4, marginBottom: 0, borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
+        {[["import","📦 Import"], ["history","📋 History"], ["logs","📊 Live Logs"]].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)} style={{
             background: "none", border: "none", cursor: "pointer",
             padding: "8px 18px", fontSize: 14, fontWeight: 600,
@@ -4001,14 +4004,17 @@ function OnBuyBulkPage() {
             marginBottom: -1, transition: "color 0.15s",
           }}>{label}</button>
         ))}
-        <div style={{ flex: 1 }} />
+      </div>
+
+      {/* Action toolbar — restricted brands & utilities */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "12px 0", marginBottom: 16, borderBottom: `1px solid ${C.border}` }}>
         <button
           onClick={downloadRestrictedBrandsTemplate}
-          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}
+          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
         >
           <span style={{ fontSize: 13 }}>📋</span> Restricted Brands Template
         </button>
-        <label style={{ cursor: rbUploading ? "not-allowed" : "pointer", marginBottom: 4 }}>
+        <label style={{ cursor: rbUploading ? "not-allowed" : "pointer" }}>
           <input type="file" accept=".xlsx,.csv" style={{ display: "none" }} onChange={uploadRestrictedBrands} disabled={rbUploading} />
           <span style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: rbUploading ? C.muted : C.text, padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ fontSize: 13 }}>{rbUploading ? "⏳" : "📤"}</span>
@@ -4017,12 +4023,13 @@ function OnBuyBulkPage() {
         </label>
         <button
           onClick={runDeleteRestrictedJob}
-          disabled={deleteJobRunning || !restrictedBrands.count}
-          style={{ background: deleteJobRunning ? C.surface : "#ef444415", border: `1px solid ${deleteJobRunning || !restrictedBrands.count ? C.border : "#ef444466"}`, borderRadius: 6, color: deleteJobRunning || !restrictedBrands.count ? C.muted : "#ef4444", cursor: deleteJobRunning || !restrictedBrands.count ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}
+          disabled={liveJobData?.job?.status === "running" || !restrictedBrands.count}
+          style={{ background: liveJobData?.job?.status === "running" ? C.surface : "#ef444415", border: `1px solid ${liveJobData?.job?.status === "running" || !restrictedBrands.count ? C.border : "#ef444466"}`, borderRadius: 6, color: liveJobData?.job?.status === "running" || !restrictedBrands.count ? C.muted : "#ef4444", cursor: liveJobData?.job?.status === "running" || !restrictedBrands.count ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
         >
-          <span style={{ fontSize: 13 }}>{deleteJobRunning ? "⏳" : "🗑️"}</span>
-          {deleteJobRunning ? "Scanning & Deleting…" : "Delete Restricted Brand Listings"}
+          <span style={{ fontSize: 13 }}>{liveJobData?.job?.status === "running" ? "⏳" : "🗑️"}</span>
+          {liveJobData?.job?.status === "running" ? "Job Running…" : "Delete Restricted Brand Listings"}
         </button>
+        <div style={{ flex: 1 }} />
         <button
           onClick={downloadCategoriesSheet}
           disabled={catExportLoading}
@@ -4033,7 +4040,6 @@ function OnBuyBulkPage() {
             cursor: catExportLoading ? "not-allowed" : "pointer",
             padding: "5px 13px", fontSize: 12, fontWeight: 600,
             display: "flex", alignItems: "center", gap: 6,
-            marginBottom: 4,
           }}
         >
           {catExportLoading
@@ -4043,23 +4049,70 @@ function OnBuyBulkPage() {
         </button>
       </div>
 
-      {/* ── Delete Restricted Brands Job Log ── */}
-      {deleteJobLog.length > 0 && (
-        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 20, fontSize: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 8, color: C.text }}>🗑️ Delete Restricted Brands Job</div>
-          <div style={{ maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
-            {deleteJobLog.map((ev, i) => (
-              <div key={i} style={{ color: ev.type === "error" ? C.red : ev.type === "done" ? "#22c55e" : C.muted }}>
-                {ev.type === "account"   && `📦 Processing account: ${ev.name}`}
-                {ev.type === "progress"  && `🔍 Scanned ${ev.scanned} listings — ${ev.found} restricted found`}
-                {ev.type === "deleted"   && `🗑️ Deleted ${ev.count} listings (total: ${ev.total})`}
-                {ev.type === "error"     && `❌ ${ev.message}`}
-                {ev.type === "done"      && `✅ Done — Scanned ${ev.totalScanned}, deleted ${ev.totalDeleted} listings`}
+      {/* ── Live Logs Tab ── */}
+      {tab === "logs" && (() => {
+        const job  = liveJobData?.job;
+        const logs = liveJobData?.logs ?? [];
+        const isRunning = job?.status === "running";
+        const statusColor = job?.status === "completed" ? C.accent : job?.status === "failed" ? C.red : job?.status === "cancelled" ? C.amber : C.info;
+        return (
+          <div>
+            {!job ? (
+              <div style={{ textAlign: "center", padding: 48, color: C.muted, border: `1px dashed ${C.border}`, borderRadius: 12 }}>
+                <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>No delete brands job found</div>
+                <div style={{ fontSize: 13 }}>Use the "Delete Restricted Brand Listings" button to start a job.</div>
               </div>
-            ))}
+            ) : (
+              <>
+                <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                    <div style={{ fontWeight: 700, fontSize: 15, color: C.text }}>
+                      {isRunning ? "⏳" : job.status === "completed" ? "✅" : job.status === "cancelled" ? "🚫" : "❌"}&nbsp;
+                      Delete Restricted Brands Job #{job.id}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, background: statusColor + "22", color: statusColor, border: `1px solid ${statusColor}44`, borderRadius: 20, padding: "2px 10px" }}>
+                        {(job.status || "").toUpperCase()}
+                      </span>
+                      {isRunning && (
+                        <button onClick={() => cancelDeleteJob(job.id)} style={{ background: "#ef444415", border: "1px solid #ef444466", borderRadius: 6, color: "#ef4444", cursor: "pointer", padding: "4px 12px", fontSize: 12, fontWeight: 600 }}>
+                          Cancel
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
+                    {[["Brands", job.brands_count], ["Matched (Total)", job.opcs_found], ["Listings Scanned", job.listings_scanned], ["Listings Deleted", job.listings_deleted]].map(([label, val]) => (
+                      <div key={label} style={{ background: C.bg, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+                        <div style={{ fontSize: 20, fontWeight: 700, color: C.text }}>{val ?? 0}</div>
+                        <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 11, color: C.muted }}>
+                    Started: {new Date(job.created_at).toLocaleString()}
+                    {job.completed_at && ` · Finished: ${new Date(job.completed_at).toLocaleString()}`}
+                    {isRunning && " · Auto-refreshes every 5s"}
+                  </div>
+                </div>
+                <div style={{ background: "#0a0f1a", border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, fontFamily: "monospace", fontSize: 11 }}>
+                  <div style={{ color: C.muted, marginBottom: 8, fontSize: 11, fontWeight: 700 }}>JOB LOGS</div>
+                  <div style={{ maxHeight: 400, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                    {logs.length === 0 && <div style={{ color: C.muted }}>No logs yet…</div>}
+                    {logs.map((log, i) => (
+                      <div key={i} style={{ color: log.level === "error" ? "#f87171" : log.level === "warn" ? "#fbbf24" : "#86efac", wordBreak: "break-word" }}>
+                        <span style={{ color: "#4b5563", marginRight: 8 }}>{new Date(log.created_at).toLocaleTimeString()}</span>
+                        {log.message}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── History Tab ── */}
       {tab === "history" && (

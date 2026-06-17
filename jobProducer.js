@@ -29,7 +29,8 @@ export const fastQueue        = new Queue('repricer-fast',  { connection: redis 
 export const slowQueue        = new Queue('repricer-slow',  { connection: redis });
 export const keepaQueue       = new Queue('keepa-scrape',   { connection: redis });
 export const queuePollerQueue = new Queue('queue-poller',   { connection: redis });
-export const bulkImportQueue  = new Queue('bulk-import',    { connection: redis });
+export const bulkImportQueue    = new Queue('bulk-import',    { connection: redis });
+export const deleteBrandsQueue  = new Queue('delete-brands',  { connection: redis });
 
 export async function getTokenForAccount(account, { retries = 2, log = null } = {}) {
   const label = account.account_name || `id=${account.id}`;
@@ -140,6 +141,21 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
       for (const r of sRows) {
         if (!userSettingsMap[r.user_id]) userSettingsMap[r.user_id] = {};
         userSettingsMap[r.user_id][r.key] = r.value;
+      }
+    }
+
+    // Query the most recent repricer completion per (user, account) so we can detect whether
+    // pricing settings changed after the last run and force-reprice all listings if so.
+    const lastRepricedMap = {};
+    if (userIds.length) {
+      const { rows: lrRows } = await db.query(
+        `SELECT user_id, onbuy_account_id, MAX(last_repriced_at) AS last_repriced_at
+         FROM daily_sync_stats WHERE user_id = ANY($1)
+         GROUP BY user_id, onbuy_account_id`,
+        [userIds]
+      );
+      for (const r of lrRows) {
+        lastRepricedMap[`${r.user_id}:${r.onbuy_account_id}`] = r.last_repriced_at;
       }
     }
 
@@ -258,6 +274,21 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
       }
     }
 
+    // Guard: skip repricing for any user who has a delete-brands job running
+    const pricingUserIds = [...new Set(pricingMappings.map(m => m.user_id).filter(Boolean))];
+    if (pricingUserIds.length) {
+      const { rows: deletingUsers } = await db.query(
+        `SELECT DISTINCT user_id FROM onbuy_delete_brand_jobs WHERE user_id = ANY($1) AND status = 'running'`,
+        [pricingUserIds]
+      );
+      if (deletingUsers.length) {
+        const blocked = new Set(deletingUsers.map(r => r.user_id));
+        const before  = pricingMappings.length;
+        pricingMappings = pricingMappings.filter(m => !blocked.has(m.user_id));
+        jlog(`[Job] ⚠️  Skipped repricing for ${before - pricingMappings.length} mapping(s) — Delete Restricted Brands job running for user(s): ${[...blocked].join(', ')}`);
+      }
+    }
+
     const jobs = [];
     let skippedNoToken = 0;
 
@@ -270,14 +301,18 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
       if (!token) { skippedNoToken++; continue; }
 
       const us = userSettingsMap[mapping.user_id] || {};
+      const pricingUpdatedAt = us.pricing_settings_updated_at || null;
+      const lastRepriced     = lastRepricedMap[`${mapping.user_id}:${mapping.onbuy_account_id ?? 0}`] ?? null;
+      const forceReprice     = !!(pricingUpdatedAt && (!lastRepriced || new Date(pricingUpdatedAt) > new Date(lastRepriced)));
       const userSettings = {
         feeRate:          us.onbuy_fee_percent   ? parseFloat(us.onbuy_fee_percent)   / 100 : null,
         defaultRoi:       us.default_roi_percent ? parseFloat(us.default_roi_percent)        : null,
         minRoiPercent:    us.min_roi_percent     ? parseFloat(us.min_roi_percent)            : null,
         proxyApiUrl:      us.webshare_proxy_api  || null,
-        enablePuppeteer: mapping.acct_enable_puppeteer === true,
-        enableTwister:   mapping.acct_enable_twister   === true,
-        enableCheerio:   mapping.acct_enable_cheerio   === true,
+        enablePuppeteer:  mapping.acct_enable_puppeteer === true,
+        enableTwister:    mapping.acct_enable_twister   === true,
+        enableCheerio:    mapping.acct_enable_cheerio   === true,
+        forceReprice,
       };
 
       jobs.push({
@@ -312,6 +347,26 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
     const CHUNK = 500;
     for (let i = 0; i < jobs.length; i += CHUNK) {
       await fastQueue.addBulk(jobs.slice(i, i + CHUNK));
+    }
+
+    // Stamp last_repriced_at for each (user, account) pair that had jobs enqueued.
+    // This is read on the next run to decide whether pricing settings changed since
+    // the last run and a force-reprice is needed. Must be written AFTER forceReprice
+    // was already computed above, so the current run's flag is unaffected.
+    const enqueuedAccounts = new Set();
+    for (const j of jobs) {
+      const uid = j.data.mapping.user_id;
+      const aid = j.data.mapping.onbuy_account_id ?? 0;
+      if (uid) enqueuedAccounts.add(`${uid}:${aid}`);
+    }
+    for (const key of enqueuedAccounts) {
+      const [eUid, eAid] = key.split(':').map(Number);
+      db.query(
+        `INSERT INTO daily_sync_stats (user_id, onbuy_account_id, date, last_repriced_at)
+         VALUES ($1, $2, CURRENT_DATE, NOW())
+         ON CONFLICT (user_id, onbuy_account_id, date) DO UPDATE SET last_repriced_at = NOW()`,
+        [eUid, eAid]
+      ).catch(() => {});
     }
 
     // Write per-user running counts — skipped for Keepa-flush calls because the

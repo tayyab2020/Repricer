@@ -367,7 +367,7 @@ function rowObjToArray(obj, headers) {
 }
 
 // ── Google Sheets sync ────────────────────────────────────────────────────────
-async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
+async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preComputedDispatchCount = null) {
   if (!account.google_sheet_id || !account.google_service_account) return;
 
   let creds;
@@ -400,6 +400,26 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
   const meta     = (await sheets.spreadsheets.get({ spreadsheetId })).data;
   const knownTabs = new Set((meta.sheets ?? []).map(s => s.properties?.title));
   const tabIdMap  = new Map((meta.sheets ?? []).map(s => [s.properties?.title, s.properties?.sheetId]));
+
+  // When there are no recently-synced orders (quiet period) but we have a pre-computed
+  // dispatch count, still update V1 on the current month's tab so the counter is current.
+  if (byTab.size === 0 && preComputedDispatchCount !== null) {
+    const currentTabName = monthTabName();
+    if (knownTabs.has(currentTabName)) {
+      try {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `'${currentTabName}'!V1`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[`Total Dispatch: ${preComputedDispatchCount}`]] },
+        });
+        log(`No recent orders — updated Total Dispatch: ${preComputedDispatchCount}`);
+      } catch (e) {
+        log(`Dispatch counter update error: ${e.message}`);
+      }
+    }
+    return;
+  }
 
   for (const [tabName, items] of byTab) {
     try {
@@ -483,28 +503,29 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log) {
       }
       const rowCursor = new Map(); // orderId → how many items consumed so far
 
-      // Count unique orders whose expected_dispatch_date is today → update V1 (merged V1:W1)
-      // Use Europe/London timezone — OnBuy expected_dispatch_date is in UK local time
-      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date()); // YYYY-MM-DD
-      const seenDispatchIds = new Set();
-      const todayDispatchOrderIds = [];
-      for (const { order } of items) {
-        if (seenDispatchIds.has(order.order_id)) continue;
-        seenDispatchIds.add(order.order_id);
-        const rawData  = typeof order.raw_data === 'string'
-          ? JSON.parse(order.raw_data) : (order.raw_data ?? {});
-        if (rawData.dispatched || order.is_dispatched) continue;
-        const orderStatus = (rawData.status ?? order.status ?? '');
-        if (orderStatus !== 'Awaiting Dispatch') continue;
-        const products = Array.isArray(rawData.products) ? rawData.products : [];
-        const hasToday = products.some(p => {
-          const edd = p.expected_dispatch_date ?? '';
-          return edd && edd.toString().startsWith(todayStr);
-        });
-        if (hasToday) todayDispatchOrderIds.push(order.order_id);
+      // Count unique orders whose expected_dispatch_date is today → update V1 (merged V1:W1).
+      // Use the caller-supplied count when available (computed from all DB orders, not just
+      // the current sync batch). Fall back to computing from items for backward compatibility.
+      let todayDispatchCount;
+      if (preComputedDispatchCount !== null && tabName === monthTabName()) {
+        todayDispatchCount = preComputedDispatchCount;
+      } else {
+        const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date());
+        const seenDispatchIds = new Set();
+        todayDispatchCount = 0;
+        for (const { order } of items) {
+          if (seenDispatchIds.has(order.order_id)) continue;
+          seenDispatchIds.add(order.order_id);
+          const rawData = typeof order.raw_data === 'string'
+            ? JSON.parse(order.raw_data) : (order.raw_data ?? {});
+          if (rawData.dispatched || order.is_dispatched) continue;
+          if ((rawData.status ?? order.status ?? '') !== 'Awaiting Dispatch') continue;
+          const products = Array.isArray(rawData.products) ? rawData.products : [];
+          if (products.some(p => (p.expected_dispatch_date ?? '').toString().startsWith(todayStr))) {
+            todayDispatchCount++;
+          }
+        }
       }
-      const todayDispatchCount = todayDispatchOrderIds.length;
-      log(`Today dispatch orders (${todayDispatchCount}): ${todayDispatchOrderIds.join(', ') || 'none'}`);
       await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `'${tabName}'!V1`,
@@ -1020,17 +1041,65 @@ async function syncAccount(db, account, { fullSync = false } = {}) {
     if (account.google_sheet_id && account.google_service_account) {
       log('Syncing to Google Sheets...');
       const currentTab = monthTabName();
-      const monthIds   = orders.filter(o => tabForOrder(o) === currentTab).map(o => o.order_id);
 
+      // ── Compute today's dispatch count from ALL relevant DB orders ────────────
+      // We always query the DB (not the recently-fetched batch) so the counter is
+      // accurate even when no orders were modified in the last 25 minutes.
+      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date());
+      const [todayY, todayM, todayD] = todayStr.split('-').map(Number);
+
+      // Start from the first day of the current month
+      let dispatchFromDate = `${todayY}-${String(todayM).padStart(2, '0')}-01 00:00:00`;
+
+      // If we're in the first 5 days, also look at the last 10 days of the previous month
+      // (an order placed on e.g. 29 May could have an expected_dispatch_date of 3 June)
+      if (todayD <= 5) {
+        const lastDayOfPrev = new Date(todayY, todayM - 1, 0); // day 0 of current month = last day of prev
+        const py  = lastDayOfPrev.getFullYear();
+        const pm  = lastDayOfPrev.getMonth() + 1;
+        const pd  = lastDayOfPrev.getDate();
+        const sd  = Math.max(1, pd - 9); // 10 days back from end of prev month
+        dispatchFromDate = `${py}-${String(pm).padStart(2, '0')}-${String(sd).padStart(2, '0')} 00:00:00`;
+      }
+
+      const { rows: allDispatchOrders } = await db.query(
+        `SELECT order_id, status, is_dispatched, raw_data
+         FROM onbuy_orders WHERE account_id = $1 AND order_date >= $2`,
+        [account.id, dispatchFromDate]
+      );
+
+      const seenDispIds = new Set();
+      const dispIds     = [];
+      for (const order of allDispatchOrders) {
+        if (seenDispIds.has(order.order_id)) continue;
+        seenDispIds.add(order.order_id);
+        const rawData = typeof order.raw_data === 'string' ? JSON.parse(order.raw_data) : (order.raw_data ?? {});
+        if (rawData.dispatched || order.is_dispatched) continue;
+        if ((rawData.status ?? order.status ?? '') !== 'Awaiting Dispatch') continue;
+        const products = Array.isArray(rawData.products) ? rawData.products : [];
+        if (products.some(p => (p.expected_dispatch_date ?? '').toString().startsWith(todayStr))) {
+          dispIds.push(order.order_id);
+        }
+      }
+      const todayDispatchCount = dispIds.length;
+      log(`Today dispatch orders (${todayDispatchCount}): ${dispIds.join(', ') || 'none'}`);
+
+      // ── Sheet row sync — only for recently-fetched orders ─────────────────────
+      const monthIds = orders.filter(o => tabForOrder(o) === currentTab).map(o => o.order_id);
+      let dbRows = [];
       if (monthIds.length > 0) {
-        const { rows: dbRows } = await db.query(
+        const { rows } = await db.query(
           `SELECT * FROM onbuy_orders WHERE account_id = $1 AND order_id = ANY($2)`,
           [account.id, monthIds]
         );
-        await syncToGoogleSheet(account, dbRows, enrichmentMap, log);
+        dbRows = rows;
       } else {
-        log(`No orders for current month (${currentTab})`);
+        log(`No recent orders for current tab (${currentTab}) — only updating dispatch counter`);
       }
+
+      // Always call syncToGoogleSheet so the dispatch counter in V1 is kept current
+      // even on quiet periods when no orders have been modified recently.
+      await syncToGoogleSheet(account, dbRows, enrichmentMap, log, todayDispatchCount);
       log('Google Sheets sync done');
       await dispatchPendingOrders(db, account, token, log);
     }

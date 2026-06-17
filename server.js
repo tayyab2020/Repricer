@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import https from 'https';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, redis, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, redis, getTokenForAccount } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { appendFile, appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -1785,6 +1785,7 @@ async function runMigrations() {
        price_changes    INT  NOT NULL DEFAULT 0,
        PRIMARY KEY (user_id, onbuy_account_id, date)
      )`,
+    `ALTER TABLE daily_sync_stats ADD COLUMN IF NOT EXISTS last_repriced_at TIMESTAMPTZ`,
     // Google Sheets integration per OnBuy account
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS google_sheet_id TEXT`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS google_service_account JSONB`,
@@ -1852,6 +1853,27 @@ async function runMigrations() {
    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
    PRIMARY KEY (user_id, brand_name)
 )`,
+    `CREATE TABLE IF NOT EXISTS onbuy_delete_brand_jobs (
+       id               SERIAL PRIMARY KEY,
+       user_id          INTEGER NOT NULL,
+       status           TEXT NOT NULL DEFAULT 'running',
+       brands_count     INTEGER DEFAULT 0,
+       opcs_found       INTEGER DEFAULT 0,
+       listings_scanned INTEGER DEFAULT 0,
+       listings_deleted INTEGER DEFAULT 0,
+       created_at       TIMESTAMP DEFAULT NOW(),
+       completed_at     TIMESTAMP
+     )`,
+    `CREATE TABLE IF NOT EXISTS onbuy_delete_brand_job_logs (
+       id         SERIAL PRIMARY KEY,
+       job_id     INTEGER REFERENCES onbuy_delete_brand_jobs(id) ON DELETE CASCADE,
+       user_id    INTEGER NOT NULL,
+       message    TEXT NOT NULL,
+       level      TEXT NOT NULL DEFAULT 'info',
+       created_at TIMESTAMP DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_dbj_user   ON onbuy_delete_brand_jobs(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_dbjl_job   ON onbuy_delete_brand_job_logs(job_id, created_at ASC)`,
   ];
   for (const sql of steps) {
     try {
@@ -1933,6 +1955,18 @@ app.put('/api/settings', requireAuth, async (req, res) => {
   const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time', 'app_theme'];
   const uid = req.effectiveUserId;
   try {
+    // Read current pricing values before saving so we can detect actual changes
+    const pricingKeys = ['onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent'];
+    const changingPricingKeys = pricingKeys.filter(k => k in req.body);
+    let oldPricingValues = {};
+    if (changingPricingKeys.length) {
+      const { rows: oldRows } = await db.query(
+        `SELECT key, value FROM settings WHERE user_id = $1 AND key = ANY($2)`,
+        [uid, changingPricingKeys]
+      );
+      oldPricingValues = Object.fromEntries(oldRows.map(r => [r.key, r.value]));
+    }
+
     for (const key of allowed) {
       if (!(key in req.body)) continue;
       const value = req.body[key] != null && req.body[key] !== '' ? String(req.body[key]) : null;
@@ -1947,6 +1981,22 @@ app.put('/api/settings', requireAuth, async (req, res) => {
       }
       if (key === 'webshare_proxy_api') setProxyApiUrl(value);
     }
+
+    // If any pricing-critical setting actually changed value, stamp pricing_settings_updated_at.
+    // This timestamp is later compared against daily_sync_stats.last_repriced_at so the next
+    // repricer run knows to force-reprice all listings instead of skipping unchanged prices.
+    const pricingActuallyChanged = changingPricingKeys.some(k => {
+      const newVal = req.body[k] != null && req.body[k] !== '' ? String(req.body[k]) : null;
+      return newVal !== (oldPricingValues[k] ?? null);
+    });
+    if (pricingActuallyChanged) {
+      await db.query(
+        `INSERT INTO settings (key, value, user_id, updated_at) VALUES ('pricing_settings_updated_at', $1, $2, NOW())
+         ON CONFLICT (key, user_id) DO UPDATE SET value = $1, updated_at = NOW()`,
+        [new Date().toISOString(), uid]
+      );
+    }
+
     const { rows } = await db.query('SELECT key, value FROM settings WHERE user_id = $1', [uid]);
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
     // Notify worker process to reload schedules/settings immediately
@@ -2270,6 +2320,15 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   const { rows: [{ cat_count }] } = await db.query(`SELECT COUNT(*) AS cat_count FROM onbuy_categories`);
   if (parseInt(cat_count) === 0)
     return res.status(400).json({ error: 'OnBuy categories not found. Please ask the admin to upload the categories file in Settings before importing.' });
+
+  // Guard: block import if a delete-brands job is running for this user
+  const { rows: runningDeleteJobs } = await db.query(
+    `SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`,
+    [req.effectiveUserId]
+  );
+  if (runningDeleteJobs.length) {
+    return res.status(409).json({ error: 'A Delete Restricted Brands job is currently running. Please wait for it to complete before starting a new import.' });
+  }
 
   const account = await getImportAccount(account_id);
   if (!account) return res.status(400).json({ error: 'Account not found or inactive' });
@@ -3130,98 +3189,52 @@ app.get('/api/restricted-brands', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/restricted-brands/delete-job — SSE stream: scan all OnBuy listings and delete restricted brand ones
+// POST /api/restricted-brands/delete-job — enqueue a background delete-brands job
 app.post('/api/restricted-brands/delete-job', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
 
-  // Load restricted brands
-  const { rows: brandRows } = await db.query(
-    'SELECT brand_name FROM restricted_brands WHERE user_id = $1',
-    [uid]
+  const { rows: runningImports } = await db.query(
+    `SELECT id FROM onbuy_bulk_import_sessions WHERE user_id = $1 AND status = 'processing' LIMIT 1`, [uid]
   );
-  if (!brandRows.length) return res.status(400).json({ error: 'No restricted brands uploaded for your account' });
-  const restrictedSet = new Set(brandRows.map(r => r.brand_name.toLowerCase()));
+  if (runningImports.length) return res.status(409).json({ error: 'A bulk import job is currently running. Please wait for it to complete.' });
 
-  // Load active OnBuy accounts for this user
-  const { rows: accounts } = await db.query(
-    'SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true',
-    [uid]
+  const { rows: existingJobs } = await db.query(
+    `SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [uid]
   );
-  if (!accounts.length) return res.status(400).json({ error: 'No active OnBuy accounts found' });
+  if (existingJobs.length) return res.status(409).json({ error: 'A Delete Restricted Brands job is already running.' });
 
-  // SSE setup
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  const send = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-    if (typeof res.flush === 'function') res.flush();
-  };
+  const { rows: [{ cnt }] } = await db.query(`SELECT COUNT(*) AS cnt FROM restricted_brands WHERE user_id = $1`, [uid]);
+  if (parseInt(cnt) === 0) return res.status(400).json({ error: 'No restricted brands uploaded for your account.' });
 
-  let totalDeleted = 0;
-  let totalScanned = 0;
+  const { rows: [jobRow] } = await db.query(
+    `INSERT INTO onbuy_delete_brand_jobs (user_id, status) VALUES ($1, 'running') RETURNING id`, [uid]
+  );
+  await deleteBrandsQueue.add('delete', { jobId: jobRow.id, userId: uid }, {
+    jobId: `delete-brands-${jobRow.id}`, removeOnComplete: true, removeOnFail: true, attempts: 1,
+  });
+  res.json({ jobId: jobRow.id, status: 'running' });
+});
 
-  for (const account of accounts) {
-    send({ type: 'account', name: account.account_name });
-    let token;
-    try {
-      const tr = await fetch('https://api.onbuy.com/v2/auth/request-token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ consumer_key: account.consumer_key, secret_key: account.secret_key }),
-      });
-      const td = await tr.json();
-      token = td.access_token || td.Result?.token || null;
-    } catch {}
-    if (!token) { send({ type: 'error', message: `Could not get token for ${account.account_name}` }); continue; }
+// GET /api/delete-brands/active — most recent job + its logs
+app.get('/api/delete-brands/active', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  const { rows: [job] } = await db.query(
+    `SELECT * FROM onbuy_delete_brand_jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [uid]
+  );
+  if (!job) return res.json({ job: null, logs: [] });
+  const { rows: logs } = await db.query(
+    `SELECT message, level, created_at FROM onbuy_delete_brand_job_logs WHERE job_id = $1 ORDER BY created_at ASC`, [job.id]
+  );
+  res.json({ job, logs });
+});
 
-    const siteId = parseInt(account.site_id) || 2000;
-    const toDelete = [];
-    let offset = 0;
-    let totalRows = null;
-
-    // Paginate through all listings
-    while (true) {
-      let data;
-      try {
-        const r = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=1000&offset=${offset}`, {
-          headers: { Authorization: token },
-        });
-        data = await r.json();
-      } catch (e) { send({ type: 'error', message: `Fetch error: ${e.message}` }); break; }
-
-      const listings = data.payload ?? data.results ?? data.listings ?? (Array.isArray(data) ? data : []);
-      if (totalRows === null) totalRows = parseInt(data.metadata?.total_rows ?? data.total ?? listings.length);
-
-      for (const listing of listings) {
-        const brand = (listing.manufacturer || listing.brand || listing.brand_name || '').toLowerCase().trim();
-        if (brand && restrictedSet.has(brand)) toDelete.push(listing.sku || listing.seller_sku);
-      }
-
-      totalScanned += listings.length;
-      offset += listings.length;
-      send({ type: 'progress', scanned: totalScanned, found: toDelete.length });
-      if (listings.length === 0 || offset >= totalRows) break;
-    }
-
-    // Delete in batches of 1000
-    const BATCH = 1000;
-    for (let i = 0; i < toDelete.length; i += BATCH) {
-      const batch = toDelete.slice(i, i + BATCH);
-      try {
-        await fetch('https://api.onbuy.com/v2/listings/by-sku', {
-          method: 'DELETE',
-          headers: { Authorization: token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ site_id: siteId, skus: batch }),
-        });
-        totalDeleted += batch.length;
-        send({ type: 'deleted', count: batch.length, total: totalDeleted });
-      } catch (e) { send({ type: 'error', message: `Delete error: ${e.message}` }); }
-    }
-  }
-
-  send({ type: 'done', totalScanned, totalDeleted });
-  res.end();
+// POST /api/delete-brands/:jobId/cancel
+app.post('/api/delete-brands/:jobId/cancel', requireAuth, async (req, res) => {
+  await db.query(
+    `UPDATE onbuy_delete_brand_jobs SET status='cancelled', completed_at=NOW() WHERE id=$1 AND user_id=$2`,
+    [req.params.jobId, req.effectiveUserId]
+  );
+  res.json({ ok: true });
 });
 
 // ── OnBuy Orders ──────────────────────────────────────────────────────────────
