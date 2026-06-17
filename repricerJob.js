@@ -1122,6 +1122,14 @@ async function processKeepaJob(job) {
     }
   }
 
+  // Clear any stale cancellation flag so this fresh job run is not blocked by a prior cancel signal
+  await redis.del(`keepa:cancelled:${userId}`);
+
+  const checkNotCancelled = async () => {
+    if (await redis.get(`keepa:cancelled:${userId}`))
+      throw Object.assign(new Error('Keepa job cancelled by user'), { _cancelled: true });
+  };
+
   const toFetch         = pendingAsins ?? asins;
   // wasQuotaExhausted=true means the PREVIOUS run hit the ≤5% ceiling and we waited 1 hour
   // for quota to refill — only 1,800 new tokens are available (5%/hr × 36,000 products).
@@ -1136,9 +1144,9 @@ async function processKeepaJob(job) {
   log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
 
   const cacheKey           = `keepa:prices:${accountId}`;
-  const SUB_BATCH          = 1700;          // one Keepa browser session per sub-batch
+  const SUB_BATCH          = 1600;          // one Keepa browser session per sub-batch
   const ONBUY_FLUSH_BATCH  = 1000;          // max mapping IDs per runRepricerJob call to OnBuy
-  const FLUSH_PRICE_COUNT  = 1700;          // trigger OnBuy update after a full sub-batch is processed
+  const FLUSH_PRICE_COUNT  = 1600;          // trigger OnBuy update after a full sub-batch is processed
   const FLUSH_INTERVAL_MS  = 5 * 60 * 1000; // …or after 5 minutes, whichever comes first
 
   let totalPriceCount  = 0;
@@ -1147,13 +1155,14 @@ async function processKeepaJob(job) {
   const hasAsinMap     = Object.keys(asinToMappingIds).length > 0;
 
   // Flush accumulated mapping IDs to the OnBuy pricing phase in ≤1000 batches.
-  // Capping at 1000 keeps each runRepricerJob call within API limits — e.g. a 1700-ASIN
+  // Capping at 1000 keeps each runRepricerJob call within API limits — e.g. a 1600-ASIN
   // Keepa sub-batch triggers two OnBuy requests (first 1000, then 700).
   // skipCounter=true prevents overwriting the DECRBY-managed counter.
   // fromKeepaFlush=true prevents the fast worker from double-decrementing per job.
   const flushToOnBuy = async (ids) => {
     if (!ids.length) return;
     for (let i = 0; i < ids.length; i += ONBUY_FLUSH_BATCH) {
+      await checkNotCancelled();
       const batch = ids.slice(i, i + ONBUY_FLUSH_BATCH);
       log(`[KeepaWorker] Flushing ${batch.length} mapping(s) to OnBuy pricing phase (${i + 1}–${i + batch.length} of ${ids.length})`);
       try {
@@ -1173,7 +1182,9 @@ async function processKeepaJob(job) {
   // proved unreliable in production — a fresh session is the only reliable approach.
   let quotaExhaustedIdx = -1;  // index in thisBatch where quota was detected ≤5%
 
+  try {
   for (let i = 0; i < thisBatch.length; i += SUB_BATCH) {
+    await checkNotCancelled();
     const chunk    = thisBatch.slice(i, i + SUB_BATCH);
     const chunkNum = Math.floor(i / SUB_BATCH) + 1;
     const totalChunks = Math.ceil(thisBatch.length / SUB_BATCH);
@@ -1328,6 +1339,13 @@ async function processKeepaJob(job) {
   }
 
   return { priceCount: totalPriceCount, asinCount: thisBatch.length, remaining: leftover.length };
+  } catch (err) {
+    if (err._cancelled) {
+      log('[KeepaWorker] 🛑 Job cancelled by user — stopped cleanly');
+      return { priceCount: totalPriceCount, asinCount: thisBatch.length, remaining: leftover.length, cancelled: true };
+    }
+    throw err;
+  }
 }
 
 const keepaWorker = new Worker('keepa-scrape', processKeepaJob, {

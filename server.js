@@ -587,9 +587,10 @@ app.post('/api/job/cancel', requireAuth, async (req, res) => {
       }
     }
 
-    // Clear Redis flags
+    // Clear Redis flags and signal any active Keepa worker to stop
     await redis.del(`keepa:refill-pending:${userId}`);
     await redis.del(`repricer:running:${userId}`);
+    await redis.set(`keepa:cancelled:${userId}`, '1', 'EX', 7200); // 2-hour TTL; worker checks this flag
 
     console.log(`[CancelJob] User ${userId} cancelled ${removed} job(s)`);
     res.json({ ok: true, removed });
