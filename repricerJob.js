@@ -1141,23 +1141,21 @@ async function processKeepaJob(job) {
     redis.set(`repricer:running:${userId}`, toFetch.length, 'EX', activeTtl).catch(() => {});
     log(`[KeepaWorker] Restored UI counter — ${toFetch.length} ASINs pending`);
   }
-  // wasQuotaExhausted=true means the PREVIOUS run hit the ≤5% ceiling and we waited 1 hour
-  // for quota to refill — only 1,800 new tokens are available (5%/hr × 36,000 products).
-  // wasQuotaExhausted=false (initial run or continuation) means quota was NOT exhausted so
-  // we attempt ALL remaining ASINs and let the internal ≤5% pre-batch check stop us naturally.
-  // This prevents the 36,000 hard cap from causing unnecessary 1,800-per-30s drip runs when
-  // the account has >100% quota available.
-  const wasQuotaExhausted = job.data.wasQuotaExhausted ?? false;
-  const thisBatch = wasQuotaExhausted ? toFetch.slice(0, KEEPA_HOURLY_FILL) : toFetch;
-  let   leftover  = wasQuotaExhausted ? toFetch.slice(KEEPA_HOURLY_FILL)    : [];
-
-  log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
-
   const cacheKey           = `keepa:prices:${accountId}`;
-  const SUB_BATCH          = 1500;          // one Keepa browser session per sub-batch
+  const SUB_BATCH          = 1500;          // one Keepa browser session per sub-batch — hard max per Keepa request
   const ONBUY_FLUSH_BATCH  = 1000;          // max mapping IDs per runRepricerJob call to OnBuy
   const FLUSH_PRICE_COUNT  = 1500;          // trigger OnBuy update after a full sub-batch is processed
   const FLUSH_INTERVAL_MS  = 5 * 60 * 1000; // …or after 5 minutes, whichever comes first
+
+  // wasQuotaExhausted=true means the previous run hit ≤5% and we waited 1 hour for refill.
+  // Cap the refill run to exactly one SUB_BATCH (1500) so Keepa never receives more than 1500
+  // ASINs in a single request. Non-exhausted runs process all remaining ASINs; the sub-batch
+  // loop below handles splitting into ≤1500-ASIN chunks automatically.
+  const wasQuotaExhausted = job.data.wasQuotaExhausted ?? false;
+  const thisBatch = wasQuotaExhausted ? toFetch.slice(0, SUB_BATCH) : toFetch;
+  let   leftover  = wasQuotaExhausted ? toFetch.slice(SUB_BATCH)    : [];
+
+  log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
 
   let totalPriceCount  = 0;
   let pendingMappingIds = [];   // mapping IDs waiting for the next OnBuy pricing flush
