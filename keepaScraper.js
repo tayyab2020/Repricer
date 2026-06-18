@@ -37,7 +37,7 @@ puppeteer.use(StealthPlugin());
 
 const KEEPA_HOME   = 'https://keepa.com/#!';
 const KEEPA_VIEWER = 'https://keepa.com/#!viewer';
-const BATCH_SIZE   = 1600;
+const BATCH_SIZE   = 1500;
 
 const _sleep = ms => new Promise(r => setTimeout(r, ms));
 

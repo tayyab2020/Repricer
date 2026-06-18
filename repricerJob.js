@@ -1122,15 +1122,25 @@ async function processKeepaJob(job) {
     }
   }
 
-  // Clear any stale cancellation flag so this fresh job run is not blocked by a prior cancel signal
-  await redis.del(`keepa:cancelled:${userId}`);
+  // Record when this job instance started so we can ignore cancel signals that predate it.
+  // This avoids clearing the flag at startup (which would unblock a concurrent older job).
+  const jobStartTime = Date.now();
 
   const checkNotCancelled = async () => {
-    if (await redis.get(`keepa:cancelled:${userId}`))
+    const cancelledAt = await redis.get(`keepa:cancelled:${userId}`);
+    // Only stop if the cancel was issued AFTER this job started
+    if (cancelledAt && parseInt(cancelledAt) > jobStartTime)
       throw Object.assign(new Error('Keepa job cancelled by user'), { _cancelled: true });
   };
 
-  const toFetch         = pendingAsins ?? asins;
+  const toFetch = pendingAsins ?? asins;
+
+  // Restore UI counter if the cancel route cleared it while this job was already active
+  if (!(await redis.exists(`repricer:running:${userId}`))) {
+    const activeTtl = (Math.ceil(toFetch.length / KEEPA_HOURLY_FILL) + 2) * 3600;
+    redis.set(`repricer:running:${userId}`, toFetch.length, 'EX', activeTtl).catch(() => {});
+    log(`[KeepaWorker] Restored UI counter — ${toFetch.length} ASINs pending`);
+  }
   // wasQuotaExhausted=true means the PREVIOUS run hit the ≤5% ceiling and we waited 1 hour
   // for quota to refill — only 1,800 new tokens are available (5%/hr × 36,000 products).
   // wasQuotaExhausted=false (initial run or continuation) means quota was NOT exhausted so
@@ -1144,9 +1154,9 @@ async function processKeepaJob(job) {
   log(`[KeepaWorker] Run #${runNumber} — account ${accountId}: fetching ${thisBatch.length} ASINs${leftover.length ? `, ${leftover.length} deferred (quota refill)` : ''}${wasQuotaExhausted ? ' [post-exhaustion refill]' : ''}`);
 
   const cacheKey           = `keepa:prices:${accountId}`;
-  const SUB_BATCH          = 1600;          // one Keepa browser session per sub-batch
+  const SUB_BATCH          = 1500;          // one Keepa browser session per sub-batch
   const ONBUY_FLUSH_BATCH  = 1000;          // max mapping IDs per runRepricerJob call to OnBuy
-  const FLUSH_PRICE_COUNT  = 1600;          // trigger OnBuy update after a full sub-batch is processed
+  const FLUSH_PRICE_COUNT  = 1500;          // trigger OnBuy update after a full sub-batch is processed
   const FLUSH_INTERVAL_MS  = 5 * 60 * 1000; // …or after 5 minutes, whichever comes first
 
   let totalPriceCount  = 0;
@@ -1155,7 +1165,7 @@ async function processKeepaJob(job) {
   const hasAsinMap     = Object.keys(asinToMappingIds).length > 0;
 
   // Flush accumulated mapping IDs to the OnBuy pricing phase in ≤1000 batches.
-  // Capping at 1000 keeps each runRepricerJob call within API limits — e.g. a 1600-ASIN
+  // Capping at 1000 keeps each runRepricerJob call within API limits — e.g. a 1500-ASIN
   // Keepa sub-batch triggers two OnBuy requests (first 1000, then 700).
   // skipCounter=true prevents overwriting the DECRBY-managed counter.
   // fromKeepaFlush=true prevents the fast worker from double-decrementing per job.
@@ -1268,6 +1278,9 @@ async function processKeepaJob(job) {
       }
     }
   }
+
+  // Check for cancellation that arrived while the last browser session was running
+  await checkNotCancelled();
 
   // When quota ran out mid-run, fold unprocessed ASINs into leftover so the
   // existing 1-hour refill scheduler picks them up automatically.
