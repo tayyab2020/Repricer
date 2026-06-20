@@ -276,10 +276,10 @@ const SHEET_HEADERS = [
   'Tracking', 'Courier Name', 'Sourcing Link', 'Onbuy Link',
   '',                                                               // J (9)  yellow separator
   'Qty', 'Unit Price', 'Source Price',                             // K-M (10-12)
-  'Onbuy Fee', 'Boosted', 'VAT',                                   // N-P (13-15)
-  'Total Fee', 'Total Cost', 'Selling Price', 'Net Profit',        // Q-T (16-19)
-  '',                                                               // U (20) yellow separator
-  'ROI %', 'Status',                                               // V-W (21-22)
+  'Onbuy Fee', 'Boosted', 'VAT', 'Delivery Fee',                   // N-Q (13-16)
+  'Total Fee', 'Total Cost', 'Selling Price', 'Net Profit',        // R-U (17-20)
+  '',                                                               // V (21) yellow separator
+  'ROI %', 'Status',                                               // W-X (22-23)
 ];
 
 // Row-2 meta-headers written when creating a new tab (0-based column index → text)
@@ -306,7 +306,14 @@ const MANUAL_HEADERS = new Set([
 // Formulas written into new rows only (existing rows already have their own formulas)
 // Each value is a function(colIdx, rowNum) → formula string
 const FORMULA_COLUMNS = {
-  'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
+  'Total Fee':  (ci, r) => {
+    // When Delivery Fee exists it sits between VAT and Total Fee — extend the SUM range to include it.
+    // On old sheets without the column, fall back to summing only up to VAT.
+    const endCol = ci['Delivery Fee'] != null
+      ? colIdxToLetter(ci['Delivery Fee'])
+      : colIdxToLetter(ci['VAT']);
+    return `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${endCol}${r})`;
+  },
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
   'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
   'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Net Profit'])}${r}/${colIdxToLetter(ci['Source Price'])}${r}*100)`,
@@ -322,10 +329,11 @@ function toNum(val) {
 // Returns row data as an object keyed by header title.
 // Only non-manual, non-formula columns are included — sheet formulas handle the rest.
 function buildSheetRow(order, product, vatRate, enriched = {}) {
-  const zeroed    = isCancelledOrRefunded(order.status);
-  const fee       = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
-  const vat       = parseFloat(product.fee?.fees_tax ?? 0);
-  const boosted   = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
+  const zeroed      = isCancelledOrRefunded(order.status);
+  const fee         = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
+  const vat         = parseFloat(product.fee?.fees_tax ?? 0);
+  const deliveryFee = zeroed ? 0 : toNum(product.price_delivery_total ?? 0);
+  const boosted     = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
   const rawStatus = (order.status ?? '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const status    = rawStatus === 'Cancelled By Customer' ? 'Cancelled By Buyer' : rawStatus;
   const rawData   = order.raw_data ?? {};
@@ -348,6 +356,7 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
     'Onbuy Fee':         toNum(fee),
     'Boosted':           boosted,
     'VAT':               toNum(vat),
+    'Delivery Fee':      deliveryFee,
     'Status':            status,
     '_apiTracking':      apiTracking,
   };
@@ -409,7 +418,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       try {
         await sheets.spreadsheets.values.update({
           spreadsheetId,
-          range: `'${currentTabName}'!V1`,
+          range: `'${currentTabName}'!W1`,
           valueInputOption: 'RAW',
           requestBody: { values: [[`Total Dispatch: ${preComputedDispatchCount}`]] },
         });
@@ -452,8 +461,8 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
         const row1Raw = [
           { range: `'${tabName}'!A1`, values: [[account.account_name || '']] },
           { range: `'${tabName}'!J1`, values: [['_']] },
-          { range: `'${tabName}'!U1`, values: [['_']] },
-          { range: `'${tabName}'!V1`, values: [['Total Dispatch: 0']] },
+          { range: `'${tabName}'!V1`, values: [['_']] },
+          { range: `'${tabName}'!W1`, values: [['Total Dispatch: 0']] },
         ];
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId,
@@ -461,7 +470,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
         });
         // SUM formulas for numeric columns in row 1 (Unit Price → Net Profit, cols L–T)
         const row1Formulas = [];
-        for (let ci = 11; ci <= 19; ci++) {
+        for (let ci = 11; ci <= 20; ci++) {
           const col = colIdxToLetter(ci);
           row1Formulas.push({ range: `'${tabName}'!${col}1`, values: [[`=SUM(${col}4:${col}1000)`]] });
         }
@@ -487,6 +496,36 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
           const key = String(h).trim();
           if (key && !(key in colIdx)) colIdx[key] = i;
         });
+      }
+
+      // Auto-insert "Delivery Fee" column on existing tabs that pre-date this feature.
+      // Inserts right after VAT so Total Fee = SUM(OnbuyFee:DeliveryFee) works correctly.
+      if (colIdx['Delivery Fee'] == null && colIdx['VAT'] != null) {
+        const insertAt = colIdx['VAT'] + 1;
+        const sheetId  = tabIdMap.get(tabName);
+        if (sheetId != null) {
+          await sheets.spreadsheets.batchUpdate({
+            spreadsheetId,
+            requestBody: { requests: [{ insertDimension: {
+              range: { sheetId, dimension: 'COLUMNS', startIndex: insertAt, endIndex: insertAt + 1 },
+              inheritFromBefore: false,
+            }}] },
+          });
+          const newColLetter = colIdxToLetter(insertAt);
+          await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: { valueInputOption: 'USER_ENTERED', data: [
+              { range: `'${tabName}'!${newColLetter}3`, values: [['Delivery Fee']] },
+              { range: `'${tabName}'!${newColLetter}1`, values: [[`=SUM(${newColLetter}4:${newColLetter}1000)`]] },
+            ]},
+          });
+          // Shift all colIdx entries at or after the insert point, then register the new column
+          for (const key of Object.keys(colIdx)) {
+            if (colIdx[key] >= insertAt) colIdx[key]++;
+          }
+          colIdx['Delivery Fee'] = insertAt;
+          log(`Auto-inserted 'Delivery Fee' column at ${newColLetter} in tab ${tabName}`);
+        }
       }
 
       const orderNumCol = colIdx['Order No'] ?? 1; // col B
@@ -528,7 +567,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       }
       await sheets.spreadsheets.values.update({
         spreadsheetId,
-        range: `'${tabName}'!V1`,
+        range: `'${tabName}'!W1`,
         valueInputOption: 'RAW',
         requestBody: { values: [[`Total Dispatch: ${todayDispatchCount}`]] },
       });
@@ -538,12 +577,12 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       const newRowObjs = [];
       let   updatedRows = 0;
 
-      // Ensure ROI % and Status are in row 3 (V3, W3) not row 2 — fixes existing tabs
+      // Ensure ROI % and Status are in row 3 (W3, X3) not row 2 — fixes existing tabs
       batchData.push(
-        { range: `'${tabName}'!V2`, values: [['']] },
         { range: `'${tabName}'!W2`, values: [['']] },
-        { range: `'${tabName}'!V3`, values: [['ROI %']] },
-        { range: `'${tabName}'!W3`, values: [['Status']] },
+        { range: `'${tabName}'!X2`, values: [['']] },
+        { range: `'${tabName}'!W3`, values: [['ROI %']] },
+        { range: `'${tabName}'!X3`, values: [['Status']] },
       );
 
       for (const { order, product, vatRate } of items) {
