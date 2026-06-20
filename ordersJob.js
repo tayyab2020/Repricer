@@ -457,7 +457,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
           requestBody: { values: [row2] },
         });
 
-        // Row 1: account name + yellow separator placeholders + Total Dispatch counter (V1:W1 merged)
+        // Row 1: account name + yellow separator placeholders + Total Dispatch counter (W1:X1 merged)
         const row1Raw = [
           { range: `'${tabName}'!A1`, values: [[account.account_name || '']] },
           { range: `'${tabName}'!J1`, values: [['_']] },
@@ -468,7 +468,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
           spreadsheetId,
           requestBody: { valueInputOption: 'RAW', data: row1Raw },
         });
-        // SUM formulas for numeric columns in row 1 (Unit Price → Net Profit, cols L–T)
+        // SUM formulas for numeric columns in row 1 (Unit Price → Net Profit, cols L–U)
         const row1Formulas = [];
         for (let ci = 11; ci <= 20; ci++) {
           const col = colIdxToLetter(ci);
@@ -690,14 +690,18 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
                 fields: 'userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold,userEnteredFormat.textFormat.fontSize',
               },
             },
+            // Unmerge rows 1 and 2 entirely before re-merging — prevents "must select all cells
+            // in a merged range" errors caused by auto-inserted columns shifting existing merges.
+            { unmergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 50 } } },
+            { unmergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 50 } } },
             // Merge A1:I1 for account name
             { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
-            // Merge V1:W1 for "Total Dispatch: N" counter
-            { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 21, endColumnIndex: 23 }, mergeType: 'MERGE_ALL' } },
+            // Merge W1:X1 for "Total Dispatch: N" counter (W=ROI%=22, X=Status=23, endIndex exclusive=24)
+            { mergeCells: { range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 22, endColumnIndex: 24 }, mergeType: 'MERGE_ALL' } },
             // Merge A2:I2 for "Selling Details"
             { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
-            // Merge K2:T2 for "Selling Details / Profit"
-            { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 10, endColumnIndex: 20 }, mergeType: 'MERGE_ALL' } },
+            // Merge K2:U2 for "Selling Details / Profit" (endColumnIndex 21 = exclusive, covers K–U)
+            { mergeCells: { range: { sheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 10, endColumnIndex: 21 }, mergeType: 'MERGE_ALL' } },
             // Data rows (row 4+): white background, not bold
             {
               repeatCell: {
@@ -745,10 +749,10 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
                 fields: 'userEnteredFormat.backgroundColor',
               },
             },
-            // Yellow separator column U (index 20) — all rows
+            // Yellow separator column V (index 21) — all rows
             {
               repeatCell: {
-                range: { sheetId, startColumnIndex: 20, endColumnIndex: 21 },
+                range: { sheetId, startColumnIndex: 21, endColumnIndex: 22 },
                 cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 0 } } },
                 fields: 'userEnteredFormat.backgroundColor',
               },
@@ -777,10 +781,10 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
                 fields: 'pixelSize',
               },
             },
-            // Column U (index 20): minimal width separator
+            // Column V (index 21): minimal width separator
             {
               updateDimensionProperties: {
-                range: { sheetId, dimension: 'COLUMNS', startIndex: 20, endIndex: 21 },
+                range: { sheetId, dimension: 'COLUMNS', startIndex: 21, endIndex: 22 },
                 properties: { pixelSize: 20 },
                 fields: 'pixelSize',
               },
