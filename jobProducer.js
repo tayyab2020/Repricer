@@ -225,6 +225,12 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
         const jobState = await addedJob.getState().catch(() => 'unknown');
         jlog(`[Job][DEBUG] keepa queue AFTER add (account ${aid}): ${JSON.stringify(afterCounts)}`);
         jlog(`[Job][DEBUG] addedJob.id=${addedJob.id} state=${jobState}`);
+
+        // Set sidebar counter immediately so the UI shows "Jobs Running..." even while this
+        // job is queued/waiting (keepaWorker.on('active') only fires when the job actually starts).
+        // NX: don't overwrite if a counter is already set by an active job for this user.
+        const queueTtl = (Math.ceil(uniqueAsins.length / 1800) + 6) * 3600;
+        redis.set(`repricer:running:${jobUserId}`, uniqueAsins.length, 'EX', queueTtl, 'NX').catch(() => {});
       }
 
       if (keepaAccountIds.size > 0) {
