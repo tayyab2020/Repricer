@@ -1075,6 +1075,44 @@ app.post('/api/accounts/:id/test', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/accounts/fetch-label — resolve trading_name from OnBuy credentials + site_id
+app.post('/api/accounts/fetch-label', requireAuth, async (req, res) => {
+  try {
+    const { consumer_key, secret_key, site_id } = req.body;
+    if (!consumer_key || !secret_key) return res.status(400).json({ error: 'consumer_key and secret_key are required' });
+
+    // Obtain access token
+    const authRes = await fetch('https://api.onbuy.com/v2/auth/request-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ consumer_key, secret_key }),
+    });
+    const authData = await authRes.json().catch(() => ({}));
+    const token = authData?.access_token || authData?.Result?.token || authData?.result?.token || authData?.token;
+    if (!token) {
+      const msg = authData?.message || authData?.error || authData?.Error || `HTTP ${authRes.status}`;
+      return res.status(401).json({ error: `OnBuy auth failed: ${msg}` });
+    }
+
+    // Fetch seller entities
+    const entRes = await fetch('https://api.onbuy.com/v2/sellers/entities', {
+      headers: { Authorization: token },
+    });
+    if (!entRes.ok) return res.status(502).json({ error: `Sellers entities API ${entRes.status}` });
+    const entData = await entRes.json().catch(() => ({}));
+    const entities = entData?.results ?? entData?.data ?? [];
+
+    // Match by site_id if provided, otherwise return first
+    const siteIdNum = site_id ? parseInt(site_id) : null;
+    const match = siteIdNum
+      ? entities.find(e => parseInt(e.site_id) === siteIdNum)
+      : entities[0];
+
+    if (!match) return res.status(404).json({ error: `No entity found for site_id ${site_id}` });
+    res.json({ trading_name: match.trading_name });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─────────────────────────────────────────────
 // EXCEL IMPORT
 // ─────────────────────────────────────────────

@@ -2500,8 +2500,9 @@ function AccountsPage() {
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
   const [testResult, setResult] = useState({});
-  const [loading, setLoading]   = useState(false);
-  const [err, setErr]           = useState("");
+  const [loading, setLoading]       = useState(false);
+  const [err, setErr]               = useState("");
+  const [fetchingLabel, setFetchingLabel] = useState(false);
 
   const load = useCallback(async () => {
     try { setAccounts(await api("/accounts")); } catch {}
@@ -2538,6 +2539,19 @@ function AccountsPage() {
     }
     setTesting(t => ({ ...t, [id]: false }));
     load();
+  }
+
+  async function fetchLabel() {
+    if (!form.consumer_key || !form.secret_key) return;
+    setFetchingLabel(true); setErr("");
+    try {
+      const r = await api("/accounts/fetch-label", {
+        method: "POST",
+        body: JSON.stringify({ consumer_key: form.consumer_key, secret_key: form.secret_key, site_id: form.site_id }),
+      });
+      if (r?.trading_name) setForm(f => ({ ...f, account_name: r.trading_name }));
+    } catch (e) { setErr(e.message); }
+    setFetchingLabel(false);
   }
 
   async function toggleActive(a) {
@@ -2589,6 +2603,35 @@ function AccountsPage() {
               <label style={labelStyle}>Secret Key</label>
               <input style={fieldStyle} placeholder="••••••••••••"
                 value={form.secret_key} onChange={e => setForm(f => ({ ...f, secret_key:e.target.value }))} />
+              <button
+                type="button"
+                onClick={fetchLabel}
+                disabled={fetchingLabel || !form.consumer_key || !form.secret_key}
+                style={{
+                  marginTop: 8,
+                  padding: "7px 14px",
+                  background: (fetchingLabel || !form.consumer_key || !form.secret_key) ? C.bg : C.accent + "22",
+                  border: `1px solid ${(fetchingLabel || !form.consumer_key || !form.secret_key) ? C.border : C.accent}`,
+                  borderRadius: 7,
+                  color: (fetchingLabel || !form.consumer_key || !form.secret_key) ? C.muted : C.accent,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: (fetchingLabel || !form.consumer_key || !form.secret_key) ? "not-allowed" : "pointer",
+                  letterSpacing: "0.04em",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                {fetchingLabel ? (
+                  <>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ animation:"spin 1s linear infinite" }}>
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                    </svg>
+                    Fetching…
+                  </>
+                ) : "Fetch Account Label"}
+              </button>
             </div>
             <div>
               <label style={labelStyle}>Site ID</label>
