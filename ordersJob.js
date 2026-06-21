@@ -276,8 +276,8 @@ const SHEET_HEADERS = [
   'Tracking', 'Courier Name', 'Sourcing Link', 'Onbuy Link',
   '',                                                               // J (9)  yellow separator
   'Qty', 'Unit Price', 'Source Price',                             // K-M (10-12)
-  'Onbuy Fee', 'Boosted', 'VAT', 'Delivery Fee',                   // N-Q (13-16)
-  'Total Fee', 'Total Cost', 'Selling Price', 'Net Profit',        // R-U (17-20)
+  'Onbuy Fee', 'Boosted', 'VAT', 'Total Fee',                       // N-Q (13-16)
+  'Total Cost', 'Delivery Fee', 'Selling Price', 'Net Profit',     // R-U (17-20)
   '',                                                               // V (21) yellow separator
   'ROI %', 'Status',                                               // W-X (22-23)
 ];
@@ -306,14 +306,7 @@ const MANUAL_HEADERS = new Set([
 // Formulas written into new rows only (existing rows already have their own formulas)
 // Each value is a function(colIdx, rowNum) → formula string
 const FORMULA_COLUMNS = {
-  'Total Fee':  (ci, r) => {
-    // When Delivery Fee exists it sits between VAT and Total Fee — extend the SUM range to include it.
-    // On old sheets without the column, fall back to summing only up to VAT.
-    const endCol = ci['Delivery Fee'] != null
-      ? colIdxToLetter(ci['Delivery Fee'])
-      : colIdxToLetter(ci['VAT']);
-    return `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${endCol}${r})`;
-  },
+  'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
   'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
   'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Net Profit'])}${r}/${colIdxToLetter(ci['Source Price'])}${r}*100)`,
@@ -333,6 +326,8 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
   const fee         = zeroed ? 0 : parseFloat(product.fee?.total_sales_fee ?? 0);
   const vat         = parseFloat(product.fee?.fees_tax ?? 0);
   const deliveryFee = zeroed ? 0 : toNum(product.price_delivery_total ?? 0);
+  const spBase      = toNum(product.total_price);
+  const sellingPrice = zeroed ? 0 : (spBase === '' ? '' : spBase + deliveryFee);
   const boosted     = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
   const rawStatus = (order.status ?? '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const status    = rawStatus === 'Cancelled By Customer' ? 'Cancelled By Buyer' : rawStatus;
@@ -352,7 +347,7 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
     'Onbuy Link':        enriched.product_url || '',
     'Qty':               toNum(product.quantity),
     'Unit Price':        toNum(product.unit_price),
-    'Selling Price':     zeroed ? 0 : toNum(product.total_price),
+    'Selling Price':     sellingPrice,
     'Onbuy Fee':         toNum(fee),
     'Boosted':           boosted,
     'VAT':               toNum(vat),
@@ -409,6 +404,133 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
   const meta     = (await sheets.spreadsheets.get({ spreadsheetId })).data;
   const knownTabs = new Set((meta.sheets ?? []).map(s => s.properties?.title));
   const tabIdMap  = new Map((meta.sheets ?? []).map(s => [s.properties?.title, s.properties?.sheetId]));
+
+  // ── One-time migration: move 'Delivery Fee' to new position for ALL tabs ──────
+  // Runs every sync but is a no-op once migrated (condition never re-triggers).
+  // Must run before the byTab loop so that loop reads updated column positions.
+  if (tabIdMap.size > 0) {
+    const allTabNames = [...tabIdMap.keys()];
+    let hdrRanges = [];
+    try {
+      const batchHdr = await sheets.spreadsheets.values.batchGet({
+        spreadsheetId,
+        ranges: allTabNames.map(t => `'${t}'!A3:Z3`),
+      });
+      hdrRanges = batchHdr.data.valueRanges ?? [];
+    } catch (e) {
+      log(`[Migration] header read error: ${e.message}`);
+    }
+
+    const migMeta = [];
+
+    for (let i = 0; i < hdrRanges.length; i++) {
+      const headerRow = hdrRanges[i].values?.[0] ?? [];
+      const ci = {};
+      headerRow.forEach((h, idx) => { if (h) ci[String(h).trim()] = idx; });
+
+      const tName    = allTabNames[i];
+      const tSheetId = tabIdMap.get(tName);
+      if (tSheetId == null)                      continue;
+      if (ci['Delivery Fee'] == null)            continue;
+      if (ci['Total Fee'] == null)               continue;
+      if (ci['Selling Price'] == null)           continue;
+      if (ci['Delivery Fee'] >= ci['Total Fee']) continue; // already in new position
+
+      migMeta.push({ tName, ci, tSheetId });
+    }
+
+    if (migMeta.length > 0) {
+      // Build a single batchUpdate: unmerge → moveDimension → re-merge for each tab.
+      // The K2:U2 "Selling Details / Profit" merge spans the columns being moved, so
+      // we must unmerge it first or the API returns a "crosses merged cell" error.
+      const migrateRequests = [];
+
+      // Phase 1: unmerge rows 1-2 for every tab being migrated
+      for (const { tSheetId } of migMeta) {
+        migrateRequests.push(
+          { unmergeCells: { range: { sheetId: tSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 50 } } },
+          { unmergeCells: { range: { sheetId: tSheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 50 } } },
+        );
+      }
+      // Phase 2: moveDimension for every tab
+      for (const { ci, tSheetId } of migMeta) {
+        migrateRequests.push({ moveDimension: {
+          source: { sheetId: tSheetId, dimension: 'COLUMNS',
+                    startIndex: ci['Delivery Fee'], endIndex: ci['Delivery Fee'] + 1 },
+          destinationIndex: ci['Selling Price'],
+        }});
+      }
+      // Phase 3: re-apply the standard row-1 and row-2 merges for every tab
+      for (const { tSheetId } of migMeta) {
+        migrateRequests.push(
+          // A1:I1 — account name
+          { mergeCells: { range: { sheetId: tSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
+          // W1:X1 — Total Dispatch counter
+          { mergeCells: { range: { sheetId: tSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 22, endColumnIndex: 24 }, mergeType: 'MERGE_ALL' } },
+          // A2:I2 — "Selling Details"
+          { mergeCells: { range: { sheetId: tSheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 0, endColumnIndex: 9 }, mergeType: 'MERGE_ALL' } },
+          // K2:U2 — "Selling Details / Profit"
+          { mergeCells: { range: { sheetId: tSheetId, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 10, endColumnIndex: 21 }, mergeType: 'MERGE_ALL' } },
+        );
+      }
+
+      try {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: { requests: migrateRequests },
+        });
+      } catch (e) {
+        log(`[Migration] batchUpdate error: ${e.message}`);
+        migMeta.length = 0; // skip formula fix if move failed
+      }
+
+      const formulaUpdates = [];
+      for (const { tName, ci } of migMeta) {
+        const oldDFIdx = ci['Delivery Fee'];
+        const spIdx    = ci['Selling Price'];
+
+        // Recompute column letters after the move
+        const newCI = { ...ci };
+        for (const key of Object.keys(newCI)) {
+          if (newCI[key] > oldDFIdx && newCI[key] < spIdx) newCI[key]--;
+        }
+        newCI['Delivery Fee'] = spIdx - 1;
+
+        const tfCol    = colIdxToLetter(newCI['Total Fee']);
+        const onbuyCol = colIdxToLetter(newCI['Onbuy Fee']);
+        const vatCol   = colIdxToLetter(newCI['VAT']);
+        const dfCol    = colIdxToLetter(newCI['Delivery Fee']);
+        const tcCol    = colIdxToLetter(newCI['Total Cost']);
+
+        // Row 1 column-total SUM formulas for the three shifted columns
+        formulaUpdates.push(
+          { range: `'${tName}'!${tfCol}1`, values: [[`=SUM(${tfCol}4:${tfCol}1000)`]] },
+          { range: `'${tName}'!${tcCol}1`, values: [[`=SUM(${tcCol}4:${tcCol}1000)`]] },
+          { range: `'${tName}'!${dfCol}1`, values: [[`=SUM(${dfCol}4:${dfCol}1000)`]] },
+        );
+        // Rewrite Total Fee formulas for all data rows (4-1000).
+        // Sheets auto-expands a SUM range to track the moved column, producing the
+        // wrong =SUM(N:S) — we must overwrite with the correct =SUM(OnbuyFee:VAT).
+        for (let r = 4; r <= 1000; r++) {
+          formulaUpdates.push({
+            range: `'${tName}'!${tfCol}${r}`,
+            values: [[`=SUM(${onbuyCol}${r}:${vatCol}${r})`]],
+          });
+        }
+        log(`[Migration] moved 'Delivery Fee' to col ${dfCol} in tab ${tName}`);
+      }
+
+      if (formulaUpdates.length > 0) {
+        // Split into 1000-item batches to stay within API body limits
+        for (let i = 0; i < formulaUpdates.length; i += 1000) {
+          await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: { valueInputOption: 'USER_ENTERED', data: formulaUpdates.slice(i, i + 1000) },
+          }).catch(e => log(`[Migration] formula write error: ${e.message}`));
+        }
+      }
+    }
+  }
 
   // When there are no recently-synced orders (quiet period) but we have a pre-computed
   // dispatch count, still update V1 on the current month's tab so the counter is current.
