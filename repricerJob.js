@@ -2563,13 +2563,16 @@ async function _checkAllDone() {
   if (_fastActive > 0 || _slowActive > 0 || _keepaActive > 0) return;
   wlog(`[DEBUG _checkAllDone] entering — _runUserIds=${_runUserIds.size} _retryPendingFor=${_retryPendingFor.size} _runStartTime=${_runStartTime}`);
 
-  const [fc, sc] = await Promise.all([
+  const [fc, sc, kc] = await Promise.all([
     fastQueue.getJobCounts('waiting', 'delayed', 'active'),
     slowQueue.getJobCounts('waiting', 'delayed', 'active'),
+    keepaQueue.getJobCounts('waiting', 'delayed', 'active'),
   ]);
+  wlog(`[DEBUG _checkAllDone] queue counts — fast: ${fc.waiting}w/${fc.delayed}d/${fc.active}a  slow: ${sc.waiting}w/${sc.delayed}d/${sc.active}a  keepa: ${kc.waiting}w/${kc.delayed}d/${kc.active}a`);
 
   if (fc.waiting + fc.delayed + fc.active === 0 &&
-      sc.waiting + sc.delayed + sc.active === 0) {
+      sc.waiting + sc.delayed + sc.active === 0 &&
+      kc.waiting + kc.delayed + kc.active === 0) {
 
     if (_retryPendingFor.size > 0) {
       // Retry run just finished — flush its batches and mark the run fully done
@@ -2644,13 +2647,21 @@ async function _scheduleRetry(userIds, runStart) {
 
   if (retries.length === 0) {
     // Nothing to retry — clear counter unless a Keepa quota-refill job is still pending
-    for (const uid of userIds) {
-      const hasRefill = await redis.exists(`keepa:refill-pending:${uid}`).catch(() => 0);
-      if (!hasRefill) redis.del(`repricer:running:${uid}`).catch(() => {});
+    // or a new Keepa run started during the 5s+mutex delay since _checkAllDone fired.
+    const kc2 = await keepaQueue.getJobCounts('waiting', 'active', 'delayed').catch(() => ({ waiting: 0, active: 0, delayed: 0 }));
+    wlog(`[DEBUG _scheduleRetry] Keepa queue: ${kc2.waiting}w/${kc2.active}a/${kc2.delayed}d — ${kc2.waiting + kc2.active + kc2.delayed > 0 ? 'SKIPPING (Keepa in flight — its own completion will clean up)' : 'clearing counters'}`);
+    if (kc2.waiting + kc2.active + kc2.delayed === 0) {
+      // No Keepa work in flight — safe to fully clean up
+      for (const uid of userIds) {
+        const hasRefill = await redis.exists(`keepa:refill-pending:${uid}`).catch(() => 0);
+        if (!hasRefill) redis.del(`repricer:running:${uid}`).catch(() => {});
+      }
+      _runStartTime = null;
+      fastQueue.clean(0, 1000, 'failed').catch(() => {});
+      slowQueue.clean(0, 1000, 'failed').catch(() => {});
     }
-    _runStartTime = null;
-    fastQueue.clean(0, 1000, 'failed').catch(() => {});
-    slowQueue.clean(0, 1000, 'failed').catch(() => {});
+    // If Keepa is in flight, leave _runStartTime intact so the Keepa job's own
+    // _checkAllDone → _scheduleRetry call can use it for failure-retry querying.
     return;
   }
 
