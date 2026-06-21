@@ -1355,8 +1355,17 @@ app.get('/api/import/template', requireAuth, (req, res) => {
 
 // POST /api/import/preview — parse uploaded Excel, return rows for user review
 // Auto-detects 1-row header (new template) or 2-row header (old template with section headings)
-app.post('/api/import/preview', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/import/preview', requireAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  // Read the user's actual default ROI% from DB (falls back to 20 if not set)
+  let userDefaultRoi = _globalSettings.defaultRoi;
+  try {
+    const { rows: srRows } = await db.query(
+      `SELECT value FROM settings WHERE user_id = $1 AND key = 'default_roi_percent' LIMIT 1`,
+      [req.effectiveUserId]
+    );
+    if (srRows[0]?.value) userDefaultRoi = parseFloat(srRows[0].value);
+  } catch {}
   try {
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
     const ws = wb.Sheets[wb.SheetNames[0]];
@@ -1435,7 +1444,7 @@ app.post('/api/import/preview', requireAuth, upload.single('file'), (req, res) =
       const hasRoiCol   = !isNaN(sheetRoi) && String(mapped.markup_value || '').trim() !== '';
       const markupType  = (hasRoiCol || sellingPrice) ? 'roi'
                         : String(mapped.markup_type || 'roi').toLowerCase().trim();
-      const markupValue = hasRoiCol ? sheetRoi : _globalSettings.defaultRoi;
+      const markupValue = hasRoiCol ? sheetRoi : userDefaultRoi;
 
       // OnBuy Fee: use sheet value if present, otherwise auto-calculate as fee% of selling price
       const sheetFee    = parseFloat(mapped.onbuy_fee);
@@ -1459,6 +1468,7 @@ app.post('/api/import/preview', requireAuth, upload.single('file'), (req, res) =
         raw_source:       String(mapped.primary_asin || sellerSku || '').trim(),
         markup_type:      markupType,
         markup_value:     markupValue,
+        markup_is_explicit: hasRoiCol,
         onbuy_fee:        onbuyFee,
         min_price:        parseFloat(mapped.min_price) || null,
         notes:            String(mapped.notes || '').trim(),
@@ -1575,22 +1585,23 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
     const c = toUpdate.slice(i, i + CHUNK);
     await db.query(`
       UPDATE product_mappings pm SET
-        product_name     = COALESCE(NULLIF(v.product_name,''),  pm.product_name),
-        onbuy_listing_id = COALESCE(NULLIF(v.listing_id,''),    pm.onbuy_listing_id),
-        onbuy_opc        = COALESCE(NULLIF(v.opc,''),           pm.onbuy_opc),
-        onbuy_sku        = COALESCE(NULLIF(v.sku,''),           pm.onbuy_sku),
-        markup_type      = v.markup_type,
-        markup_value     = v.markup_value::decimal,
-        onbuy_fee        = v.onbuy_fee::decimal,
-        target_price     = COALESCE(NULLIF(v.target_price,'')::decimal, pm.target_price),
-        min_price        = COALESCE(NULLIF(v.min_price,'')::decimal,    pm.min_price),
-        notes            = COALESCE(NULLIF(v.notes,''),         pm.notes),
-        updated_at       = NOW()
+        product_name       = COALESCE(NULLIF(v.product_name,''),  pm.product_name),
+        onbuy_listing_id   = COALESCE(NULLIF(v.listing_id,''),    pm.onbuy_listing_id),
+        onbuy_opc          = COALESCE(NULLIF(v.opc,''),           pm.onbuy_opc),
+        onbuy_sku          = COALESCE(NULLIF(v.sku,''),           pm.onbuy_sku),
+        markup_type        = v.markup_type,
+        markup_value       = v.markup_value::decimal,
+        markup_is_explicit = v.markup_is_explicit::boolean,
+        onbuy_fee          = v.onbuy_fee::decimal,
+        target_price       = COALESCE(NULLIF(v.target_price,'')::decimal, pm.target_price),
+        min_price          = COALESCE(NULLIF(v.min_price,'')::decimal,    pm.min_price),
+        notes              = COALESCE(NULLIF(v.notes,''),         pm.notes),
+        updated_at         = NOW()
       FROM (SELECT * FROM unnest(
         $1::int[], $2::text[], $3::text[], $4::text[], $5::text[],
-        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[]
+        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[]
       ) AS v(id, product_name, listing_id, opc, sku,
-             markup_type, markup_value, onbuy_fee, target_price, min_price, notes)) v
+             markup_type, markup_value, markup_is_explicit, onbuy_fee, target_price, min_price, notes)) v
       WHERE pm.id = v.id AND pm.user_id = ${req.effectiveUserId}`,
     [
       c.map(r => r._id),
@@ -1600,6 +1611,7 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
       c.map(r => r.onbuy_sku        || ''),
       c.map(r => r.markup_type      || 'roi'),
       c.map(r => String(r.markup_value ?? 0)),
+      c.map(r => String(r.markup_is_explicit === true ? 'true' : 'false')),
       c.map(r => String(r.onbuy_fee  ?? 0)),
       c.map(r => r.target_price != null ? String(r.target_price) : ''),
       c.map(r => r.min_price    != null ? String(r.min_price)    : ''),
@@ -1614,7 +1626,7 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
     await db.query(`
       INSERT INTO product_mappings
         (product_name, onbuy_listing_id, onbuy_opc, onbuy_sku, primary_asin,
-         markup_type, markup_value, onbuy_fee, target_price, min_price, notes,
+         markup_type, markup_value, markup_is_explicit, onbuy_fee, target_price, min_price, notes,
          onbuy_account_id, user_id, is_active)
       SELECT
         NULLIF(v.product_name,''),
@@ -1624,6 +1636,7 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
         v.asin,
         v.markup_type,
         v.markup_value::decimal,
+        v.markup_is_explicit::boolean,
         v.onbuy_fee::decimal,
         NULLIF(v.target_price,'')::decimal,
         NULLIF(v.min_price,'')::decimal,
@@ -1633,9 +1646,9 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
         true
       FROM unnest(
         $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[]
+        $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[]
       ) AS v(product_name, listing_id, opc, sku, asin,
-             markup_type, markup_value, onbuy_fee, target_price, min_price, notes, account_id, user_id)`,
+             markup_type, markup_value, markup_is_explicit, onbuy_fee, target_price, min_price, notes, account_id, user_id)`,
     [
       c.map(r => r.product_name     || ''),
       c.map(r => r.onbuy_listing_id || ''),
@@ -1644,6 +1657,7 @@ app.post('/api/import/confirm', requireAuth, async (req, res) => {
       c.map(r => r.primary_asin),
       c.map(r => r.markup_type      || 'roi'),
       c.map(r => String(r.markup_value ?? 0)),
+      c.map(r => String(r.markup_is_explicit === true ? 'true' : 'false')),
       c.map(r => String(r.onbuy_fee  ?? 0)),
       c.map(r => r.target_price != null ? String(r.target_price) : ''),
       c.map(r => r.min_price    != null ? String(r.min_price)    : ''),
@@ -1942,6 +1956,9 @@ async function runMigrations() {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_dbj_user   ON onbuy_delete_brand_jobs(user_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_dbjl_job   ON onbuy_delete_brand_job_logs(job_id, created_at ASC)`,
+    // markup_is_explicit: true = ROI was set explicitly in the import sheet; false = defaulted from global setting.
+    // Rows default to false so the repricer always uses the user's current default ROI for pre-existing products.
+    `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS markup_is_explicit BOOLEAN NOT NULL DEFAULT FALSE`,
   ];
   for (const sql of steps) {
     try {

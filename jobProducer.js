@@ -101,6 +101,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
              pm.onbuy_opc,
              pm.markup_type,
              pm.markup_value,
+             pm.markup_is_explicit,
              pm.min_price,
              pm.last_amazon_price,
              pm.last_onbuy_price,

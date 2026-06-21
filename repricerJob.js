@@ -764,7 +764,10 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
 
   const effFeeRate  = userSettings.feeRate      ?? _onbuyFeeRate;
   const effMinRoi   = userSettings.minRoiPercent ?? _minRoiPercent;
-  let markup_value = parseFloat(mapping.markup_value) || (userSettings.defaultRoi ?? _defaultRoi);
+  // Only use the stored markup_value when the user explicitly set it in their import sheet.
+  // When not explicit (defaulted at import time), always use the current global default ROI
+  // so that changing "Default ROI %" in Settings takes effect immediately on the next reprice run.
+  let markup_value = (mapping.markup_is_explicit ? parseFloat(mapping.markup_value) : 0) || (userSettings.defaultRoi ?? _defaultRoi);
 
   // Auto-correct markup_value that was corrupted by a previous CheckWinning run.
   // A stored ROI below the user's own minimum threshold is always wrong — a user
