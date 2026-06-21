@@ -1959,6 +1959,15 @@ async function runMigrations() {
     // markup_is_explicit: true = ROI was set explicitly in the import sheet; false = defaulted from global setting.
     // Rows default to false so the repricer always uses the user's current default ROI for pre-existing products.
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS markup_is_explicit BOOLEAN NOT NULL DEFAULT FALSE`,
+    // Back-fill: for every non-explicit ROI mapping, store the user's actual current default_roi_percent.
+    // This corrects historical rows that were stored with the hardcoded 20% fallback.
+    // Safe to run on every restart — only touches non-explicit rows, never overrides user-set values.
+    `UPDATE product_mappings pm
+     SET markup_value = COALESCE(
+       (SELECT value::decimal FROM settings WHERE user_id = pm.user_id AND key = 'default_roi_percent'),
+       pm.markup_value
+     )
+     WHERE pm.markup_type = 'roi' AND pm.markup_is_explicit = false`,
   ];
   for (const sql of steps) {
     try {
