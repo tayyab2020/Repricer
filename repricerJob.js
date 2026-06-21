@@ -134,10 +134,18 @@ class OnBuyUpdater {
     this._timers       = new Map(); // key → timer id
     this._stockBatches = new Map(); // key → [{ token, siteId, identifier, isSku, stock, resolve, reject }]
     this._stockTimers  = new Map(); // key → timer id (30-second window)
-    this._rrTs         = [];        // timestamps of sent requests (sliding 1-hour window)
+    this._rrTs         = new Map(); // per-account sliding windows: `${token}||${siteId}` → [timestamps]
     this._mutex        = Promise.resolve(); // serialises all batch flushes
     this._creds        = new Map(); // token → { consumerKey, secretKey } for refresh on 401
     this._tokenMap     = new Map(); // oldToken → newToken (redirect after 401 refresh)
+  }
+
+  // fetch() with a hard 60-second timeout so a hung OnBuy response never freezes the mutex chain.
+  _fetch(url, options = {}) {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 60_000);
+    return fetch(url, { ...options, signal: controller.signal })
+      .finally(() => clearTimeout(tid));
   }
 
   // Follow the redirect chain so stale tokens from job.data are silently
@@ -185,7 +193,7 @@ class OnBuyUpdater {
 
   // Enqueue a stock-only update (e.g. stock=0 for OOS, stock=2 for back-in-stock).
   // Uses a 30-second collection window (shorter than price's 5 min because OOS changes are urgent)
-  // and routes through the same _rrTs rate limiter so stock + price PUTs share the 200/hr ceiling.
+  // and routes through the same per-account _rrTs rate limiter so stock + price PUTs share the 200/hr ceiling.
   enqueueStock(rawToken, siteId, identifier, isSku, stock, { consumerKey, secretKey, userId = null } = {}) {
     return new Promise((resolve, reject) => {
       const token = this._resolveToken(rawToken);
@@ -216,18 +224,24 @@ class OnBuyUpdater {
     if (!batch || batch.length === 0) return;
     const items = batch.splice(0, this._maxBatch);
 
-    const now = Date.now();
-    this._rrTs = this._rrTs.filter(t => now - t < 3_600_000);
-    if (this._rrTs.length >= this._maxPerHour) {
-      const waitMs = 3_600_000 - (now - this._rrTs[0]) + 1000;
-      wlog(`[OnBuyUpdater] Rate limit reached (${this._rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
-      await new Promise(r => setTimeout(r, waitMs));
-      this._rrTs = this._rrTs.filter(t => Date.now() - t < 3_600_000);
-    }
-    this._rrTs.push(Date.now());
-
     const { token, siteId, isSku } = items[0];
     const batchUserId = items[0].userId ?? null;
+
+    // Per-account rate limit — each (token, siteId) pair has its own 200/hr budget
+    // so one slow account never blocks others waiting in the _mutex chain.
+    const rrKey = `${token}||${siteId}`;
+    let rrTs = this._rrTs.get(rrKey) || [];
+    const now = Date.now();
+    rrTs = rrTs.filter(t => now - t < 3_600_000);
+    if (rrTs.length >= this._maxPerHour) {
+      const waitMs = 3_600_000 - (now - rrTs[0]) + 1000;
+      wlog(`[OnBuyUpdater] Rate limit reached for account (${rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
+      await new Promise(r => setTimeout(r, waitMs));
+      rrTs = rrTs.filter(t => Date.now() - t < 3_600_000);
+    }
+    rrTs.push(Date.now());
+    this._rrTs.set(rrKey, rrTs);
+
     const endpoint    = isSku
       ? `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`
       : `https://api.onbuy.com/v2/listings?site_id=${siteId}`;
@@ -236,7 +250,7 @@ class OnBuyUpdater {
 
     ulog(batchUserId, `[OnBuyUpdater] Stock batch ${listingKey.toUpperCase()} ×${items.length}`, JSON.stringify({ listings }));
 
-    const doRequest = (authToken) => fetch(endpoint, {
+    const doRequest = (authToken) => this._fetch(endpoint, {
       method:  'PUT',
       headers: { Authorization: authToken, 'Content-Type': 'application/json' },
       body:    JSON.stringify({ listings }),
@@ -356,6 +370,7 @@ class OnBuyUpdater {
           });
         }
       );
+      req.setTimeout(30_000, () => { req.destroy(new Error('_checkWinning timeout')); });
       req.on('error', (e) => { wlog(`[CheckWinning] Error:`, e.message); resolve(null); });
       req.write(bodyBuf);
       req.end();
@@ -367,20 +382,25 @@ class OnBuyUpdater {
     if (!batch || batch.length === 0) return;
     const items = batch.splice(0, this._maxBatch);
 
-    // ── Sliding-window rate limit ──
-    const now = Date.now();
-    this._rrTs = this._rrTs.filter(t => now - t < 3_600_000);
-    if (this._rrTs.length >= this._maxPerHour) {
-      const waitMs = 3_600_000 - (now - this._rrTs[0]) + 1000;
-      wlog(`[OnBuyUpdater] Rate limit reached (${this._rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
-      await new Promise(r => setTimeout(r, waitMs));
-      this._rrTs = this._rrTs.filter(t => Date.now() - t < 3_600_000);
-    }
-    this._rrTs.push(Date.now());
-
     const { token, siteId, isSku } = items[0];
     // All items in a batch share the same account/token, so one userId covers the batch.
     const batchUserId = items[0].userId ?? null;
+
+    // ── Per-account sliding-window rate limit ──
+    // Each (token, siteId) pair gets its own 200/hr budget so a slow account's
+    // wait never blocks price updates for the other accounts in the _mutex chain.
+    const rrKey = `${token}||${siteId}`;
+    let rrTs = this._rrTs.get(rrKey) || [];
+    const now = Date.now();
+    rrTs = rrTs.filter(t => now - t < 3_600_000);
+    if (rrTs.length >= this._maxPerHour) {
+      const waitMs = 3_600_000 - (now - rrTs[0]) + 1000;
+      wlog(`[OnBuyUpdater] Rate limit reached for account (${rrTs.length}/${this._maxPerHour}/hr) — pausing ${Math.round(waitMs / 1000)}s`);
+      await new Promise(r => setTimeout(r, waitMs));
+      rrTs = rrTs.filter(t => Date.now() - t < 3_600_000);
+    }
+    rrTs.push(Date.now());
+    this._rrTs.set(rrKey, rrTs);
 
     // ── Check-winning: adjust prices for non-winning SKU listings ──
     if (isSku) {
@@ -484,7 +504,7 @@ class OnBuyUpdater {
 
     const listings   = sendItems.map(it => ({ [listingKey]: it.identifier, price: it.price.toFixed(2) }));
 
-    const doRequest = (authToken) => fetch(endpoint, {
+    const doRequest = (authToken) => this._fetch(endpoint, {
       method: 'PUT',
       headers: { Authorization: authToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ listings }),
