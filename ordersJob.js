@@ -402,8 +402,9 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
   }
 
   const meta     = (await sheets.spreadsheets.get({ spreadsheetId })).data;
-  const knownTabs = new Set((meta.sheets ?? []).map(s => s.properties?.title));
-  const tabIdMap  = new Map((meta.sheets ?? []).map(s => [s.properties?.title, s.properties?.sheetId]));
+  const knownTabs    = new Set((meta.sheets ?? []).map(s => s.properties?.title));
+  const tabIdMap     = new Map((meta.sheets ?? []).map(s => [s.properties?.title, s.properties?.sheetId]));
+  const tabRowCount  = new Map((meta.sheets ?? []).map(s => [s.properties?.title, s.properties?.gridProperties?.rowCount ?? 500]));
 
   // ── One-time migration: move 'Delivery Fee' to new position for ALL tabs ──────
   // Runs every sync but is a no-op once migrated (condition never re-triggers).
@@ -436,7 +437,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       if (ci['Selling Price'] == null)           continue;
       if (ci['Delivery Fee'] >= ci['Total Fee']) continue; // already in new position
 
-      migMeta.push({ tName, ci, tSheetId });
+      migMeta.push({ tName, ci, tSheetId, rowCount: tabRowCount.get(tName) ?? 500 });
     }
 
     if (migMeta.length > 0) {
@@ -485,7 +486,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       }
 
       const formulaUpdates = [];
-      for (const { tName, ci } of migMeta) {
+      for (const { tName, ci, rowCount } of migMeta) {
         const oldDFIdx = ci['Delivery Fee'];
         const spIdx    = ci['Selling Price'];
 
@@ -504,14 +505,14 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
 
         // Row 1 column-total SUM formulas for the three shifted columns
         formulaUpdates.push(
-          { range: `'${tName}'!${tfCol}1`, values: [[`=SUM(${tfCol}4:${tfCol}1000)`]] },
-          { range: `'${tName}'!${tcCol}1`, values: [[`=SUM(${tcCol}4:${tcCol}1000)`]] },
-          { range: `'${tName}'!${dfCol}1`, values: [[`=SUM(${dfCol}4:${dfCol}1000)`]] },
+          { range: `'${tName}'!${tfCol}1`, values: [[`=SUM(${tfCol}4:${tfCol}${rowCount})`]] },
+          { range: `'${tName}'!${tcCol}1`, values: [[`=SUM(${tcCol}4:${tcCol}${rowCount})`]] },
+          { range: `'${tName}'!${dfCol}1`, values: [[`=SUM(${dfCol}4:${dfCol}${rowCount})`]] },
         );
-        // Rewrite Total Fee formulas for all data rows (4-1000).
+        // Rewrite Total Fee formulas for all data rows up to the sheet's actual row count.
         // Sheets auto-expands a SUM range to track the moved column, producing the
         // wrong =SUM(N:S) — we must overwrite with the correct =SUM(OnbuyFee:VAT).
-        for (let r = 4; r <= 1000; r++) {
+        for (let r = 4; r <= rowCount; r++) {
           formulaUpdates.push({
             range: `'${tName}'!${tfCol}${r}`,
             values: [[`=SUM(${onbuyCol}${r}:${vatCol}${r})`]],
