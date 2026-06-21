@@ -2111,6 +2111,7 @@ export default function App() {
   const [syncing, setSyncing]       = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [queueBusy, setQueueBusy]   = useState(false);
+  const [queueState, setQueueState] = useState('idle'); // 'idle' | 'queued' | 'active'
   const [queueCounts, setQueueCounts] = useState(null);
   const [chartMapping, setChartMapping] = useState(null);
   const [jobInterval, setJobInterval]     = useState(null);
@@ -2169,6 +2170,7 @@ export default function App() {
     api("/queue-status").then(s => {
       if (!s) return;
       setQueueBusy(s.busy);
+      setQueueState(s.state ?? (s.busy ? 'active' : 'idle'));
       setQueueCounts(s);
     }).catch(() => {});
   }, []);
@@ -2211,6 +2213,7 @@ export default function App() {
       api("/queue-status").then(s => {
         if (!s) return;
         setQueueBusy(s.busy);
+        setQueueState(s.state ?? (s.busy ? 'active' : 'idle'));
         setQueueCounts(s);
         if (s.busy || attempts >= 30) {
           clearInterval(waitForBusy);
@@ -2301,25 +2304,27 @@ export default function App() {
         <div className="px-4 py-4 border-t border-separator space-y-2">
           {/* Sync button */}
           <button
-            onClick={() => { if (!syncing && !queueBusy) setSyncModalOpen(true); }}
-            disabled={syncing || queueBusy}
-            title={queueBusy
-              ? `Queue busy — fast: ${queueCounts?.fast?.waiting ?? 0}w/${queueCounts?.fast?.active ?? 0}a, slow: ${queueCounts?.slow?.waiting ?? 0}w/${queueCounts?.slow?.active ?? 0}a, keepa: ${queueCounts?.keepa?.waiting ?? 0}w/${queueCounts?.keepa?.active ?? 0}a`
-              : "Run repricer now"}
+            onClick={() => { if (!syncing && queueState === 'idle') setSyncModalOpen(true); }}
+            disabled={syncing || queueState !== 'idle'}
+            title={queueState === 'active'
+              ? `Jobs running — fast: ${queueCounts?.fast?.waiting ?? 0}w/${queueCounts?.fast?.active ?? 0}a, slow: ${queueCounts?.slow?.waiting ?? 0}w/${queueCounts?.slow?.active ?? 0}a, keepa: ${queueCounts?.keepa?.waiting ?? 0}w/${queueCounts?.keepa?.active ?? 0}a`
+              : queueState === 'queued'
+                ? "Job queued — waiting for a free worker"
+                : "Run repricer now"}
             className={[
               "w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg",
               "text-[13px] font-semibold transition-all duration-150",
-              (syncing || queueBusy)
+              (syncing || queueState !== 'idle')
                 ? "bg-accent/20 text-accent/60 cursor-not-allowed"
                 : "bg-accent text-black hover:bg-accent/90 active:scale-95 cursor-pointer",
             ].join(" ")}
           >
-            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${(syncing || queueBusy) ? "animate-spin" : ""}`} />
-            {syncing ? "Syncing…" : queueBusy ? "Jobs Running…" : "Sync All Now"}
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${(syncing || queueState !== 'idle') ? "animate-spin" : ""}`} />
+            {syncing || queueState === 'queued' ? "Syncing…" : queueState === 'active' ? "Jobs Running…" : "Sync All Now"}
           </button>
 
-          {/* Cancel running job */}
-          {queueBusy && (
+          {/* Cancel running job — only shown while actively running, not while queued */}
+          {queueState === 'active' && (
             <button
               onClick={async () => {
                 if (cancelling) return;
@@ -2327,6 +2332,7 @@ export default function App() {
                 try {
                   await api("/job/cancel", { method: "POST" });
                   setQueueBusy(false);
+                  setQueueState('idle');
                   setQueueCounts(null);
                 } catch (e) {
                   alert("Failed to cancel job: " + (e.message || "Unknown error"));
@@ -2343,14 +2349,16 @@ export default function App() {
           )}
 
           {/* Schedule info */}
-          <p className={`text-[10px] text-center ${queueBusy ? "text-amber" : "text-subdued"}`}>
-            {queueBusy
+          <p className={`text-[10px] text-center ${queueState !== 'idle' ? "text-amber" : "text-subdued"}`}>
+            {queueState === 'active'
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
-              : jobInterval === null
-                ? "Schedule not set"
-                : jobInterval === 0
-                  ? `Once daily at ${jobStartTime || "00:00"}`
-                  : `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`}
+              : queueState === 'queued'
+                ? "Waiting for a free worker…"
+                : jobInterval === null
+                  ? "Schedule not set"
+                  : jobInterval === 0
+                    ? `Once daily at ${jobStartTime || "00:00"}`
+                    : `Auto-runs every ${jobInterval >= 60 ? `${jobInterval / 60}h` : `${jobInterval} min`}`}
           </p>
 
           {/* User info + logout */}

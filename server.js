@@ -536,21 +536,26 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
     const uid = String(req.effectiveUserId);
     const pending = parseInt(await redis.get(`repricer:running:${uid}`) || '0');
-    if (pending > 0) {
-      res.json({ total: pending, busy: true });
-      return;
-    }
-    // Counter is 0/missing — check Keepa queue directly for this user's jobs.
-    // Handles the window where a refill job's DECRBY brings the counter to 0
-    // while the main Keepa job (or next queued job) is still waiting.
+
+    // Always check the Keepa queue — the counter alone can be 0 while a job is waiting
+    // (e.g. a refill job's DECRBY brings it to 0 before the next queued job starts).
     const [kWaiting, kActive, kDelayed] = await Promise.all([
       keepaQueue.getWaiting(),
       keepaQueue.getActive(),
       keepaQueue.getDelayed(),
     ]);
-    const busy = [...kWaiting, ...kActive, ...kDelayed]
-      .some(j => String(j.data?.userId) === uid);
-    res.json({ total: 0, busy });
+    const hasActiveKeepa  = kActive.some(j => String(j.data?.userId) === uid);
+    const hasQueuedKeepa  = !hasActiveKeepa &&
+      [...kWaiting, ...kDelayed].some(j => String(j.data?.userId) === uid);
+
+    // state: 'active'  → job is running now (counter > 0 OR active Keepa job)
+    //        'queued'  → job is waiting in queue (not yet running)
+    //        'idle'    → no job
+    const state = (pending > 0 || hasActiveKeepa) ? 'active'
+                : hasQueuedKeepa                   ? 'queued'
+                : 'idle';
+
+    res.json({ total: pending, busy: state !== 'idle', state });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
