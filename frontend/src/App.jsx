@@ -2353,7 +2353,7 @@ export default function App() {
             {queueState === 'active'
               ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
               : queueState === 'queued'
-                ? "Waiting for a free worker…"
+                ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} waiting in queue`
                 : jobInterval === null
                   ? "Schedule not set"
                   : jobInterval === 0

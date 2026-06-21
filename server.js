@@ -545,8 +545,9 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
       keepaQueue.getDelayed(),
     ]);
     const hasActiveKeepa  = kActive.some(j => String(j.data?.userId) === uid);
-    const hasQueuedKeepa  = !hasActiveKeepa &&
-      [...kWaiting, ...kDelayed].some(j => String(j.data?.userId) === uid);
+    const userQueuedJobs  = hasActiveKeepa ? [] :
+      [...kWaiting, ...kDelayed].filter(j => String(j.data?.userId) === uid);
+    const hasQueuedKeepa  = userQueuedJobs.length > 0;
 
     // state: 'active'  → job is running now (counter > 0 OR active Keepa job)
     //        'queued'  → job is waiting in queue (not yet running)
@@ -555,7 +556,15 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
                 : hasQueuedKeepa                   ? 'queued'
                 : 'idle';
 
-    res.json({ total: pending, busy: state !== 'idle', state });
+    // For 'queued' state, sum the ASIN counts from the waiting job payloads —
+    // mirrors the display logic in keepaWorker.on('active') and the Redis counter
+    // that the active state uses, so the number is consistent.
+    const total = state === 'queued'
+      ? userQueuedJobs.reduce((sum, j) =>
+          sum + (j.data?.pendingAsins?.length ?? j.data?.asins?.length ?? 0), 0)
+      : pending;
+
+    res.json({ total, busy: state !== 'idle', state });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
