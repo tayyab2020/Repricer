@@ -276,7 +276,7 @@ const SHEET_HEADERS = [
   'Tracking', 'Courier Name', 'Sourcing Link', 'Onbuy Link',
   '',                                                               // J (9)  yellow separator
   'Qty', 'Unit Price', 'Source Price',                             // K-M (10-12)
-  'Onbuy Fee', 'Boosted', 'VAT', 'Total Fee',                       // N-Q (13-16)
+  'Onbuy Fee', 'Boost Fee', 'VAT', 'Total Fee',                      // N-Q (13-16)
   'Total Cost', 'Delivery Fee', 'Selling Price', 'Net Profit',     // R-U (17-20)
   '',                                                               // V (21) yellow separator
   'ROI %', 'Status',                                               // W-X (22-23)
@@ -308,7 +308,7 @@ const MANUAL_HEADERS = new Set([
 const FORMULA_COLUMNS = {
   'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
-  'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
+  'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}-${colIdxToLetter(ci['Delivery Fee'])}${r}`,
   'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Net Profit'])}${r}/${colIdxToLetter(ci['Source Price'])}${r}*100)`,
 };
 
@@ -328,7 +328,7 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
   const deliveryFee = zeroed ? 0 : toNum(product.price_delivery_total ?? 0);
   const spBase      = toNum(product.total_price);
   const sellingPrice = zeroed ? 0 : (spBase === '' ? '' : spBase + deliveryFee);
-  const boosted     = parseFloat(product.commission_boost_marketing_percentage ?? 0) > 0 ? 'Yes' : '';
+  const boostFee    = zeroed ? 0 : toNum(product.fee?.total_boost_fee ?? 0);
   const rawStatus = (order.status ?? '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const status    = rawStatus === 'Cancelled By Customer' ? 'Cancelled By Buyer' : rawStatus;
   const rawData   = order.raw_data ?? {};
@@ -349,7 +349,7 @@ function buildSheetRow(order, product, vatRate, enriched = {}) {
     'Unit Price':        toNum(product.unit_price),
     'Selling Price':     sellingPrice,
     'Onbuy Fee':         toNum(fee),
-    'Boosted':           boosted,
+    'Boost Fee':         boostFee,
     'VAT':               toNum(vat),
     'Delivery Fee':      deliveryFee,
     'Status':            status,
@@ -530,6 +530,28 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
           }).catch(e => log(`[Migration] formula write error: ${e.message}`));
         }
       }
+    }
+
+    // Rename 'Boosted' header → 'Boost Fee' in any tab that still has the old name.
+    const headerRenames = [];
+    for (let i = 0; i < hdrRanges.length; i++) {
+      const headerRow = hdrRanges[i].values?.[0] ?? [];
+      const tName = allTabNames[i];
+      headerRow.forEach((h, idx) => {
+        if (String(h).trim() === 'Boosted') {
+          headerRenames.push({
+            range: `'${tName}'!${colIdxToLetter(idx)}3`,
+            values: [['Boost Fee']],
+          });
+        }
+      });
+    }
+    if (headerRenames.length > 0) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: { valueInputOption: 'RAW', data: headerRenames },
+      }).catch(e => log(`[Migration] header rename error: ${e.message}`));
+      log(`[Migration] renamed 'Boosted' → 'Boost Fee' in ${headerRenames.length} tab(s)`);
     }
   }
 
