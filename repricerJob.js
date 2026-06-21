@@ -1394,10 +1394,20 @@ keepaWorker.on('active', (job) => {
   if (userId) {
     _runUserIds.add(userId);
     // TTL covers the full remaining work: one hour per 1800-ASIN refill cycle plus 2 h buffer.
-    // Using EX 1800 (30 min) caused the key to expire when pm2 restarted mid-run, making
-    // the UI fall back to the BullMQ queue count instead of the Keepa-managed counter.
     const activeTtl = (Math.ceil(displayCount / KEEPA_HOURLY_FILL) + 2) * 3600;
-    redis.set(`repricer:running:${userId}`, displayCount, 'EX', activeTtl).catch(() => {});
+    // Don't shrink the counter if a larger value is already there (e.g. the main job's
+    // 8207-ASIN counter from the NX enqueue fix when a smaller 1500-ASIN refill fires).
+    // GET first, then SET only if current < displayCount; otherwise just extend the TTL.
+    redis.get(`repricer:running:${userId}`).then(cur => {
+      const current = parseInt(cur || '0');
+      if (current < displayCount) {
+        redis.set(`repricer:running:${userId}`, displayCount, 'EX', activeTtl).catch(() => {});
+      } else {
+        redis.expire(`repricer:running:${userId}`, activeTtl).catch(() => {});
+      }
+    }).catch(() => {
+      redis.set(`repricer:running:${userId}`, displayCount, 'EX', activeTtl).catch(() => {});
+    });
   }
 });
 keepaWorker.on('completed', (job, result) => {

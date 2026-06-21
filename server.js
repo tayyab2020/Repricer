@@ -534,8 +534,23 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 // sees that user's count via effectiveUserId.
 app.get('/api/queue-status', requireAuth, async (req, res) => {
   try {
-    const pending = parseInt(await redis.get(`repricer:running:${req.effectiveUserId}`) || '0');
-    res.json({ total: pending, busy: pending > 0 });
+    const uid = String(req.effectiveUserId);
+    const pending = parseInt(await redis.get(`repricer:running:${uid}`) || '0');
+    if (pending > 0) {
+      res.json({ total: pending, busy: true });
+      return;
+    }
+    // Counter is 0/missing — check Keepa queue directly for this user's jobs.
+    // Handles the window where a refill job's DECRBY brings the counter to 0
+    // while the main Keepa job (or next queued job) is still waiting.
+    const [kWaiting, kActive, kDelayed] = await Promise.all([
+      keepaQueue.getWaiting(),
+      keepaQueue.getActive(),
+      keepaQueue.getDelayed(),
+    ]);
+    const busy = [...kWaiting, ...kActive, ...kDelayed]
+      .some(j => String(j.data?.userId) === uid);
+    res.json({ total: 0, busy });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
