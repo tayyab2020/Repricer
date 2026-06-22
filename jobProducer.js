@@ -107,6 +107,12 @@ async function fetchAllListingsForAccount(token, siteId, log) {
   return allListings;
 }
 
+// Returns true only if the value matches the Amazon ASIN pattern (B + 9 alphanumeric chars).
+// OnBuy seller SKUs are ASIN-format for cross-listed products; non-ASIN SKUs cannot be repriced.
+function isAsin(s) {
+  return /^B[0-9A-Z]{9}$/i.test((s || '').trim());
+}
+
 async function syncAccountListings(account, db, log) {
   const label     = account.account_name || `id=${account.id}`;
   const userId    = account.user_id;
@@ -135,13 +141,19 @@ async function syncAccountListings(account, db, log) {
   }
   log(`[ListingSync] "${label}" — ${listings.length} listing(s) to sync`);
 
+  // Look up existing rows by BOTH sku and uid to avoid creating duplicates when
+  // the same listing was previously imported via Excel with a different key.
   const skus = [...new Set(listings.map(l => l.sku).filter(Boolean))];
+  const uids = [...new Set(listings.map(l => String(l.uid || l.listing_uid || l.id || '')).filter(Boolean))];
+
   const { rows: existing } = await db.query(
-    `SELECT id, onbuy_sku FROM product_mappings
-     WHERE onbuy_account_id = $1 AND user_id = $2 AND onbuy_sku = ANY($3)`,
-    [accountId, userId, skus]
+    `SELECT id, onbuy_sku, onbuy_listing_id FROM product_mappings
+     WHERE onbuy_account_id = $1 AND user_id = $2
+       AND (onbuy_sku = ANY($3) OR onbuy_listing_id = ANY($4))`,
+    [accountId, userId, skus.length ? skus : ['__none__'], uids.length ? uids : ['__none__']]
   );
-  const existingSkuMap = new Map(existing.map(r => [r.onbuy_sku, r.id]));
+  const bySkuMap = new Map(existing.filter(r => r.onbuy_sku).map(r => [r.onbuy_sku, r.id]));
+  const byUidMap = new Map(existing.filter(r => r.onbuy_listing_id).map(r => [r.onbuy_listing_id, r.id]));
 
   const toUpdate = [];
   const toInsert = [];
@@ -153,12 +165,18 @@ async function syncAccountListings(account, db, log) {
     const uid   = String(listing.uid || listing.listing_uid || listing.id || listing.product_listing_id || '').trim();
     const opc   = String(listing.opc || listing.product_encoded_id || '').trim();
     const name  = String(listing.name || listing.product_name || listing.title || '').trim();
-    const price = listing.price != null ? parseFloat(listing.price) : null;
+    const rawPrice = listing.price;
+    const price = rawPrice != null && !isNaN(parseFloat(rawPrice)) ? parseFloat(rawPrice) : null;
+    // Only use the SKU as the Amazon ASIN when it actually matches the ASIN format.
+    // Non-ASIN SKUs (barcodes, product codes, etc.) cannot be scraped on Amazon and
+    // would cause the repricer to skip the listing entirely on every run.
+    const asin  = isAsin(sku) ? sku.toUpperCase().trim() : null;
 
-    if (existingSkuMap.has(sku)) {
-      toUpdate.push({ id: existingSkuMap.get(sku), uid, opc, name, price });
+    const existId = bySkuMap.get(sku) || (uid && byUidMap.get(uid));
+    if (existId) {
+      toUpdate.push({ id: existId, uid, opc, name, price });
     } else {
-      toInsert.push({ sku, uid, opc, name, price });
+      toInsert.push({ sku, asin, uid, opc, name, price });
     }
   }
 
@@ -189,46 +207,55 @@ async function syncAccountListings(account, db, log) {
     ]);
   }
 
+  let skippedNonAsin = 0;
   for (let i = 0; i < toInsert.length; i += CHUNK) {
     const c = toInsert.slice(i, i + CHUNK);
+    // Skip new rows where the SKU is not a valid ASIN — those can't be repriced and
+    // would permanently spam the repricer log with "no Amazon price" errors.
+    const withAsin = c.filter(r => r.asin);
+    skippedNonAsin += c.length - withAsin.length;
+    if (!withAsin.length) continue;
+
     await db.query(`
       INSERT INTO product_mappings
         (user_id, onbuy_account_id, onbuy_sku, primary_asin,
          onbuy_listing_id, onbuy_opc, product_name, last_onbuy_price,
          markup_type, markup_value, markup_is_explicit, is_active)
       SELECT
-        $6::int,
         $7::int,
+        $8::int,
         v.sku,
-        v.sku,
-        NULLIF(v.uid, ''),
-        NULLIF(v.opc, ''),
-        NULLIF(v.name, ''),
+        v.asin,
+        NULLIF(v.uid,   ''),
+        NULLIF(v.opc,   ''),
+        NULLIF(v.name,  ''),
         NULLIF(v.price, '')::decimal,
         'roi',
-        $8::decimal,
+        $9::decimal,
         false,
         true
       FROM (
         SELECT unnest($1::text[]) AS sku,
-               unnest($2::text[]) AS uid,
-               unnest($3::text[]) AS opc,
-               unnest($4::text[]) AS name,
-               unnest($5::text[]) AS price
+               unnest($2::text[]) AS asin,
+               unnest($3::text[]) AS uid,
+               unnest($4::text[]) AS opc,
+               unnest($5::text[]) AS name,
+               unnest($6::text[]) AS price
       ) v
     `, [
-      c.map(r => r.sku),
-      c.map(r => r.uid),
-      c.map(r => r.opc),
-      c.map(r => r.name),
-      c.map(r => r.price != null ? String(r.price) : ''),
+      withAsin.map(r => r.sku),
+      withAsin.map(r => r.asin),
+      withAsin.map(r => r.uid),
+      withAsin.map(r => r.opc),
+      withAsin.map(r => r.name),
+      withAsin.map(r => r.price != null ? String(r.price) : ''),
       userId,
       accountId,
       defaultRoi,
     ]);
   }
 
-  log(`[ListingSync] "${label}" — updated ${toUpdate.length}, inserted ${toInsert.length}`);
+  log(`[ListingSync] "${label}" — updated ${toUpdate.length}, inserted ${toInsert.length - skippedNonAsin}${skippedNonAsin ? ` (${skippedNonAsin} skipped — non-ASIN SKU)` : ''}`);
 }
 
 export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
