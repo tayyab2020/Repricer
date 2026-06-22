@@ -617,7 +617,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
         const row1Formulas = [];
         for (let ci = 11; ci <= 20; ci++) {
           const col = colIdxToLetter(ci);
-          row1Formulas.push({ range: `'${tabName}'!${col}1`, values: [[`=SUM(${col}4:${col}1000)`]] });
+          row1Formulas.push({ range: `'${tabName}'!${col}1`, values: [[`=SUM(${col}4:${col})`]] });
         }
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId,
@@ -661,7 +661,7 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
             spreadsheetId,
             requestBody: { valueInputOption: 'USER_ENTERED', data: [
               { range: `'${tabName}'!${newColLetter}3`, values: [['Delivery Fee']] },
-              { range: `'${tabName}'!${newColLetter}1`, values: [[`=SUM(${newColLetter}4:${newColLetter}1000)`]] },
+              { range: `'${tabName}'!${newColLetter}1`, values: [[`=SUM(${newColLetter}4:${newColLetter})`]] },
             ]},
           });
           // Shift all colIdx entries at or after the insert point, then register the new column
@@ -765,6 +765,28 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
           updatedRows++;
         } else {
           newRowObjs.push({ orderId: order.order_id, rowObj });
+        }
+      }
+
+      // Expand the sheet grid if new rows would exceed the current row count.
+      // Sheets API rejects writes to rows beyond the grid size with "exceeds grid limits".
+      if (newRowObjs.length > 0) {
+        const currentGridRows = tabRowCount.get(tabName) ?? 1000;
+        const rowsAfterInsert = existingVals.length + newRowObjs.length;
+        if (rowsAfterInsert >= currentGridRows) {
+          const rowsToAdd = rowsAfterInsert - currentGridRows + 200; // 200-row headroom
+          const tabSheetId = tabIdMap.get(tabName);
+          if (tabSheetId != null) {
+            try {
+              await sheets.spreadsheets.batchUpdate({
+                spreadsheetId,
+                requestBody: { requests: [{ appendDimension: { sheetId: tabSheetId, dimension: 'ROWS', length: rowsToAdd } }] },
+              });
+              tabRowCount.set(tabName, currentGridRows + rowsToAdd);
+            } catch (e) {
+              log(`[Sheet] appendDimension error on "${tabName}": ${e.message}`);
+            }
+          }
         }
       }
 
