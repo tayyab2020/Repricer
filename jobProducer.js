@@ -66,6 +66,171 @@ export async function getTokenForAccount(account, { retries = 2, log = null } = 
   return null;
 }
 
+// ─────────────────────────────────────────────
+// LISTING SYNC
+// Fetch all seller listings from OnBuy (paginated by 1000) and upsert them
+// into product_mappings so the repricer always works on current store state.
+// ─────────────────────────────────────────────
+
+async function fetchAllListingsForAccount(token, siteId, log) {
+  const allListings = [];
+  let offset = 0;
+  const limit = 1000;
+
+  while (true) {
+    try {
+      const url = `https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=${limit}&offset=${offset}`;
+      const r = await fetch(url, { headers: { Authorization: token } });
+      if (!r.ok) {
+        log(`[ListingSync] OnBuy listings API error: HTTP ${r.status}`);
+        break;
+      }
+      const data = await r.json().catch(() => ({}));
+      const results = Array.isArray(data) ? data : (data.results ?? data.payload ?? data.listings ?? []);
+      if (!results.length) break;
+
+      allListings.push(...results);
+      log(`[ListingSync] Fetched page offset=${offset}: ${results.length} listings (total so far: ${allListings.length})`);
+
+      if (results.length < limit) break;
+      const total = data.total ?? data.count ?? null;
+      if (total !== null && allListings.length >= total) break;
+
+      offset += limit;
+      await new Promise(r => setTimeout(r, 300));
+    } catch (err) {
+      log(`[ListingSync] Fetch error at offset=${offset}: ${err.message}`);
+      break;
+    }
+  }
+
+  return allListings;
+}
+
+async function syncAccountListings(account, db, log) {
+  const label     = account.account_name || `id=${account.id}`;
+  const userId    = account.user_id;
+  const accountId = account.id;
+  const siteId    = account.site_id || '2000';
+
+  const token = await getTokenForAccount(account, { log });
+  if (!token) {
+    log(`[ListingSync] ⚠️  No token for "${label}" — skipping`);
+    return;
+  }
+
+  let defaultRoi = 20;
+  try {
+    const { rows: sRows } = await db.query(
+      `SELECT value FROM settings WHERE user_id = $1 AND key = 'default_roi_percent' LIMIT 1`,
+      [userId]
+    );
+    if (sRows[0]?.value) defaultRoi = parseFloat(sRows[0].value);
+  } catch {}
+
+  const listings = await fetchAllListingsForAccount(token, siteId, log);
+  if (!listings.length) {
+    log(`[ListingSync] "${label}" — no listings returned`);
+    return;
+  }
+  log(`[ListingSync] "${label}" — ${listings.length} listing(s) to sync`);
+
+  const skus = [...new Set(listings.map(l => l.sku).filter(Boolean))];
+  const { rows: existing } = await db.query(
+    `SELECT id, onbuy_sku FROM product_mappings
+     WHERE onbuy_account_id = $1 AND user_id = $2 AND onbuy_sku = ANY($3)`,
+    [accountId, userId, skus]
+  );
+  const existingSkuMap = new Map(existing.map(r => [r.onbuy_sku, r.id]));
+
+  const toUpdate = [];
+  const toInsert = [];
+
+  for (const listing of listings) {
+    const sku = listing.sku;
+    if (!sku) continue;
+
+    const uid   = String(listing.uid || listing.listing_uid || listing.id || listing.product_listing_id || '').trim();
+    const opc   = String(listing.opc || listing.product_encoded_id || '').trim();
+    const name  = String(listing.name || listing.product_name || listing.title || '').trim();
+    const price = listing.price != null ? parseFloat(listing.price) : null;
+
+    if (existingSkuMap.has(sku)) {
+      toUpdate.push({ id: existingSkuMap.get(sku), uid, opc, name, price });
+    } else {
+      toInsert.push({ sku, uid, opc, name, price });
+    }
+  }
+
+  const CHUNK = 1000;
+
+  for (let i = 0; i < toUpdate.length; i += CHUNK) {
+    const c = toUpdate.slice(i, i + CHUNK);
+    await db.query(`
+      UPDATE product_mappings pm SET
+        onbuy_listing_id = CASE WHEN v.uid  <> '' THEN v.uid  ELSE pm.onbuy_listing_id END,
+        onbuy_opc        = CASE WHEN v.opc  <> '' THEN v.opc  ELSE pm.onbuy_opc        END,
+        product_name     = CASE WHEN v.name <> '' THEN v.name ELSE pm.product_name      END,
+        last_onbuy_price = CASE WHEN v.price <> '' THEN v.price::decimal ELSE pm.last_onbuy_price END
+      FROM (
+        SELECT unnest($1::int[])  AS id,
+               unnest($2::text[]) AS uid,
+               unnest($3::text[]) AS opc,
+               unnest($4::text[]) AS name,
+               unnest($5::text[]) AS price
+      ) v
+      WHERE pm.id = v.id
+    `, [
+      c.map(r => r.id),
+      c.map(r => r.uid),
+      c.map(r => r.opc),
+      c.map(r => r.name),
+      c.map(r => r.price != null ? String(r.price) : ''),
+    ]);
+  }
+
+  for (let i = 0; i < toInsert.length; i += CHUNK) {
+    const c = toInsert.slice(i, i + CHUNK);
+    await db.query(`
+      INSERT INTO product_mappings
+        (user_id, onbuy_account_id, onbuy_sku, primary_asin,
+         onbuy_listing_id, onbuy_opc, product_name, last_onbuy_price,
+         markup_type, markup_value, markup_is_explicit, is_active)
+      SELECT
+        $6::int,
+        $7::int,
+        v.sku,
+        v.sku,
+        NULLIF(v.uid, ''),
+        NULLIF(v.opc, ''),
+        NULLIF(v.name, ''),
+        NULLIF(v.price, '')::decimal,
+        'roi',
+        $8::decimal,
+        false,
+        true
+      FROM (
+        SELECT unnest($1::text[]) AS sku,
+               unnest($2::text[]) AS uid,
+               unnest($3::text[]) AS opc,
+               unnest($4::text[]) AS name,
+               unnest($5::text[]) AS price
+      ) v
+    `, [
+      c.map(r => r.sku),
+      c.map(r => r.uid),
+      c.map(r => r.opc),
+      c.map(r => r.name),
+      c.map(r => r.price != null ? String(r.price) : ''),
+      userId,
+      accountId,
+      defaultRoi,
+    ]);
+  }
+
+  log(`[ListingSync] "${label}" — updated ${toUpdate.length}, inserted ${toInsert.length}`);
+}
+
 export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
   const jlog = log ?? ((...a) => console.log(`[${new Date().toISOString()}]`, ...a));
   jlog('\n' + '═'.repeat(60));
@@ -73,6 +238,27 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
   jlog('═'.repeat(60));
 
   try {
+    // ── Step 0: Sync listings from OnBuy ─────────────────────────────────────
+    // Skip for targeted retries (mappingIds) and Keepa-flush calls — those work
+    // on an already-known set of mappings and don't need a fresh store sync.
+    if (!mappingIds?.length && !fromKeepaFlush) {
+      jlog('[ListingSync] Fetching all listings from OnBuy store(s)…');
+      try {
+        const acctWhere  = userId    ? 'WHERE is_active = true AND user_id = $1'
+                         : accountId ? 'WHERE is_active = true AND id = $1'
+                         :             'WHERE is_active = true';
+        const acctParams = (userId || accountId) ? [userId ?? accountId] : [];
+        const { rows: syncAccounts } = await db.query(
+          `SELECT * FROM onbuy_accounts ${acctWhere} ORDER BY id`, acctParams
+        );
+        for (const acct of syncAccounts) {
+          await syncAccountListings(acct, db, jlog);
+        }
+      } catch (syncErr) {
+        jlog(`[ListingSync] ⚠️  Sync error (continuing to reprice): ${syncErr.message}`);
+      }
+    }
+
     const conditions  = ['pm.is_active = true'];
     const queryParams = [];
     if (userId) {
