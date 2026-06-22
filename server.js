@@ -1968,6 +1968,9 @@ async function runMigrations() {
        pm.markup_value
      )
      WHERE pm.markup_type = 'roi' AND pm.markup_is_explicit = false`,
+    // Widen varchar columns that may have been created with length caps — OnBuy SKUs can exceed 20 chars
+    `ALTER TABLE product_mappings ALTER COLUMN primary_asin TYPE TEXT`,
+    `ALTER TABLE product_mappings ALTER COLUMN onbuy_sku    TYPE TEXT`,
   ];
   for (const sql of steps) {
     try {
