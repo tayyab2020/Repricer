@@ -1390,4 +1390,4 @@ export function startWorker() {
 // Allow direct execution: node ordersJob.js
 const _thisFile = resolve(fileURLToPath(import.meta.url));
 const _mainFile = process.argv[1] ? resolve(process.argv[1]) : '';
-if (_thisFile === _mainFile) startWorker();
+if (_thisFile === _mainFile || process.env.pm_id !== undefined) startWorker();
