@@ -265,6 +265,20 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
   jlog('═'.repeat(60));
 
   try {
+    // ── Cancel guard ──────────────────────────────────────────────────────────
+    // If the user clicked Cancel within the last 10 minutes, abort immediately.
+    // This prevents a Keepa browser session that outlived the cancel signal from
+    // re-triggering pricing jobs via its flush callback (fromKeepaFlush path).
+    if (userId) {
+      try {
+        const cancelledAt = await redis.get(`keepa:cancelled:${userId}`);
+        if (cancelledAt && Date.now() - parseInt(cancelledAt) < 10 * 60 * 1000) {
+          jlog(`[Job] ⏭️  Run skipped — user cancelled ${Math.round((Date.now() - parseInt(cancelledAt)) / 1000)}s ago`);
+          return;
+        }
+      } catch {}
+    }
+
     // ── Step 0: Sync listings from OnBuy ─────────────────────────────────────
     // Skip for targeted retries (mappingIds) and Keepa-flush calls — those work
     // on an already-known set of mappings and don't need a fresh store sync.

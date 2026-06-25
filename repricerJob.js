@@ -2630,6 +2630,23 @@ async function _checkAllDone() {
 // Covers both OnBuy 401 errors and Amazon scrape failures (all_methods_failed, etc.).
 async function _scheduleRetry(userIds, runStart) {
   if (!runStart || !userIds.length) return;
+
+  // If any user cancelled the run in the last 10 minutes, skip their retry entirely.
+  // The cancel guard in runRepricerJob would catch it too, but checking here avoids
+  // the unnecessary sync_logs query and avoids orphaned _retryPendingFor entries.
+  const activeUserIds = [];
+  for (const uid of userIds) {
+    try {
+      const cancelledAt = await redis.get(`keepa:cancelled:${uid}`);
+      if (cancelledAt && Date.now() - parseInt(cancelledAt) < 10 * 60 * 1000) {
+        ulog(uid, `[Retry] Skipping — run was cancelled ${Math.round((Date.now() - parseInt(cancelledAt)) / 1000)}s ago`);
+        continue;
+      }
+    } catch {}
+    activeUserIds.push(uid);
+  }
+  if (!activeUserIds.length) return;
+  userIds = activeUserIds;
   const retries = [];
   for (const userId of userIds) {
     try {
@@ -2685,7 +2702,7 @@ async function _scheduleRetry(userIds, runStart) {
   await Promise.all(retries.map(async ({ userId, ids }) => {
     ulog(userId, `[Retry] ${ids.length} failed listing(s) — retrying once`);
     try {
-      await runRepricerJob({ userId, mappingIds: ids, log: (...args) => ulog(userId, ...args) });
+      await runRepricerJob({ userId, mappingIds: ids, skipKeepa: true, log: (...args) => ulog(userId, ...args) });
     } catch (err) {
       ulog(userId, '[Retry] runRepricerJob error:', err.message);
       _retryPendingFor.delete(userId);
