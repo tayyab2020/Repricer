@@ -4948,6 +4948,7 @@ function BulkActionsSection({ accounts }) {
 
 function DeleteListingsPage() {
   const [step, setStep]           = useState(1);
+  const [mode, setMode]           = useState("delete"); // "delete" | "oos" | "restock"
   const [accounts, setAccounts]   = useState([]);
   const [accountId, setAccountId] = useState("");
   const [file, setFile]           = useState(null);
@@ -4956,6 +4957,13 @@ function DeleteListingsPage() {
   const [loading, setLoading]     = useState(false);
   const [err, setErr]             = useState("");
   const [dragOver, setDragOver]   = useState(false);
+
+  const MODE_CONFIG = {
+    delete:  { label: "Delete Listings",  color: "#ef4444", btnLabel: (n) => `Delete ${n} Listing${n !== 1 ? "s" : ""}`,  loadLabel: "Deleting…",   doneLabel: "Delete More",   warning: (n) => `${n} listing${n !== 1 ? "s" : ""} will be permanently deleted from OnBuy.` },
+    oos:     { label: "OOS Listings",     color: C.amber,   btnLabel: (n) => `Mark ${n} Listing${n !== 1 ? "s" : ""} OOS`, loadLabel: "Marking OOS…", doneLabel: "Mark More OOS", warning: (n) => `${n} listing${n !== 1 ? "s" : ""} will have their stock set to 0 (out of stock) on OnBuy.` },
+    restock: { label: "Restock Listings", color: C.accent,  btnLabel: (n) => `Restock ${n} Listing${n !== 1 ? "s" : ""}`, loadLabel: "Restocking…", doneLabel: "Restock More", warning: (n) => `${n} listing${n !== 1 ? "s" : ""} will have their stock set to 5 on OnBuy.` },
+  };
+  const mc = MODE_CONFIG[mode];
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
@@ -4985,12 +4993,13 @@ function DeleteListingsPage() {
     if (!accountId) { setErr("Please select an OnBuy account"); return; }
     setLoading(true); setErr("");
     try {
-      const r = await api("/delete-listings/delete", {
+      const endpoint = mode === "oos" ? "/delete-listings/oos" : mode === "restock" ? "/delete-listings/restock" : "/delete-listings/delete";
+      const r = await api(endpoint, {
         method: "POST",
         body: JSON.stringify({ skus: preview.rows.map(r => r.sku), onbuy_account_id: accountId }),
       });
       if (!r) { setLoading(false); return; }
-      setResult(r); setStep(3);
+      setResult({ ...r, _mode: mode }); setStep(3);
     } catch (e) { setErr(e.message); }
     setLoading(false);
   }
@@ -5032,6 +5041,22 @@ function DeleteListingsPage() {
 
       {step === 1 && (
         <Section>
+          <div style={{ padding: "16px 20px 0", borderBottom: `1px solid ${C.border}`, marginBottom: 0 }}>
+            <div style={{ display: "flex" }}>
+              {Object.entries(MODE_CONFIG).map(([key, cfg], i, arr) => (
+                <button key={key} onClick={() => setMode(key)} style={{
+                  flex: 1, padding: "10px 16px", fontSize: 13, fontWeight: mode === key ? 700 : 400,
+                  background: mode === key ? cfg.color + "18" : "transparent",
+                  color: mode === key ? cfg.color : C.muted,
+                  border: "none", borderBottom: mode === key ? `2px solid ${cfg.color}` : "2px solid transparent",
+                  borderRight: i < arr.length - 1 ? `1px solid ${C.border}` : "none",
+                  cursor: "pointer", transition: "all 0.15s",
+                }}>
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <div
             style={dropStyle}
             onClick={() => document.getElementById("del-file-input").click()}
@@ -5072,13 +5097,15 @@ function DeleteListingsPage() {
 
       {step === 2 && preview && (
         <div>
-          <div style={{ background: "#ef444415", border: "1px solid #ef444455", borderRadius: 10,
+          <div style={{ background: mc.color + "15", border: `1px solid ${mc.color}55`, borderRadius: 10,
             padding: "14px 18px", marginBottom: 20, display: "flex", gap: 12, alignItems: "flex-start" }}>
             <span style={{ fontSize: 20 }}>⚠️</span>
             <div>
-              <div style={{ color: "#ef4444", fontWeight: 700, fontSize: 14 }}>This action cannot be undone</div>
+              <div style={{ color: mc.color, fontWeight: 700, fontSize: 14 }}>
+                {mode === "delete" ? "This action cannot be undone" : "Please review before confirming"}
+              </div>
               <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>
-                {preview.total} listing{preview.total !== 1 ? "s" : ""} will be permanently deleted from OnBuy.
+                {mc.warning(preview.total)}
               </div>
             </div>
           </div>
@@ -5121,8 +5148,8 @@ function DeleteListingsPage() {
             <div style={{ display: "flex", gap: 10 }}>
               <Btn variant="secondary" onClick={reset}>Cancel</Btn>
               <Btn onClick={runDelete} disabled={loading || !accountId}
-                style={{ background: "#ef4444", borderColor: "#ef4444" }}>
-                {loading ? "Deleting…" : `Delete ${preview.total} Listing${preview.total !== 1 ? "s" : ""}`}
+                style={{ background: mc.color, borderColor: mc.color, color: mode === "delete" ? "#fff" : "#000" }}>
+                {loading ? mc.loadLabel : mc.btnLabel(preview.total)}
               </Btn>
             </div>
           </Section>
@@ -5131,48 +5158,56 @@ function DeleteListingsPage() {
 
       {step === 3 && result && (
         <Section>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
-            <StatCard label="Total"     value={result.total}    color={C.text} />
-            <StatCard label="Deleted"   value={result.deleted}  color={C.accent} />
-            <StatCard label="Not Found" value={result.notFound} color={C.amber} />
-            <StatCard label="Failed"    value={result.failed}   color={C.red} />
-          </div>
-
-          {result.failed > 0 && (
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Failed SKUs</div>
-              <div style={{ maxHeight: 200, overflowY: "auto" }}>
-                {Object.entries(result.results)
-                  .filter(([, v]) => v.status !== "ok" && v.error !== "SKU not found")
-                  .map(([sku, v], i) => (
-                    <div key={i} style={{ background: "#ef444411", border: "1px solid #ef444433",
-                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
-                      <span style={{ color: "#ef4444", fontWeight: 600, fontFamily: "monospace" }}>{sku}</span>
-                      <span style={{ color: C.muted, marginLeft: 10 }}>{v.error || "Unknown error"}</span>
-                    </div>
-                  ))}
+          {result._mode === "delete" ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
+                <StatCard label="Total"     value={result.total}    color={C.text} />
+                <StatCard label="Deleted"   value={result.deleted}  color={C.accent} />
+                <StatCard label="Not Found" value={result.notFound} color={C.amber} />
+                <StatCard label="Failed"    value={result.failed}   color={C.red} />
               </div>
-            </div>
-          )}
-
-          {result.notFound > 0 && (
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Not Found on OnBuy</div>
-              <div style={{ maxHeight: 200, overflowY: "auto" }}>
-                {Object.entries(result.results)
-                  .filter(([, v]) => v.error === "SKU not found")
-                  .map(([sku], i) => (
-                    <div key={i} style={{ background: `${C.amber}15`, border: `1px solid ${C.amber}44`,
-                      borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
-                      <span style={{ color: C.amber, fontFamily: "monospace" }}>{sku}</span>
-                    </div>
-                  ))}
-              </div>
+              {result.failed > 0 && (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Failed SKUs</div>
+                  <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                    {Object.entries(result.results)
+                      .filter(([, v]) => v.status !== "ok" && v.error !== "SKU not found")
+                      .map(([sku, v], i) => (
+                        <div key={i} style={{ background: "#ef444411", border: "1px solid #ef444433",
+                          borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
+                          <span style={{ color: "#ef4444", fontWeight: 600, fontFamily: "monospace" }}>{sku}</span>
+                          <span style={{ color: C.muted, marginLeft: 10 }}>{v.error || "Unknown error"}</span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+              {result.notFound > 0 && (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ color: C.text, fontWeight: 600, fontSize: 14, marginBottom: 10 }}>Not Found on OnBuy</div>
+                  <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                    {Object.entries(result.results)
+                      .filter(([, v]) => v.error === "SKU not found")
+                      .map(([sku], i) => (
+                        <div key={i} style={{ background: `${C.amber}15`, border: `1px solid ${C.amber}44`,
+                          borderRadius: 8, padding: "8px 14px", marginBottom: 6, fontSize: 12 }}>
+                          <span style={{ color: C.amber, fontFamily: "monospace" }}>{sku}</span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 24 }}>
+              <StatCard label="Total"   value={result.total}   color={C.text} />
+              <StatCard label="Updated" value={result.updated} color={C.accent} />
+              <StatCard label="Failed"  value={result.failed}  color={C.red} />
             </div>
           )}
 
           <div style={{ textAlign: "center", marginTop: 24 }}>
-            <Btn onClick={reset}>Delete More</Btn>
+            <Btn onClick={reset}>{MODE_CONFIG[result._mode]?.doneLabel ?? "Go Again"}</Btn>
           </div>
         </Section>
       )}
