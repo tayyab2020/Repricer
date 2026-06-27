@@ -3182,6 +3182,53 @@ app.post('/api/listings/oos-all', requireAuth, async (req, res) => {
   res.end();
 });
 
+// POST /api/listings/restock-all — set stock=5 for every listing; streams progress via SSE
+app.post('/api/listings/restock-all', requireAuth, async (req, res) => {
+  const { onbuy_account_id } = req.body;
+  if (!onbuy_account_id) return res.status(400).json({ error: 'No account selected' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = d => res.write(`data: ${JSON.stringify(d)}\n\n`);
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM onbuy_accounts WHERE id = $1 LIMIT 1`, [onbuy_account_id]);
+    if (!rows[0]) { send({ error: 'Account not found' }); return res.end(); }
+    const token  = await getTokenForAccount(rows[0]);
+    if (!token)  { send({ error: 'Could not obtain auth token' }); return res.end(); }
+    const siteId = parseInt(rows[0].site_id) || 2000;
+
+    send({ phase: 'fetching', fetched: 0, total: null });
+    const allSkus = await fetchAllListingSkus(token, siteId, (fetched, total) => {
+      send({ phase: 'fetching', fetched, total });
+    });
+
+    let updated = 0, failed = 0;
+    for (let i = 0; i < allSkus.length; i += 1000) {
+      const batch    = allSkus.slice(i, i + 1000);
+      const r        = await fetch(`https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`, {
+        method:  'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ listings: batch.map(sku => ({ sku, stock: 5 })) }),
+      });
+      const data     = await r.json().catch(() => ({}));
+      const batchRes = Array.isArray(data.results) ? data.results : [];
+      const failCnt  = batchRes.filter(item => item.success === false).length;
+      failed  += failCnt;
+      updated += batch.length - failCnt;
+      if (!batchRes.length) updated += batch.length;
+      send({ phase: 'restocking', updated, failed, total: allSkus.length });
+    }
+
+    send({ phase: 'done', total: allSkus.length, updated, failed });
+  } catch (e) {
+    send({ error: e.message });
+  }
+  res.end();
+});
+
 // POST /api/listings/delete-all — delete every listing; streams progress via SSE
 app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
   const { onbuy_account_id } = req.body;

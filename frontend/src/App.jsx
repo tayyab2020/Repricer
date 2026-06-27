@@ -4759,7 +4759,7 @@ async function readSseStream(response, onEvent) {
 
 function BulkActionsSection({ accounts }) {
   const [accountId, setAccountId]   = useState("");
-  const [confirm, setConfirm]       = useState(null); // "oos" | "delete" | null
+  const [confirm, setConfirm]       = useState(null); // "oos" | "delete" | "restock" | null
   const [running, setRunning]       = useState(false);
   const [progress, setProgress]     = useState(null); // { phase, fetched, total, updated, deleted, notFound, failed }
   const [result, setResult]         = useState(null);
@@ -4791,7 +4791,7 @@ function BulkActionsSection({ accounts }) {
     setRunning(true); setErr(""); setResult(null); setProgress({ phase: "fetching", fetched: 0, total: null });
 
     const token    = localStorage.getItem("repricer_token");
-    const endpoint = action === "oos" ? "/listings/oos-all" : "/listings/delete-all";
+    const endpoint = action === "oos" ? "/listings/oos-all" : action === "restock" ? "/listings/restock-all" : "/listings/delete-all";
     try {
       const response = await fetch(`${API}${endpoint}`, {
         method:  "POST",
@@ -4839,6 +4839,10 @@ function BulkActionsSection({ accounts }) {
             style={{ borderColor: C.amber + "88", color: C.amber }}>
             OOS All Listings
           </Btn>
+          <Btn variant="secondary" onClick={() => openConfirm("restock")}
+            style={{ borderColor: C.accent + "88", color: C.accent }}>
+            Restock All Listings
+          </Btn>
           <Btn variant="danger" onClick={() => openConfirm("delete")}>
             Delete All Listings
           </Btn>
@@ -4853,6 +4857,8 @@ function BulkActionsSection({ accounts }) {
               ? `Fetching SKUs… ${progress.fetched.toLocaleString()}${progress.total ? ` / ${Number(progress.total).toLocaleString()}` : ""}`
               : progress.phase === "updating"
               ? `Marking OOS… ${(progress.updated + progress.failed).toLocaleString()} / ${progress.total.toLocaleString()}`
+              : progress.phase === "restocking"
+              ? `Restocking… ${(progress.updated + progress.failed).toLocaleString()} / ${progress.total.toLocaleString()}`
               : `Deleting… ${(progress.deleted + progress.notFound + progress.failed).toLocaleString()} / ${progress.total.toLocaleString()}`}
           </div>
           <div style={{ background: C.border, borderRadius: 99, height: 8, overflow: "hidden" }}>
@@ -4868,7 +4874,7 @@ function BulkActionsSection({ accounts }) {
         <div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 10, marginBottom: 14 }}>
             <StatCard label="Total" value={result.total?.toLocaleString()} color={C.text} />
-            {result.action === "oos" ? (
+            {result.action === "oos" || result.action === "restock" ? (
               <>
                 <StatCard label="Updated" value={result.updated?.toLocaleString()} color={C.accent} />
                 <StatCard label="Failed"  value={result.failed?.toLocaleString()}  color={C.red} />
@@ -4888,7 +4894,7 @@ function BulkActionsSection({ accounts }) {
       {/* Confirmation modal */}
       {confirm && (
         <Modal
-          title={confirm === "oos" ? "Mark All Listings as OOS?" : "Delete All Listings?"}
+          title={confirm === "oos" ? "Mark All Listings as OOS?" : confirm === "restock" ? "Restock All Listings?" : "Delete All Listings?"}
           onClose={() => { setConfirm(null); setConfirmPwd(""); setConfirmPwdErr(""); }}
         >
           <div style={{ background: "#ef444415", border: "1px solid #ef444455",
@@ -4900,6 +4906,8 @@ function BulkActionsSection({ accounts }) {
               <div style={{ color: C.muted, fontSize: 13, marginTop: 4 }}>
                 {confirm === "oos"
                   ? "All listings on OnBuy will have their stock set to 0. They will appear as out of stock to buyers."
+                  : confirm === "restock"
+                  ? "All listings on OnBuy will have their stock set to 5. This will make them available to buyers."
                   : "All listings will be permanently deleted from OnBuy. This cannot be reversed."}
               </div>
             </div>
@@ -4926,9 +4934,9 @@ function BulkActionsSection({ accounts }) {
           <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
             <Btn variant="secondary" onClick={() => { setConfirm(null); setConfirmPwd(""); setConfirmPwdErr(""); }}>Cancel</Btn>
             <Btn onClick={handleConfirmSubmit} disabled={verifying}
-              style={{ background: confirm === "oos" ? C.amber : "#ef4444",
-                borderColor: confirm === "oos" ? C.amber : "#ef4444", color: "#000" }}>
-              {verifying ? "Verifying…" : confirm === "oos" ? "Yes, Mark OOS" : "Yes, Delete All"}
+              style={{ background: confirm === "oos" ? C.amber : confirm === "restock" ? C.accent : "#ef4444",
+                borderColor: confirm === "oos" ? C.amber : confirm === "restock" ? C.accent : "#ef4444", color: "#000" }}>
+              {verifying ? "Verifying…" : confirm === "oos" ? "Yes, Mark OOS" : confirm === "restock" ? "Yes, Restock All" : "Yes, Delete All"}
             </Btn>
           </div>
         </Modal>
