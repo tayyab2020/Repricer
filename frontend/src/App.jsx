@@ -754,10 +754,20 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   const markupLabel = (m) => {
+    if (m.markup_type === "roi") {
+      const amazon = parseFloat(m.last_amazon_price);
+      const onbuy  = parseFloat(m.last_onbuy_price);
+      const fee    = parseFloat(m.onbuy_fee) || 0;
+      if (amazon > 0 && onbuy > 0) {
+        const effectiveRoi = (onbuy - fee - amazon) / amazon * 100;
+        return `+${effectiveRoi.toFixed(2)}% ROI`;
+      }
+      const configured = parseFloat(m.markup_value) || defaultRoi;
+      return `+${configured.toFixed(2)}% ROI`;
+    }
     const sign = m.markup_type === "fixed" ? "£" : "%";
-    const tag  = m.markup_type === "roi" ? " ROI" : "";
-    const val  = parseFloat(m.markup_value) || (m.markup_type === "roi" ? defaultRoi : 0);
-    return `+${val.toFixed(2)}${sign}${tag}`;
+    const val  = parseFloat(m.markup_value) || 0;
+    return `+${val.toFixed(2)}${sign}`;
   };
 
   const pageStart = (pageNum - 1) * pageSize;
