@@ -623,7 +623,7 @@ function DashboardPage({ stats }) {
 // ── Mappings Page ─────────────────────────────
 const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
 
-function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
+function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
   const [mappings, setMappings] = useState([]);
   const [total, setTotal]       = useState(0);
   const [loading, setLoading]   = useState(false);
@@ -757,9 +757,8 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20 }) {
     if (m.markup_type === "roi") {
       const amazon = parseFloat(m.last_amazon_price);
       const onbuy  = parseFloat(m.last_onbuy_price);
-      const fee    = parseFloat(m.onbuy_fee) || 0;
       if (amazon > 0 && onbuy > 0) {
-        const effectiveRoi = (onbuy - fee - amazon) / amazon * 100;
+        const effectiveRoi = (onbuy * (1 - feePercent / 100) - amazon) / amazon * 100;
         return `+${effectiveRoi.toFixed(2)}% ROI`;
       }
       const configured = parseFloat(m.markup_value) || defaultRoi;
@@ -2465,7 +2464,7 @@ export default function App() {
 
         {/* Pages */}
         {page === "dashboard"      && <DashboardPage stats={stats} />}
-        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} defaultRoi={defaultRoi} />}
+        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} defaultRoi={defaultRoi} feePercent={parseFloat(feePercent) || 15} />}
         {page === "compare"        && <ComparePage />}
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
