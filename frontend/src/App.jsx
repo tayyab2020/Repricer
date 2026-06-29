@@ -2126,6 +2126,7 @@ export default function App() {
   const [jobInterval, setJobInterval]     = useState(null);
   const [jobStartTime, setJobStartTime]   = useState("00:00");
   const [defaultRoi, setDefaultRoi]       = useState(20);
+  const [feePercent, setFeePercent]       = useState(15);
   const [appTheme, setAppTheme]           = useState("semi-dark");
 
   const changeTheme = useCallback((name) => {
@@ -2193,6 +2194,7 @@ export default function App() {
       if (s.job_interval_minutes !== undefined) setJobInterval(parseInt(s.job_interval_minutes));
       if (s.job_start_time       !== undefined) setJobStartTime(s.job_start_time || "00:00");
       if (s.default_roi_percent)                setDefaultRoi(parseFloat(s.default_roi_percent));
+      if (s.onbuy_fee_percent)                  setFeePercent(parseFloat(s.onbuy_fee_percent));
     }).catch(() => {});
   }, [authToken, loadDashboard, changeTheme]);
 
@@ -2464,7 +2466,7 @@ export default function App() {
 
         {/* Pages */}
         {page === "dashboard"      && <DashboardPage stats={stats} />}
-        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} defaultRoi={defaultRoi} feePercent={parseFloat(feePercent) || 15} />}
+        {page === "mappings"       && <MappingsPage onSelectMapping={m => { setChartMapping(m); setPage("chart"); }} defaultRoi={defaultRoi} feePercent={feePercent} />}
         {page === "compare"        && <ComparePage />}
         {page === "current-prices" && <CurrentPricesPage />}
         {page === "accounts"       && <AccountsPage />}
