@@ -24,6 +24,7 @@ import XLSX from 'xlsx';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { getLwaAccessToken, fetchAsinCatalog, parseCatalogItem, MARKETPLACES } from './spApiHelper.js';
+import { runProductHunting } from './productHunterScraper.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { mkdirSync(join(__dirname, 'logs'), { recursive: true }); } catch {}
@@ -2762,18 +2763,50 @@ app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res
     const page   = Math.max(1, parseInt(req.query.page)  || 1);
     const search = (req.query.search || '').trim();
 
-    const params = [req.params.sessionId, req.effectiveUserId];
-    let whereExtra = '';
+    const sid = req.params.sessionId;
+    const uid = req.effectiveUserId;
+
+    // Combine resolved items with still-pending queue items (row data stored in row_meta JSONB).
+    // Pending items drop out of the second leg once their status changes from 'pending'.
+    const baseUnion = `
+      SELECT row_number, product_name, sku, ean, brand, category,
+             source_price, selling_price, stock::TEXT AS stock, condition, opc, status, error_message, created_at
+      FROM onbuy_bulk_import_items
+      WHERE session_id = $1 AND user_id = $2
+
+      UNION ALL
+
+      SELECT
+        NULLIF(pq.row_meta->'row'->>'_row', '')::INTEGER          AS row_number,
+        pq.row_meta->'row'->>'name'                               AS product_name,
+        pq.row_meta->'row'->>'sku'                                AS sku,
+        pq.row_meta->'row'->>'ean'                                AS ean,
+        pq.row_meta->'row'->>'brand'                              AS brand,
+        pq.row_meta->'row'->>'category'                           AS category,
+        NULLIF(pq.row_meta->>'sourcePrice',  '')::NUMERIC         AS source_price,
+        NULLIF(pq.row_meta->>'sellingPrice', '')::NUMERIC         AS selling_price,
+        pq.row_meta->'row'->>'stock'                              AS stock,
+        pq.row_meta->'row'->>'condition'                          AS condition,
+        NULL::TEXT                                                AS opc,
+        pq.status                                                 AS status,
+        pq.error_message                                          AS error_message,
+        pq.created_at                                             AS created_at
+      FROM onbuy_bulk_pending_queues pq
+      WHERE pq.session_id = $1 AND pq.user_id = $2 AND pq.status = 'pending'
+    `;
+
+    const params = [sid, uid];
+    let searchClause = '';
     if (search) {
       params.push(`%${search}%`);
       const n = params.length;
-      whereExtra = ` AND (product_name ILIKE $${n} OR sku ILIKE $${n} OR ean ILIKE $${n}
-                       OR brand ILIKE $${n} OR category ILIKE $${n} OR opc ILIKE $${n}
-                       OR status ILIKE $${n} OR error_message ILIKE $${n})`;
+      searchClause = ` AND (product_name ILIKE $${n} OR sku ILIKE $${n} OR ean ILIKE $${n}
+                           OR brand ILIKE $${n} OR category ILIKE $${n} OR opc ILIKE $${n}
+                           OR status ILIKE $${n} OR error_message ILIKE $${n})`;
     }
 
     const { rows: [{ count }] } = await db.query(
-      `SELECT COUNT(*) FROM onbuy_bulk_import_items WHERE session_id=$1 AND user_id=$2${whereExtra}`,
+      `SELECT COUNT(*) FROM (${baseUnion}) _all WHERE TRUE${searchClause}`,
       params
     );
     const total = parseInt(count);
@@ -2781,10 +2814,7 @@ app.get('/api/onbuy-bulk/history/:sessionId/items', requireAuth, async (req, res
     const safePage = Math.min(page, totalPages);
 
     const { rows } = await db.query(
-      `SELECT row_number, product_name, sku, ean, brand, category,
-              source_price, selling_price, stock, condition, opc, status, error_message, created_at
-       FROM onbuy_bulk_import_items
-       WHERE session_id = $1 AND user_id = $2${whereExtra}
+      `SELECT * FROM (${baseUnion}) _all WHERE TRUE${searchClause}
        ORDER BY row_number ASC
        LIMIT ${PAGE_SIZE} OFFSET ${(safePage - 1) * PAGE_SIZE}`,
       params
@@ -3580,6 +3610,233 @@ app.post('/api/sp-api/lookup', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────
+// PRODUCT HUNTING
+// One Puppeteer job per user; in-memory state with SSE log push
+// ─────────────────────────────────────────────────────────────
+
+// userId → { status, logs, signal, logListeners, result }
+const huntingJobs = new Map();
+
+function _huntLog(uid, msg) {
+  const job = huntingJobs.get(uid);
+  if (!job) return;
+  const line = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
+  job.logs.push(line);
+  if (job.logs.length > 2000) job.logs.shift();
+  for (const fn of job.logListeners) { try { fn(line); } catch {} }
+}
+
+// POST /api/product-hunting/start
+app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  if (huntingJobs.has(uid) && huntingJobs.get(uid).status === 'running') {
+    return res.status(409).json({ error: 'A product hunting job is already running. Cancel it first or wait for it to finish.' });
+  }
+
+  const { account_id, category, max_listings } = req.body;
+  if (!account_id) return res.status(400).json({ error: 'account_id is required' });
+  if (!category?.label) return res.status(400).json({ error: 'category.label is required' });
+
+  let account;
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM onbuy_accounts WHERE id = $1 AND user_id = $2',
+      [account_id, uid],
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Account not found' });
+    account = rows[0];
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+
+  if (!account.keepa_email || !account.keepa_password) {
+    return res.status(400).json({ error: 'This account has no Keepa credentials. Add them in OnBuy Accounts → Edit.' });
+  }
+
+  const signal = { cancelled: false };
+  huntingJobs.set(uid, {
+    status:       'running',
+    logs:         [],
+    signal,
+    logListeners: [],
+    result:       null,
+    error:        null,
+    accountId:    account_id,
+    category:     category.label,
+    startedAt:    new Date().toISOString(),
+  });
+
+  res.json({ message: 'Product hunting started', status: 'running' });
+
+  (async () => {
+    const log = (msg) => _huntLog(uid, msg);
+    try {
+      log(`[Hunt] Starting job — category: "${category.label}", max: ${max_listings ?? 100}`);
+      const rows = await runProductHunting(
+        { account, category, maxListings: max_listings ?? 100, signal },
+        log,
+      );
+
+      if (signal.cancelled) {
+        huntingJobs.get(uid).status = 'cancelled';
+        log('[Hunt] Job cancelled');
+        return;
+      }
+
+      if (!rows.length) {
+        huntingJobs.get(uid).status = 'done';
+        huntingJobs.get(uid).result = { imported: 0 };
+        log('[Hunt] No rows to import');
+        return;
+      }
+
+      log(`[Hunt] Uploading ${rows.length} row(s) to OnBuy Bulk Import…`);
+      const validRows = rows.filter(r => r.valid);
+
+      // Debug: log column presence + first 3 rows so issues are visible in the SSE stream
+      const invalidRows = rows.filter(r => !r.valid);
+      if (invalidRows.length) {
+        log(`[Hunt] ${invalidRows.length} invalid row(s): ${JSON.stringify(invalidRows.slice(0, 3).map(r => ({ row: r._row, name: r.name?.slice(0, 40), errors: r.errors })))}`);
+      }
+      if (rows.length > 0) {
+        const sample = rows.slice(0, 3).map(r => ({
+          row:       r._row,
+          name:      r.name?.slice(0, 50),
+          sku:       r.sku,
+          price:     r.price,
+          category:  r.category,
+          brand:     r.brand,
+          ean:       r.ean || '(none)',
+          images:    (r.images || []).filter(Boolean).length,
+          valid:     r.valid,
+          errors:    r.errors,
+        }));
+        log(`[Hunt] First ${sample.length} mapped row(s): ${JSON.stringify(sample, null, 2)}`);
+      }
+
+      if (!validRows.length) {
+        huntingJobs.get(uid).status = 'done';
+        huntingJobs.get(uid).result = { imported: 0, skipped: rows.length };
+        log('[Hunt] All rows were invalid — nothing uploaded');
+        return;
+      }
+
+      const { rows: [session] } = await db.query(
+        `INSERT INTO onbuy_bulk_import_sessions
+           (user_id, account_id, account_name, total_rows, status, rows_data)
+         VALUES ($1, $2, $3, $4, 'processing', $5) RETURNING id`,
+        [uid, account_id, account.account_name, validRows.length, JSON.stringify(validRows)],
+      );
+
+      await bulkImportQueue.add('import', { sessionId: session.id, accountId: account_id, userId: uid }, {
+        jobId:            `bulk-import-${session.id}`,
+        removeOnComplete: true,
+        removeOnFail:     true,
+        attempts:         1,
+      });
+
+      log(`[Hunt] Bulk import session ${session.id} queued ✓`);
+      log(`[Hunt] Done — ${validRows.length} product(s) queued for OnBuy import`);
+
+      const job = huntingJobs.get(uid);
+      job.status = 'done';
+      job.result = { imported: validRows.length, sessionId: session.id };
+
+    } catch (err) {
+      const job = huntingJobs.get(uid);
+      if (!job) return;
+      if (err.isCancelled) {
+        job.status = 'cancelled';
+        _huntLog(uid, '[Hunt] Job cancelled by user');
+      } else {
+        job.status = 'error';
+        job.error  = err.message;
+        _huntLog(uid, `[Hunt] Error: ${err.message}`);
+      }
+    }
+  })();
+});
+
+// GET /api/product-hunting/status
+app.get('/api/product-hunting/status', requireAuth, (req, res) => {
+  const uid = req.effectiveUserId;
+  const job = huntingJobs.get(uid);
+  if (!job) return res.json({ status: 'idle' });
+  res.json({
+    status:    job.status,
+    category:  job.category,
+    startedAt: job.startedAt,
+    result:    job.result,
+    error:     job.error,
+    logCount:  job.logs.length,
+  });
+});
+
+// GET /api/product-hunting/logs — SSE (token via ?token= for EventSource)
+app.get('/api/product-hunting/logs', (req, res, next) => {
+  if (req.query.token && !req.headers.authorization)
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  next();
+}, requireAuth, (req, res) => {
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const uid = req.effectiveUserId;
+  const job = huntingJobs.get(uid);
+  const send = (msg) => { try { res.write(`data: ${JSON.stringify({ msg })}\n\n`); } catch {} };
+
+  if (!job) {
+    send('[Hunt] No active job');
+    res.write('data: {"done":true}\n\n');
+    return res.end();
+  }
+
+  for (const line of job.logs) send(line);
+
+  if (job.status !== 'running') {
+    res.write('data: {"done":true}\n\n');
+    return res.end();
+  }
+
+  job.logListeners.push(send);
+
+  const hb = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch {} }, 15_000);
+  const watch = setInterval(() => {
+    const j = huntingJobs.get(uid);
+    if (j && j.status !== 'running') {
+      res.write('data: {"done":true}\n\n');
+      cleanup(); res.end();
+    }
+  }, 1000);
+
+  const cleanup = () => {
+    clearInterval(hb); clearInterval(watch);
+    const j = huntingJobs.get(uid);
+    if (j) j.logListeners = j.logListeners.filter(fn => fn !== send);
+  };
+  req.on('close', cleanup);
+});
+
+// POST /api/product-hunting/cancel
+app.post('/api/product-hunting/cancel', requireAuth, (req, res) => {
+  const uid = req.effectiveUserId;
+  const job = huntingJobs.get(uid);
+  if (!job || job.status !== 'running') return res.json({ message: 'No running job to cancel' });
+  job.signal.cancelled = true;
+  res.json({ message: 'Cancellation requested' });
+});
+
+// POST /api/product-hunting/clear — dismiss finished/error state
+app.post('/api/product-hunting/clear', requireAuth, (req, res) => {
+  const uid = req.effectiveUserId;
+  const job = huntingJobs.get(uid);
+  if (job && job.status === 'running') return res.status(409).json({ error: 'Job is still running' });
+  huntingJobs.delete(uid);
+  res.json({ message: 'Cleared' });
 });
 
 // ─────────────────────────────────────────────

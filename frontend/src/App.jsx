@@ -6,22 +6,23 @@ import {
 import {
   LayoutDashboard, Link2, TrendingUp, Store, Upload,
   Package, Trash2, ClipboardList, Settings, Terminal,
-  Users, Zap, RefreshCw, X, LogOut,
+  Users, Zap, RefreshCw, X, LogOut, Search, ChevronRight, ChevronDown,
 } from "lucide-react";
 
 // ── Nav icon map ─────────────────────────────
 const NAV_ICONS = {
-  "dashboard":       LayoutDashboard,
-  "mappings":        Link2,
-  "current-prices":  TrendingUp,
-  "accounts":        Store,
-  "import":          Upload,
-  "onbuy-bulk":      Package,
-  "delete-listings": Trash2,
-  "orders":          ClipboardList,
-  "settings":        Settings,
-  "logs":            Terminal,
-  "users":           Users,
+  "dashboard":        LayoutDashboard,
+  "mappings":         Link2,
+  "current-prices":   TrendingUp,
+  "accounts":         Store,
+  "import":           Upload,
+  "onbuy-bulk":       Package,
+  "delete-listings":  Trash2,
+  "orders":           ClipboardList,
+  "product-hunting":  Search,
+  "settings":         Settings,
+  "logs":             Terminal,
+  "users":            Users,
 };
 
 // ── Config ──────────────────────────────────
@@ -2243,9 +2244,10 @@ export default function App() {
     { id:"current-prices",  label:"Current Prices" },
     { id:"accounts",        label:"OnBuy Accounts" },
     { id:"import",          label:"Repricer Listings" },
-    { id:"onbuy-bulk",      label:"OnBuy Bulk Listings" },
-    { id:"delete-listings", label:"Delete Listings" },
-    { id:"orders",          label:"Orders" },
+    { id:"onbuy-bulk",       label:"OnBuy Bulk Listings" },
+    { id:"delete-listings",  label:"Delete Listings" },
+    { id:"product-hunting",  label:"Product Hunting" },
+    { id:"orders",           label:"Orders" },
     { id:"settings",        label:"Settings" },
     { id:"logs",            label:"Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"Users" }] : []),
@@ -2455,7 +2457,8 @@ export default function App() {
             {page === "import"          && "Bulk import listings from an Excel spreadsheet"}
             {page === "onbuy-bulk"      && "Create new products and listings directly on your OnBuy store"}
             {page === "sku-change"      && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
-            {page === "delete-listings" && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
+            {page === "delete-listings"  && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
+            {page === "product-hunting" && "Scrape Keepa bestsellers and import products directly to OnBuy"}
             {page === "orders"          && "View and sync OnBuy orders across all accounts"}
             {page === "sp-api"          && "Fetch Amazon catalog data for any ASIN using SP-API"}
             {page === "settings"        && "Configure proxies and global repricer options"}
@@ -2474,6 +2477,7 @@ export default function App() {
         {page === "onbuy-bulk"     && <OnBuyBulkPage />}
         {page === "sku-change"       && <SkuChangePage />}
         {page === "delete-listings"  && <DeleteListingsPage />}
+        {page === "product-hunting"  && <ProductHuntingPage />}
         {page === "orders"           && <OrdersPage />}
         {page === "sp-api"          && <SpApiPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} appTheme={appTheme} onThemeChange={changeTheme} />}
@@ -5645,6 +5649,463 @@ function OrdersPage() {
             disabled={offset + LIMIT >= total}>Next →</Btn>
         </div>
       )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════
+//  PRODUCT HUNTING PAGE
+// ════════════════════════════════════════════
+
+// ── Amazon UK bestseller category tree (matches Keepa's sidebar) ──
+// Flat list matching Keepa's Product Best Sellers category nav exactly
+const HUNT_CATEGORIES = [
+  { id:"alexa-skills",          label:"Alexa Skills" },
+  { id:"amazon-devices",        label:"Amazon Devices & Accessories" },
+  { id:"amazon-luxury",         label:"Amazon Luxury" },
+  { id:"apps-games",            label:"Apps & Games" },
+  { id:"audible",               label:"Audible Books & Originals" },
+  { id:"automotive",            label:"Automotive" },
+  { id:"baby",                  label:"Baby Products" },
+  { id:"beauty",                label:"Beauty" },
+  { id:"books",                 label:"Books" },
+  { id:"business",              label:"Business, Industry & Science" },
+  { id:"cds-vinyl",             label:"CDs & Vinyl" },
+  { id:"computers",             label:"Computers & Accessories" },
+  { id:"credit-cards",          label:"Credit & Payment Cards" },
+  { id:"digital-music",         label:"Digital Music" },
+  { id:"diy",                   label:"DIY & Tools" },
+  { id:"dvd",                   label:"DVD & Blu-ray" },
+  { id:"electronics",           label:"Electronics & Photo" },
+  { id:"everything-else",       label:"Everything Else" },
+  { id:"fashion",               label:"Fashion" },
+  { id:"garden",                label:"Garden" },
+  { id:"gift-cards",            label:"Gift Cards" },
+  { id:"grocery",               label:"Grocery" },
+  { id:"handmade",              label:"Handmade Products" },
+  { id:"health",                label:"Health & Personal Care" },
+  { id:"home-business",         label:"Home & Business Services" },
+  { id:"home-garden",           label:"Home & Garden" },
+  { id:"home-kitchen",          label:"Home & Kitchen" },
+  { id:"kindle",                label:"Kindle Store" },
+  { id:"kosmetik",              label:"Kosmetik" },
+  { id:"large-appliances",      label:"Large Appliances" },
+  { id:"lighting",              label:"Lighting" },
+  { id:"musical-instruments",   label:"Musical Instruments & DJ" },
+  { id:"outlet",                label:"Outlet" },
+  { id:"pc-games",              label:"PC & Video Games" },
+  { id:"pet",                   label:"Pet Supplies" },
+  { id:"premium-beauty",        label:"Premium Beauty" },
+  { id:"prime-video",           label:"Prime Video" },
+  { id:"software",              label:"Software" },
+  { id:"sports",                label:"Sports & Outdoors" },
+  { id:"stationery",            label:"Stationery & Office Supplies" },
+  { id:"toys",                  label:"Toys & Games" },
+];
+
+// Build the path (breadcrumb) for a given category id
+function _buildCategoryPath(id) {
+  const node = HUNT_CATEGORIES.find(n => n.id === id);
+  return node ? [node.label] : null;
+}
+
+// Single collapsible category node (recursive)
+function CategoryNode({ node, selected, onSelect, depth = 0 }) {
+  const [open, setOpen] = useState(false);
+  const hasChildren = node.children?.length > 0;
+  const isSelected = selected === node.id ||
+    (hasChildren && node.children.some(c => c.id === selected));
+
+  const rowStyle = {
+    display: "flex", alignItems: "center", gap: 4,
+    padding: `5px ${8 + depth * 16}px`,
+    cursor: "pointer", borderRadius: 6,
+    background: selected === node.id ? C.accentDim : "transparent",
+    border: `1px solid ${selected === node.id ? C.accent + "44" : "transparent"}`,
+    marginBottom: 1,
+  };
+
+  return (
+    <div>
+      <div
+        style={rowStyle}
+        onClick={() => {
+          if (hasChildren) setOpen(o => !o);
+          else onSelect(node);
+        }}
+      >
+        {hasChildren ? (
+          open
+            ? <ChevronDown size={13} color={C.muted} />
+            : <ChevronRight size={13} color={C.muted} />
+        ) : (
+          <span style={{ width: 13, display: "inline-block" }} />
+        )}
+        <span style={{
+          fontSize: 13,
+          color: selected === node.id ? C.accent : C.text,
+          fontWeight: selected === node.id ? 600 : 400,
+          flex: 1,
+        }}>{node.label}</span>
+        {hasChildren && !open && isSelected && (
+          <span style={{ fontSize: 10, color: C.accent }}>●</span>
+        )}
+      </div>
+      {hasChildren && open && (
+        <div>
+          {node.children.map(child => (
+            <CategoryNode
+              key={child.id}
+              node={child}
+              selected={selected}
+              onSelect={onSelect}
+              depth={depth + 1}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProductHuntingPage() {
+  const [accounts,    setAccounts]    = useState([]);
+  const [accountId,   setAccountId]   = useState("");
+  const [selectedCat, setSelectedCat] = useState(null); // { id, label }
+  const [catSearch,   setCatSearch]   = useState("");
+  const [maxListings, setMaxListings] = useState(100);
+  const [jobStatus,   setJobStatus]   = useState(null); // idle|running|done|error|cancelled
+  const [logs,        setLogs]        = useState([]);
+  const [result,      setResult]      = useState(null);
+  const [err,         setErr]         = useState("");
+  const [starting,    setStarting]    = useState(false);
+  const logsEndRef = useRef(null);
+  const esRef      = useRef(null);
+
+  // Load accounts on mount + check existing job
+  useEffect(() => {
+    api("/accounts").then(d => { if (d) setAccounts(d); }).catch(() => {});
+    api("/product-hunting/status").then(s => {
+      if (!s || s.status === "idle") return;
+      setJobStatus(s.status);
+      if (s.result) setResult(s.result);
+      if (s.error)  setErr(s.error);
+      if (s.status === "running") _startSSE();
+    }).catch(() => {});
+  }, []);
+
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  function _startSSE() {
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    const token = localStorage.getItem("repricer_token");
+    const url   = `${API}/product-hunting/logs?token=${encodeURIComponent(token ?? "")}`;
+    const es    = new EventSource(url);
+    esRef.current = es;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.done) {
+        es.close(); esRef.current = null;
+        api("/product-hunting/status").then(s => {
+          if (!s) return;
+          setJobStatus(s.status);
+          if (s.result) setResult(s.result);
+          if (s.error)  setErr(s.error);
+        }).catch(() => {});
+        return;
+      }
+      if (data.msg) setLogs(prev => [...prev, data.msg]);
+    };
+    es.onerror = () => { es.close(); esRef.current = null; };
+  }
+
+  async function start() {
+    if (!accountId)   return setErr("Please select an OnBuy account.");
+    if (!selectedCat) return setErr("Please select a Keepa category.");
+    setErr(""); setLogs([]); setResult(null); setStarting(true);
+    try {
+      const path = _buildCategoryPath(selectedCat.id) ?? [selectedCat.label];
+      await api("/product-hunting/start", {
+        method: "POST",
+        body: JSON.stringify({
+          account_id:   parseInt(accountId),
+          category:     { label: selectedCat.label, path },
+          max_listings: parseInt(maxListings) || 100,
+        }),
+      });
+      setJobStatus("running");
+      _startSSE();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  async function cancel() {
+    await api("/product-hunting/cancel", { method: "POST" }).catch(() => {});
+  }
+
+  async function reset() {
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    await api("/product-hunting/clear", { method: "POST" }).catch(() => {});
+    setJobStatus(null); setLogs([]); setResult(null); setErr("");
+  }
+
+  // Filter categories by search
+  const catFilter = catSearch.trim().toLowerCase();
+  const filteredCats = catFilter
+    ? HUNT_CATEGORIES.filter(node => node.label.toLowerCase().includes(catFilter))
+    : HUNT_CATEGORIES;
+
+  const isRunning = jobStatus === "running";
+  const isDone    = jobStatus === "done";
+  const isError   = jobStatus === "error";
+  const isCancelled = jobStatus === "cancelled";
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 16, alignItems: "start" }}>
+
+      {/* ── Left panel: controls ─────────────────────────────── */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+        {/* Account selector */}
+        <Section title="OnBuy Account">
+          <select
+            value={accountId}
+            onChange={e => setAccountId(e.target.value)}
+            disabled={isRunning}
+            style={{
+              width: "100%", padding: "8px 10px", borderRadius: 8,
+              background: C.panel, border: `1px solid ${C.border}`,
+              color: C.text, fontSize: 13, cursor: "pointer",
+            }}
+          >
+            <option value="">— Select account —</option>
+            {accounts.map(a => (
+              <option key={a.id} value={a.id}>{a.account_name}</option>
+            ))}
+          </select>
+        </Section>
+
+        {/* Category tree */}
+        <Section title="Keepa Category">
+          {/* Search */}
+          <div style={{ position: "relative", marginBottom: 8 }}>
+            <Search size={13} color={C.muted} style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)" }} />
+            <input
+              type="text"
+              placeholder="Search categories…"
+              value={catSearch}
+              onChange={e => setCatSearch(e.target.value)}
+              disabled={isRunning}
+              style={{
+                width: "100%", padding: "6px 8px 6px 26px", borderRadius: 8,
+                background: C.panel, border: `1px solid ${C.border}`,
+                color: C.text, fontSize: 12,
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          {selectedCat && (
+            <div style={{
+              background: C.accentDim, border: `1px solid ${C.accent}44`,
+              borderRadius: 6, padding: "5px 10px", marginBottom: 8,
+              fontSize: 12, color: C.accent, display: "flex", justifyContent: "space-between",
+            }}>
+              <span>✓ {selectedCat.label}</span>
+              {!isRunning && (
+                <span
+                  onClick={() => setSelectedCat(null)}
+                  style={{ cursor: "pointer", color: C.muted }}
+                >✕</span>
+              )}
+            </div>
+          )}
+
+          <div style={{
+            maxHeight: 340, overflowY: "auto",
+            background: C.bg, borderRadius: 8, border: `1px solid ${C.border}`,
+            padding: 6,
+          }}>
+            {filteredCats.map(node => (
+              <CategoryNode
+                key={node.id}
+                node={node}
+                selected={selectedCat?.id}
+                onSelect={cat => !isRunning && setSelectedCat(cat)}
+                depth={0}
+              />
+            ))}
+          </div>
+        </Section>
+
+        {/* Max listings */}
+        <Section title="Max Listings to Import">
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            {[50, 100, 250, 500, 1000].map(n => (
+              <button
+                key={n}
+                onClick={() => !isRunning && setMaxListings(n)}
+                style={{
+                  flex: 1, padding: "5px 0", borderRadius: 6, fontSize: 12, cursor: isRunning ? "default" : "pointer",
+                  background: maxListings === n ? C.accent + "22" : C.panel,
+                  border: `1px solid ${maxListings === n ? C.accent : C.border}`,
+                  color: maxListings === n ? C.accent : C.textDim,
+                  fontWeight: maxListings === n ? 700 : 400,
+                }}
+              >{n}</button>
+            ))}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+            <span style={{ color: C.muted, fontSize: 12 }}>Custom:</span>
+            <input
+              type="number" min="1" max="5000" value={maxListings}
+              onChange={e => !isRunning && setMaxListings(Math.max(1, parseInt(e.target.value) || 1))}
+              disabled={isRunning}
+              style={{
+                width: 80, padding: "4px 8px", borderRadius: 6,
+                background: C.panel, border: `1px solid ${C.border}`,
+                color: C.text, fontSize: 12,
+              }}
+            />
+          </div>
+        </Section>
+
+        {/* Action buttons */}
+        {err && (
+          <div style={{
+            background: "#ef444422", border: "1px solid #ef444466", borderRadius: 8,
+            padding: "8px 12px", color: C.red, fontSize: 12,
+          }}>{err}</div>
+        )}
+
+        {!isRunning && !isDone && !isError && !isCancelled && (
+          <Btn
+            onClick={start}
+            disabled={starting || !accountId || !selectedCat}
+            style={{ width: "100%" }}
+          >
+            {starting ? "Starting…" : "▶ Start Product Hunting"}
+          </Btn>
+        )}
+
+        {isRunning && (
+          <Btn variant="danger" onClick={cancel} style={{ width: "100%" }}>
+            ✕ Cancel Job
+          </Btn>
+        )}
+
+        {(isDone || isError || isCancelled) && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {isDone && result && (
+              <div style={{
+                background: "#22c55e22", border: "1px solid #22c55e44",
+                borderRadius: 8, padding: "10px 14px",
+              }}>
+                <p style={{ color: C.accent, fontWeight: 700, margin: 0, fontSize: 14 }}>
+                  ✓ Done — {result.imported} product(s) queued
+                </p>
+                {result.sessionId && (
+                  <p style={{ color: C.textDim, fontSize: 12, margin: "4px 0 0" }}>
+                    Bulk import session #{result.sessionId} — check OnBuy Bulk Listings for status
+                  </p>
+                )}
+              </div>
+            )}
+            {isError && (
+              <div style={{
+                background: "#ef444422", border: "1px solid #ef444466",
+                borderRadius: 8, padding: "10px 14px", color: C.red, fontSize: 13,
+              }}>✗ Error: {err}</div>
+            )}
+            {isCancelled && (
+              <div style={{
+                background: C.surface, border: `1px solid ${C.border}`,
+                borderRadius: 8, padding: "10px 14px", color: C.muted, fontSize: 13,
+              }}>Job was cancelled</div>
+            )}
+            <Btn variant="secondary" onClick={reset} style={{ width: "100%" }}>
+              ↺ Run Again
+            </Btn>
+          </div>
+        )}
+      </div>
+
+      {/* ── Right panel: live logs ───────────────────────────── */}
+      <div>
+        <Section title={
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span>Live Logs</span>
+            {isRunning && (
+              <span style={{
+                background: C.accentDim, color: C.accent,
+                borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700,
+              }}>● RUNNING</span>
+            )}
+            {isDone && (
+              <span style={{
+                background: "#22c55e22", color: C.accent,
+                borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700,
+              }}>✓ DONE</span>
+            )}
+            {isError && (
+              <span style={{
+                background: "#ef444422", color: C.red,
+                borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700,
+              }}>✗ ERROR</span>
+            )}
+          </div>
+        }>
+          <div style={{
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5,
+            background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+            padding: 12, height: 460, overflowY: "auto", lineHeight: 1.7,
+          }}>
+            {logs.length === 0 && (
+              <p style={{ color: C.muted, margin: 0 }}>
+                {!isRunning
+                  ? "Logs will appear here once you start a product hunting job."
+                  : "Waiting for first log line…"}
+              </p>
+            )}
+            {logs.map((line, i) => {
+              const isErr  = /error|failed|✗/i.test(line);
+              const isWarn = /warning|warn/i.test(line);
+              const isDone = /done|✓|complete|success/i.test(line);
+              const color  = isErr ? C.red : isWarn ? C.amber : isDone ? C.accent : C.textDim;
+              return (
+                <div key={i} style={{ color, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  {line}
+                </div>
+              );
+            })}
+            <div ref={logsEndRef} />
+          </div>
+        </Section>
+
+        {/* Info card */}
+        {!isRunning && !isDone && !isError && (
+          <Section title="How it works">
+            <ol style={{ color: C.textDim, fontSize: 13, paddingLeft: 18, margin: 0, lineHeight: 2 }}>
+              <li>Logs into your Keepa account using the credentials stored on the OnBuy account</li>
+              <li>Navigates to <strong style={{ color: C.text }}>Product Best Sellers</strong> and selects your chosen category</li>
+              <li>Configures the table columns (ASIN, Title, Description, Images, Brand, Color, Price, Category)</li>
+              <li>Exports up to 5 000 bestsellers as a CSV</li>
+              <li>Maps the CSV to OnBuy listing format (images split, features → summary points)</li>
+              <li>Submits the mapped rows to <strong style={{ color: C.text }}>OnBuy Bulk Listings</strong> as a new import session</li>
+            </ol>
+            <p style={{ color: C.muted, fontSize: 12, marginTop: 10 }}>
+              ⚠ Make sure your OnBuy account has Keepa credentials set (Accounts → Edit → Keepa Email / Password).
+            </p>
+          </Section>
+        )}
+      </div>
     </div>
   );
 }

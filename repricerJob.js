@@ -1547,6 +1547,31 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
         } else if (status === 'failed' || status === 'error') {
           const msg = typeof qr.error_message === 'string' ? qr.error_message : JSON.stringify(qr.error_message || 'Queue failed');
           ilog(`Queue ${q.queue_id}: failed — ${msg}`);
+
+          // If product already exists on OnBuy, look up the existing OPC and create a listing
+          const dupEan = (msg.match(/Duplicate entry '(\d+)'/) || [])[1];
+          if (dupEan) {
+            try {
+              const sr = await fetch(
+                `https://api.onbuy.com/v2/products?site_id=${siteId}&filter[field]=product_code&filter[query]=${encodeURIComponent(dupEan)}`,
+                { headers: { Authorization: token } }
+              );
+              const sd = await sr.json();
+              const existingOpc = (sd?.results ?? sd?.payload ?? [])[0]?.opc ?? null;
+              if (existingOpc) {
+                ilog(`Queue ${q.queue_id}: duplicate product — found existing OPC=${existingOpc}`);
+                await db.query(
+                  `UPDATE onbuy_bulk_pending_queues SET status='success', opc=$1, last_polled_at=NOW() WHERE queue_id=$2`,
+                  [existingOpc, q.queue_id]
+                ).catch(() => {});
+                successItems.push({ ...q, opc: existingOpc, ilog });
+                continue;
+              }
+            } catch (e) {
+              ilog(`Duplicate EAN lookup failed: ${e.message}`);
+            }
+          }
+
           await db.query(
             `UPDATE onbuy_bulk_pending_queues SET status='failed', error_message=$1, last_polled_at=NOW(), attempts=attempts+1 WHERE queue_id=$2`,
             [msg, q.queue_id]
@@ -1574,7 +1599,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
         }
       }
 
-      // Create listings for resolved queues
+      // Create listings for resolved queues (newly created products + duplicate-found existing ones)
       if (successItems.length > 0) {
         const ilog = successItems[0].ilog;
         ilog(`Creating listings for ${successItems.length} resolved queue(s)`);
@@ -1608,6 +1633,21 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
               const res = Array.isArray(lrs) ? lrs[j] : null;
               const ok  = !res || res.success !== false;
               const m   = q.row_meta;
+
+              // Record product_created (OnBuy confirmed the product exists via queue success)
+              db.query(
+                `INSERT INTO onbuy_bulk_import_items
+                  (session_id,user_id,row_number,product_name,sku,ean,category,brand,
+                   source_price,selling_price,stock,condition,opc,status)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'product_created')`,
+                [q.session_id, q.user_id, m.row?._row, m.row?.name, m.row?.sku, m.row?.ean,
+                 m.row?.category, m.row?.brand, m.sourcePrice, m.sellingPrice,
+                 parseInt(m.row?.stock)||0, _normalizeCondition(m.row?.condition), q.opc]
+              ).catch(() => {});
+              db.query(
+                `UPDATE onbuy_bulk_import_sessions SET products_created = products_created + 1 WHERE id = $1`,
+                [q.session_id]
+              ).catch(() => {});
 
               await db.query(
                 `UPDATE onbuy_bulk_pending_queues SET status=$1, last_polled_at=NOW() WHERE queue_id=$2`,
