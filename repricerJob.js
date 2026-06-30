@@ -1505,7 +1505,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
         const ids      = subBatch.map(q => q.queue_id).join(',');
         try {
           const pr   = await fetch(
-            `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}`,
+            `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(ids)}&limit=100`,
             { headers: { Authorization: token } }
           );
           const text = await pr.text();
@@ -1514,7 +1514,14 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
             plog(`[QueuePoller] Sub-batch poll error: not valid JSON (HTTP ${pr.status}) — skipping`);
             continue;
           }
-          const list = pd?.results ?? [];
+          // Log raw response shape once per poll run (first sub-batch of first account batch only)
+          if (j === 0 && i === 0) {
+            const sample = text.slice(0, 500);
+            plog(`[QueuePoller] Raw queue response (first sub-batch): ${sample}`);
+          }
+          const list = Array.isArray(pd?.results) ? pd.results
+                     : Array.isArray(pd?.payload)  ? pd.payload
+                     : [];
           for (const q of list) pollMap.set(q.queue_id, q);
         } catch (e) { plog(`[QueuePoller] Sub-batch poll error: ${e.message}`); }
       }
@@ -1615,6 +1622,8 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
               stock:     parseInt(m.row?.stock) || 0,
               ...(m.row?.sku             ? { sku: m.row.sku }                             : {}),
               ...(m.row?.delivery_weight ? { delivery_weight: parseFloat(m.row.delivery_weight) } : {}),
+              ...(m.row?.colour          ? { colour:          m.row.colour }               : {}),
+              ...(m.row?.handling_time   ? { handling_time:   parseInt(m.row.handling_time) } : {}),
             };
           });
 
@@ -1960,14 +1969,18 @@ async function processBulkImportJob(job) {
       const chunk = queueIds.slice(i, i + 100);
       try {
         const r    = await fetch(
-          `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(chunk.join(','))}`,
+          `https://api.onbuy.com/v2/queues?site_id=${siteId}&filter[queue_ids]=${encodeURIComponent(chunk.join(','))}&limit=100`,
           { headers: { Authorization: currentToken } }
         );
         const text = await r.text();
         let data; try { data = JSON.parse(text); } catch {
           blog(`Batch poll sub-batch error: not valid JSON (HTTP ${r.status})`); continue;
         }
-        for (const q of data?.results ?? []) resultMap.set(q.queue_id, q);
+        if (i === 0) blog(`Phase 3 raw queue response (first chunk): ${text.slice(0, 500)}`);
+        const list = Array.isArray(data?.results) ? data.results
+                   : Array.isArray(data?.payload)  ? data.payload
+                   : [];
+        for (const q of list) resultMap.set(q.queue_id, q);
       } catch (e) { blog(`Batch poll sub-batch error: ${e.message}`); }
     }
     return resultMap;
@@ -2134,6 +2147,11 @@ async function processBulkImportJob(job) {
         product_codes: [row.ean],
         ...(row.mpn             ? { mpn: row.mpn }                   : {}),
         ...(row.delivery_weight ? { delivery_weight: parseFloat(row.delivery_weight) } : {}),
+        ...(row.summary1 ? { summary_point_one:   row.summary1 } : {}),
+        ...(row.summary2 ? { summary_point_two:   row.summary2 } : {}),
+        ...(row.summary3 ? { summary_point_three: row.summary3 } : {}),
+        ...(row.summary4 ? { summary_point_four:  row.summary4 } : {}),
+        ...(row.summary5 ? { summary_point_five:  row.summary5 } : {}),
       };
     });
     blog(`Phase 2: batch creating ${chunk.length} product(s) (chunk ${Math.floor(i/CREATE_CHUNK)+1} of ${Math.ceil(toCreate.length/CREATE_CHUNK)})`);
@@ -2214,6 +2232,11 @@ async function processBulkImportJob(job) {
                 product_codes: [newEan],
                 ...(meta.row.mpn             ? { mpn: meta.row.mpn }                              : {}),
                 ...(meta.row.delivery_weight ? { delivery_weight: parseFloat(meta.row.delivery_weight) } : {}),
+                ...(meta.row.summary1 ? { summary_point_one:   meta.row.summary1 } : {}),
+                ...(meta.row.summary2 ? { summary_point_two:   meta.row.summary2 } : {}),
+                ...(meta.row.summary3 ? { summary_point_three: meta.row.summary3 } : {}),
+                ...(meta.row.summary4 ? { summary_point_four:  meta.row.summary4 } : {}),
+                ...(meta.row.summary5 ? { summary_point_five:  meta.row.summary5 } : {}),
               },
               meta: { ...meta, row: { ...meta.row, ean: newEan } },
             });

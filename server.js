@@ -1,4 +1,4 @@
-/**
+﻿/**
  * server.js
  * ─────────────────────────────────────────────────────────────
  * Express REST API backend for the Re-Pricer dashboard
@@ -2441,7 +2441,7 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   const { rows: [session] } = await db.query(
     `INSERT INTO onbuy_bulk_import_sessions (user_id, account_id, account_name, total_rows, status, rows_data)
      VALUES ($1, $2, $3, $4, 'processing', $5) RETURNING id`,
-    [req.effectiveUserId, account_id, account.account_name, validRows.length, JSON.stringify(validRows)]
+    [req.effectiveUserId, account_id, account.account_name, validRows.length, JSON.stringify(_sanitizeForJsonb(validRows))]
   );
   const sessionId = session.id;
 
@@ -3620,6 +3620,21 @@ app.post('/api/sp-api/lookup', requireAuth, async (req, res) => {
 // userId → { status, logs, signal, logListeners, result }
 const huntingJobs = new Map();
 
+// Strip characters that PostgreSQL JSONB rejects: null bytes and C0 control chars
+// except tab, newline, carriage return which are valid in JSON strings.
+function _sanitizeForJsonb(value) {
+  if (typeof value === 'string') {
+    const s = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x80-\x9F]/g, '');
+    return Buffer.from(s).toString('utf8');
+  }
+  if (Array.isArray(value))      return value.map(_sanitizeForJsonb);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = _sanitizeForJsonb(v);
+    return out;
+  }
+  return value;
+}
 function _huntLog(uid, msg) {
   const job = huntingJobs.get(uid);
   if (!job) return;
@@ -3722,11 +3737,23 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
         return;
       }
 
+      const sanitizedRows = _sanitizeForJsonb(validRows);
+      const rowsJson      = JSON.stringify(sanitizedRows);
+      // Verify JSON is well-formed before sending to Postgres
+      try { JSON.parse(rowsJson); } catch (je) {
+        throw new Error(`rows_data JSON invalid before INSERT: ${je.message}`);
+      }
+      // Detect lingering null bytes (Postgres JSONB rejects  )
+      if (rowsJson.includes(' ')) {
+        throw new Error('rows_data still contains null bytes after sanitization');
+      }
+      log(`[Hunt] rows_data: ${sanitizedRows.length} rows, ${rowsJson.length} chars`);
+
       const { rows: [session] } = await db.query(
         `INSERT INTO onbuy_bulk_import_sessions
            (user_id, account_id, account_name, total_rows, status, rows_data)
          VALUES ($1, $2, $3, $4, 'processing', $5) RETURNING id`,
-        [uid, account_id, account.account_name, validRows.length, JSON.stringify(validRows)],
+        [uid, account_id, account.account_name, sanitizedRows.length, rowsJson],
       );
 
       await bulkImportQueue.add('import', { sessionId: session.id, accountId: account_id, userId: uid }, {
