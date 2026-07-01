@@ -5954,33 +5954,20 @@ function ProductHuntingPage() {
 
         {/* Max listings */}
         <Section title="Max Listings to Import">
-          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            {[50, 100, 250, 500, 1000].map(n => (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {[100, 250, 500, 1000, 2000, 5000, 10000].map(n => (
               <button
                 key={n}
                 onClick={() => !isRunning && setMaxListings(n)}
                 style={{
-                  flex: 1, padding: "5px 0", borderRadius: 6, fontSize: 12, cursor: isRunning ? "default" : "pointer",
+                  flex: 1, minWidth: 60, padding: "5px 0", borderRadius: 6, fontSize: 12, cursor: isRunning ? "default" : "pointer",
                   background: maxListings === n ? C.accent + "22" : C.panel,
                   border: `1px solid ${maxListings === n ? C.accent : C.border}`,
                   color: maxListings === n ? C.accent : C.textDim,
                   fontWeight: maxListings === n ? 700 : 400,
                 }}
-              >{n}</button>
+              >{n.toLocaleString()}</button>
             ))}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
-            <span style={{ color: C.muted, fontSize: 12 }}>Custom:</span>
-            <input
-              type="number" min="1" max="5000" value={maxListings}
-              onChange={e => !isRunning && setMaxListings(Math.max(1, parseInt(e.target.value) || 1))}
-              disabled={isRunning}
-              style={{
-                width: 80, padding: "4px 8px", borderRadius: 6,
-                background: C.panel, border: `1px solid ${C.border}`,
-                color: C.text, fontSize: 12,
-              }}
-            />
           </div>
         </Section>
 
