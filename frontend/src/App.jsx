@@ -5777,12 +5777,17 @@ function ProductHuntingPage() {
   const [jobStatus,   setJobStatus]   = useState(null); // idle|running|done|error|cancelled
   const [logs,        setLogs]        = useState([]);
   const [result,      setResult]      = useState(null);
+  const [history,     setHistory]     = useState([]);
   const [err,         setErr]         = useState("");
   const [starting,    setStarting]    = useState(false);
   const logsEndRef = useRef(null);
   const esRef      = useRef(null);
 
-  // Load accounts on mount + check existing job
+  const loadHistory = useCallback(() => {
+    api("/product-hunting/history").then(d => { if (Array.isArray(d)) setHistory(d); }).catch(() => {});
+  }, []);
+
+  // Load accounts on mount + check existing job + load history
   useEffect(() => {
     api("/accounts").then(d => { if (d) setAccounts(d); }).catch(() => {});
     api("/product-hunting/status").then(s => {
@@ -5792,7 +5797,8 @@ function ProductHuntingPage() {
       if (s.error)  setErr(s.error);
       if (s.status === "running") _startSSE();
     }).catch(() => {});
-  }, []);
+    loadHistory();
+  }, [loadHistory]);
 
   // Auto-scroll logs to bottom
   useEffect(() => {
@@ -5816,6 +5822,7 @@ function ProductHuntingPage() {
           if (s.result) setResult(s.result);
           if (s.error)  setErr(s.error);
         }).catch(() => {});
+        loadHistory();
         return;
       }
       if (data.msg) setLogs(prev => [...prev, data.msg]);
@@ -6103,6 +6110,47 @@ function ProductHuntingPage() {
             <p style={{ color: C.muted, fontSize: 12, marginTop: 10 }}>
               ⚠ Make sure your OnBuy account has Keepa credentials set (Accounts → Edit → Keepa Email / Password).
             </p>
+          </Section>
+        )}
+
+        {/* Hunt History */}
+        {history.length > 0 && (
+          <Section title={
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%" }}>
+              <span>Hunt History</span>
+              <button onClick={loadHistory} style={{ background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 12, padding: 0 }}>↺ Refresh</button>
+            </div>
+          }>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                    {["Date", "Account", "Category", "Total", "Valid", "Skipped", "Session"].map(h => (
+                      <th key={h} style={{ color: C.muted, fontWeight: 600, padding: "6px 10px", textAlign: "left", whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((job, i) => (
+                    <tr key={job.id} style={{ borderBottom: `1px solid ${C.border}22`, background: i % 2 === 0 ? "transparent" : C.panel + "44" }}>
+                      <td style={{ padding: "7px 10px", color: C.textDim, whiteSpace: "nowrap" }}>
+                        {new Date(job.created_at).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
+                      </td>
+                      <td style={{ padding: "7px 10px", color: C.text }}>{job.account_name}</td>
+                      <td style={{ padding: "7px 10px", color: C.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.category}</td>
+                      <td style={{ padding: "7px 10px", color: C.text, textAlign: "center" }}>{job.total_rows}</td>
+                      <td style={{ padding: "7px 10px", color: C.accent, textAlign: "center", fontWeight: 600 }}>{job.valid_rows}</td>
+                      <td style={{ padding: "7px 10px", color: job.skipped_rows > 0 ? C.red : C.muted, textAlign: "center" }}>{job.skipped_rows}</td>
+                      <td style={{ padding: "7px 10px" }}>
+                        {job.session_id
+                          ? <span style={{ color: C.blue, fontSize: 11 }}>#{job.session_id}</span>
+                          : <span style={{ color: C.muted, fontSize: 11 }}>—</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </Section>
         )}
       </div>

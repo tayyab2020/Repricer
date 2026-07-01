@@ -1972,6 +1972,20 @@ async function runMigrations() {
     // Widen varchar columns that may have been created with length caps — OnBuy SKUs can exceed 20 chars
     `ALTER TABLE product_mappings ALTER COLUMN primary_asin TYPE TEXT`,
     `ALTER TABLE product_mappings ALTER COLUMN onbuy_sku    TYPE TEXT`,
+    `CREATE TABLE IF NOT EXISTS product_hunt_jobs (
+       id           SERIAL PRIMARY KEY,
+       user_id      INTEGER NOT NULL,
+       account_id   INTEGER,
+       account_name TEXT,
+       category     TEXT,
+       max_listings INTEGER,
+       total_rows   INTEGER DEFAULT 0,
+       valid_rows   INTEGER DEFAULT 0,
+       skipped_rows INTEGER DEFAULT 0,
+       session_id   INTEGER,
+       status       TEXT DEFAULT 'completed',
+       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
   ];
   for (const sql of steps) {
     try {
@@ -3709,27 +3723,6 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
       log(`[Hunt] Uploading ${rows.length} row(s) to OnBuy Bulk Import…`);
       const validRows = rows.filter(r => r.valid);
 
-      // Debug: log column presence + first 3 rows so issues are visible in the SSE stream
-      const invalidRows = rows.filter(r => !r.valid);
-      if (invalidRows.length) {
-        log(`[Hunt] ${invalidRows.length} invalid row(s): ${JSON.stringify(invalidRows.slice(0, 3).map(r => ({ row: r._row, name: r.name?.slice(0, 40), errors: r.errors })))}`);
-      }
-      if (rows.length > 0) {
-        const sample = rows.slice(0, 3).map(r => ({
-          row:       r._row,
-          name:      r.name?.slice(0, 50),
-          sku:       r.sku,
-          price:     r.price,
-          category:  r.category,
-          brand:     r.brand,
-          ean:       r.ean || '(none)',
-          images:    (r.images || []).filter(Boolean).length,
-          valid:     r.valid,
-          errors:    r.errors,
-        }));
-        log(`[Hunt] First ${sample.length} mapped row(s): ${JSON.stringify(sample, null, 2)}`);
-      }
-
       if (!validRows.length) {
         huntingJobs.get(uid).status = 'done';
         huntingJobs.get(uid).result = { imported: 0, skipped: rows.length };
@@ -3765,6 +3758,15 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
 
       log(`[Hunt] Bulk import session ${session.id} queued ✓`);
       log(`[Hunt] Done — ${validRows.length} product(s) queued for OnBuy import`);
+
+      // Record hunt job history
+      db.query(
+        `INSERT INTO product_hunt_jobs
+           (user_id, account_id, account_name, category, max_listings, total_rows, valid_rows, skipped_rows, session_id, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed')`,
+        [uid, account_id, account.account_name, category?.label ?? '',
+         max_listings, rows.length, validRows.length, rows.length - validRows.length, session.id]
+      ).catch(() => {});
 
       const job = huntingJobs.get(uid);
       job.status = 'done';
@@ -3864,6 +3866,23 @@ app.post('/api/product-hunting/clear', requireAuth, (req, res) => {
   if (job && job.status === 'running') return res.status(409).json({ error: 'Job is still running' });
   huntingJobs.delete(uid);
   res.json({ message: 'Cleared' });
+});
+// GET /api/product-hunting/history — last 50 hunt jobs for this user
+app.get('/api/product-hunting/history', requireAuth, async (req, res) => {
+  try {
+    const uid = req.effectiveUserId;
+    const { rows } = await db.query(
+      `SELECT id, account_name, category, max_listings, total_rows, valid_rows, skipped_rows,
+              session_id, status, created_at
+       FROM product_hunt_jobs
+       WHERE user_id = $1
+       ORDER BY created_at DESC LIMIT 50`,
+      [uid]
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─────────────────────────────────────────────

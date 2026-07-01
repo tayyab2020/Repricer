@@ -20,8 +20,6 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import XLSX from 'xlsx';
-
 puppeteer.use(StealthPlugin());
 
 const KEEPA_HOME        = 'https://keepa.com/#!';
@@ -146,56 +144,6 @@ export async function runProductHunting(
     const rows = _mapKeepaToOnBuy(csvPath, maxListings, log);
     log(`[Hunt] Mapped ${rows.length} product row(s) ✓`);
 
-    // ── Debug: persist raw CSV + mapped JSON + mapped Excel before temp dir is deleted ──
-    try {
-      const debugDir = path.join(process.cwd(), 'logs', 'hunt-debug');
-      fs.mkdirSync(debugDir, { recursive: true });
-      const ts = new Date().toISOString().replace(/[:.]/g, '-');
-
-      fs.copyFileSync(csvPath, path.join(debugDir, `keepa-${ts}.csv`));
-
-      fs.writeFileSync(
-        path.join(debugDir, `mapped-${ts}.json`),
-        JSON.stringify(rows, null, 2),
-      );
-
-      // Excel sheet — one row per mapped listing, human-readable column names
-      const xlsxRows = rows.map(r => ({
-        Row:                       r._row,
-        Valid:                     r.valid ? 'YES' : 'NO',
-        Errors:                    (r.errors || []).join('; '),
-        SKU:                       r.sku,
-        Product_Name:              r.name,
-        Description:               r.description,
-        Default_Image:             (r.images || [])[0] ?? '',
-        Brand:                     r.brand,
-        Category:                  r.category,
-        Condition:                 r.condition,
-        'EAN / UPC':               r.ean,
-        Price:                     r.price,
-        Stock:                     r.stock,
-        Handling_Time:             r.handling_time ?? '',
-        Colour:                    r.colour,
-        Summary_Point_One:         r.summary1,
-        Summary_Point_Two:         r.summary2,
-        Summary_Point_Three:       r.summary3,
-        Summary_Point_Four:        r.summary4,
-        Summary_Point_Five:        r.summary5,
-        Additional_images_One:     (r.images || [])[1] ?? '',
-        Additional_images_Two:     (r.images || [])[2] ?? '',
-        Additional_images_Three:   (r.images || [])[3] ?? '',
-        Additional_images_Four:    (r.images || [])[4] ?? '',
-        Additional_images_Five:    (r.images || [])[5] ?? '',
-      }));
-      const wb = XLSX.utils.book_new();
-      const ws = XLSX.utils.json_to_sheet(xlsxRows);
-      XLSX.utils.book_append_sheet(wb, ws, 'Mapped Listings');
-      XLSX.writeFile(wb, path.join(debugDir, `mapped-${ts}.xlsx`));
-
-      log(`[Hunt] Debug files → logs/hunt-debug/keepa-${ts}.csv  +  mapped-${ts}.json  +  mapped-${ts}.xlsx`);
-    } catch (e) {
-      log(`[Hunt] Debug save skipped: ${e.message}`);
-    }
 
     return rows;
 
