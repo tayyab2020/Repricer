@@ -113,17 +113,25 @@ export async function runProductHunting(
 
     _checkCancelled(signal);
 
-    // ── 5. Set rows per page to match requested listing count ──────────
+    // ── 5. Set rows per page — Keepa re-fetches then renders all rows ──
     log(`[Hunt] Setting rows per page to ${maxListings}…`);
     await _setRowsPerPage(page, maxListings, log);
-    // Give requests 2s to start before watching for idle
-    await _sleep(2000);
-    log('[Hunt] Waiting for Keepa to finish loading row data…');
-    await _waitForNetworkIdle(page, 6000, 150000);
+
+    // After the dropdown change Keepa makes an API call then renders the data
+    // client-side. The full cycle takes ~40-60s for 10 000 rows.
+    const KEEPA_ROW_OPTIONS = [5, 20, 100, 500, 1000, 2000, 5000, 10000];
+    const targetRows = KEEPA_ROW_OPTIONS.find(v => v >= maxListings) ?? 10000;
+    const waitSecs = targetRows >= 10000 ? 95
+                   : targetRows >= 5000  ? 65
+                   : targetRows >= 2000  ? 35
+                   : targetRows >= 1000  ? 15
+                   : 6;
+    log(`[Hunt] Waiting ${waitSecs}s for Keepa to fetch and render ${targetRows} rows…`);
+    await _sleep(waitSecs * 1000);
 
     _checkCancelled(signal);
 
-    // ── 6. Wait for rows to render ─────────────────────────────────────
+    // ── 6. Wait for rows to finish rendering ──────────────────────────
     log('[Hunt] Waiting for table to render…');
     await _waitForRows(page, log);
 
@@ -329,31 +337,6 @@ async function _selectCategory(page, category, log) {
     // Wait for nav/table to reload after clicking a parent, longer for the final leaf
     await _sleep(isLast ? 2500 : 2000);
   }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Wait until there are no network requests for idleMs in a row.
-// Falls back after timeoutMs regardless.
-// ─────────────────────────────────────────────────────────────
-function _waitForNetworkIdle(page, idleMs = 5000, timeoutMs = 120000) {
-  return new Promise(resolve => {
-    let timer;
-    const reset = () => {
-      clearTimeout(timer);
-      timer = setTimeout(done, idleMs);
-    };
-    const done = () => {
-      page.off('request',        reset);
-      page.off('requestfinished', reset);
-      page.off('requestfailed',   reset);
-      resolve();
-    };
-    page.on('request',        reset);
-    page.on('requestfinished', reset);
-    page.on('requestfailed',   reset);
-    reset(); // start immediately
-    setTimeout(done, timeoutMs); // hard cap
-  });
 }
 
 // ─────────────────────────────────────────────────────────────
