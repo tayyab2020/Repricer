@@ -3730,47 +3730,60 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
         return;
       }
 
-      const sanitizedRows = _sanitizeForJsonb(validRows);
-      const rowsJson      = JSON.stringify(sanitizedRows);
-      // Verify JSON is well-formed before sending to Postgres
-      try { JSON.parse(rowsJson); } catch (je) {
-        throw new Error(`rows_data JSON invalid before INSERT: ${je.message}`);
+      // Split into 1000-row batches to avoid huge single DB payloads (~26 MB for 9k rows)
+      const BATCH_SIZE = 1000;
+      const batches = [];
+      for (let i = 0; i < validRows.length; i += BATCH_SIZE)
+        batches.push(validRows.slice(i, i + BATCH_SIZE));
+
+      log(`[Hunt] Splitting ${validRows.length} valid rows into ${batches.length} batch(es) of up to ${BATCH_SIZE}…`);
+
+      const sessionIds = [];
+      for (let b = 0; b < batches.length; b++) {
+        const batch          = batches[b];
+        const sanitizedBatch = _sanitizeForJsonb(batch);
+        const batchJson      = JSON.stringify(sanitizedBatch);
+
+        try { JSON.parse(batchJson); } catch (je) {
+          throw new Error(`Batch ${b + 1} rows_data JSON invalid: ${je.message}`);
+        }
+
+        log(`[Hunt] Creating session for batch ${b + 1}/${batches.length} (${batch.length} rows, ${(batchJson.length / 1024).toFixed(0)} KB)…`);
+
+        const { rows: [bSession] } = await db.query(
+          `INSERT INTO onbuy_bulk_import_sessions
+             (user_id, account_id, account_name, total_rows, status, rows_data)
+           VALUES ($1, $2, $3, $4, 'processing', $5) RETURNING id`,
+          [uid, account_id, account.account_name, sanitizedBatch.length, batchJson],
+        );
+
+        await bulkImportQueue.add('import', { sessionId: bSession.id, accountId: account_id, userId: uid }, {
+          jobId:            `bulk-import-${bSession.id}`,
+          removeOnComplete: true,
+          removeOnFail:     true,
+          attempts:         1,
+        });
+
+        sessionIds.push(bSession.id);
+        log(`[Hunt] Batch ${b + 1}/${batches.length}: session #${bSession.id} queued ✓`);
+
+        _checkCancelled(signal);
       }
-      // Detect lingering null bytes (Postgres JSONB rejects  )
-      if (rowsJson.includes(' ')) {
-        throw new Error('rows_data still contains null bytes after sanitization');
-      }
-      log(`[Hunt] rows_data: ${sanitizedRows.length} rows, ${rowsJson.length} chars`);
 
-      const { rows: [session] } = await db.query(
-        `INSERT INTO onbuy_bulk_import_sessions
-           (user_id, account_id, account_name, total_rows, status, rows_data)
-         VALUES ($1, $2, $3, $4, 'processing', $5) RETURNING id`,
-        [uid, account_id, account.account_name, sanitizedRows.length, rowsJson],
-      );
+      log(`[Hunt] Done — ${validRows.length} product(s) across ${batches.length} session(s) queued for OnBuy import`);
 
-      await bulkImportQueue.add('import', { sessionId: session.id, accountId: account_id, userId: uid }, {
-        jobId:            `bulk-import-${session.id}`,
-        removeOnComplete: true,
-        removeOnFail:     true,
-        attempts:         1,
-      });
-
-      log(`[Hunt] Bulk import session ${session.id} queued ✓`);
-      log(`[Hunt] Done — ${validRows.length} product(s) queued for OnBuy import`);
-
-      // Record hunt job history
+      // Record hunt job history (primary session = first batch)
       db.query(
         `INSERT INTO product_hunt_jobs
            (user_id, account_id, account_name, category, max_listings, total_rows, valid_rows, skipped_rows, session_id, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'completed')`,
         [uid, account_id, account.account_name, category?.label ?? '',
-         max_listings, rows.length, validRows.length, rows.length - validRows.length, session.id]
+         max_listings, rows.length, validRows.length, rows.length - validRows.length, sessionIds[0]]
       ).catch(() => {});
 
       const job = huntingJobs.get(uid);
       job.status = 'done';
-      job.result = { imported: validRows.length, sessionId: session.id };
+      job.result = { imported: validRows.length, sessionId: sessionIds[0], sessions: sessionIds.length };
 
     } catch (err) {
       const job = huntingJobs.get(uid);
