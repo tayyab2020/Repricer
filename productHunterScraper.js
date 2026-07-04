@@ -116,7 +116,10 @@ export async function runProductHunting(
     // ── 5. Set rows per page to match requested listing count ──────────
     log(`[Hunt] Setting rows per page to ${maxListings}…`);
     await _setRowsPerPage(page, maxListings, log);
-    await _sleep(3000);
+    // Keepa fetches more data from Amazon for larger counts — wait proportionally
+    const reloadMs = maxListings >= 5000 ? 35000 : maxListings >= 2000 ? 18000 : maxListings >= 1000 ? 8000 : 4000;
+    log(`[Hunt] Waiting ${reloadMs / 1000}s for Keepa to load rows…`);
+    await _sleep(reloadMs);
 
     _checkCancelled(signal);
 
@@ -409,8 +412,34 @@ async function _setRowsPerPage(page, maxListings, log) {
     return false;
   }, String(target));
 
-  if (selected) log(`[Hunt] Rows set to ${target} ✓`);
-  else          log(`[Hunt] Warning: row option ${target} not found in dropdown`);
+  if (selected) {
+    log(`[Hunt] Rows set to ${target} ✓`);
+  } else {
+    log(`[Hunt] Row option ${target} not found — retrying…`);
+    await _sleep(1000);
+    // Retry: open dropdown again and click
+    await page.evaluate(() => {
+      const trigger = document.querySelector(
+        '#grid-tools-bestseller .tool__row .trigger, ' +
+        '.tool__row.mdc-menu-anchor .trigger, ' +
+        '.tool_row .trigger',
+      );
+      if (trigger) trigger.click();
+    });
+    await _sleep(500);
+    const retried = await page.evaluate((val) => {
+      const item = document.querySelector(
+        `#tool-row-menu li[data-value="${val}"], ` +
+        `ul.mdc-menu__items li[data-value="${val}"]`,
+      );
+      if (item) { item.click(); return true; }
+      const all = [...document.querySelectorAll('#tool-row-menu li, ul.mdc-menu__items li')];
+      const byText = all.find(li => li.textContent.trim() === String(val));
+      if (byText) { byText.click(); return true; }
+      return false;
+    }, String(target));
+    log(retried ? `[Hunt] Rows set to ${target} ✓ (retry)` : `[Hunt] Warning: could not set rows to ${target} — Keepa may default to 1000`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
