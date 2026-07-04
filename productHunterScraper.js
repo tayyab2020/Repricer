@@ -566,9 +566,12 @@ async function _configureColumns(page, log) {
 // Click Export → All active columns → CSV → download
 // ─────────────────────────────────────────────────────────────
 async function _exportCSV(page, dlDir, log) {
+  // Dismiss any overlays/modals that might block the export dialog
+  await page.keyboard.press('Escape');
+  await _sleep(300);
   // Ensure the column-config panel is closed before clicking Export
   await page.mouse.click(720, 650);
-  await _sleep(600);
+  await _sleep(800);
 
   // Open export dialog — scope to bestseller toolbar first
   const exportSel = await page.evaluate(() => {
@@ -597,11 +600,21 @@ async function _exportCSV(page, dlDir, log) {
   log(`[Hunt] Export trigger: ${exportSel}`);
   await _sleep(800);
 
-  // Wait for export dialog (longer timeout — dialog may animate in)
+  // Wait for export dialog — try up to 60s; take screenshot on failure to help debug
   await page.waitForFunction(
-    () => !!document.querySelector('#exportSubmit'),
-    { timeout: 30_000 },
-  );
+    () => !!(document.querySelector('#exportSubmit') ||
+             document.querySelector('button[type="submit"][id*="export" i]') ||
+             document.querySelector('.exportSubmit')),
+    { timeout: 60_000 },
+  ).catch(async (err) => {
+    try {
+      const fs2 = require('fs');
+      const ss = require('path').join(dlDir, '..', 'export-dialog-debug.png');
+      await page.screenshot({ path: ss, fullPage: false });
+      log(`[Hunt] Export dialog screenshot saved: ${ss}`);
+    } catch (_) {}
+    throw err;
+  });
   await _sleep(500);
 
   // Select "All active columns" + CSV
@@ -616,7 +629,15 @@ async function _exportCSV(page, dlDir, log) {
   await _sleep(300);
 
   log('[Hunt] Clicking export submit…');
-  await page.click('#exportSubmit');
+  const submitClicked = await page.evaluate(() => {
+    const btn = document.querySelector('#exportSubmit') ||
+                document.querySelector('.exportSubmit') ||
+                document.querySelector('button[type="submit"][id*="export" i]');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (!submitClicked) throw new Error('[Hunt] Export submit button not found');
+
 
   log('[Hunt] Waiting for CSV download…');
   const csvPath = await _waitForFile(dlDir, '.csv', 90_000);
