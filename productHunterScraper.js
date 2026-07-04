@@ -608,8 +608,9 @@ async function _exportCSV(page, dlDir, log) {
     { timeout: 60_000 },
   ).catch(async (err) => {
     try {
-      const fs2 = require('fs');
-      const ss = require('path').join(dlDir, '..', 'export-dialog-debug.png');
+      const debugDir = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1')), 'logs');
+      fs.mkdirSync(debugDir, { recursive: true });
+      const ss = path.join(debugDir, `export-dialog-debug-${Date.now()}.png`);
       await page.screenshot({ path: ss, fullPage: false });
       log(`[Hunt] Export dialog screenshot saved: ${ss}`);
     } catch (_) {}

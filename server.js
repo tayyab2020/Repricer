@@ -3767,7 +3767,7 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
         sessionIds.push(bSession.id);
         log(`[Hunt] Batch ${b + 1}/${batches.length}: session #${bSession.id} queued ✓`);
 
-        _checkCancelled(signal);
+        if (signal.cancelled) { huntingJobs.get(uid).status = 'cancelled'; log('[Hunt] Job cancelled'); return; }
       }
 
       log(`[Hunt] Done — ${validRows.length} product(s) across ${batches.length} session(s) queued for OnBuy import`);
