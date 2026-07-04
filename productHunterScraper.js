@@ -116,15 +116,15 @@ export async function runProductHunting(
     // ── 5. Set rows per page to match requested listing count ──────────
     log(`[Hunt] Setting rows per page to ${maxListings}…`);
     await _setRowsPerPage(page, maxListings, log);
-    // Keepa fetches more data from Amazon for larger counts — wait proportionally
-    const reloadMs = maxListings >= 5000 ? 35000 : maxListings >= 2000 ? 18000 : maxListings >= 1000 ? 8000 : 4000;
-    log(`[Hunt] Waiting ${reloadMs / 1000}s for Keepa to load rows…`);
-    await _sleep(reloadMs);
+    // Give requests 2s to start before watching for idle
+    await _sleep(2000);
+    log('[Hunt] Waiting for Keepa to finish loading row data…');
+    await _waitForNetworkIdle(page, 6000, 150000);
 
     _checkCancelled(signal);
 
-    // ── 6. Wait for reload ──────────────────────────────────────────────
-    log('[Hunt] Waiting for table to reload…');
+    // ── 6. Wait for rows to render ─────────────────────────────────────
+    log('[Hunt] Waiting for table to render…');
     await _waitForRows(page, log);
 
     _checkCancelled(signal);
@@ -329,6 +329,31 @@ async function _selectCategory(page, category, log) {
     // Wait for nav/table to reload after clicking a parent, longer for the final leaf
     await _sleep(isLast ? 2500 : 2000);
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Wait until there are no network requests for idleMs in a row.
+// Falls back after timeoutMs regardless.
+// ─────────────────────────────────────────────────────────────
+function _waitForNetworkIdle(page, idleMs = 5000, timeoutMs = 120000) {
+  return new Promise(resolve => {
+    let timer;
+    const reset = () => {
+      clearTimeout(timer);
+      timer = setTimeout(done, idleMs);
+    };
+    const done = () => {
+      page.off('request',        reset);
+      page.off('requestfinished', reset);
+      page.off('requestfailed',   reset);
+      resolve();
+    };
+    page.on('request',        reset);
+    page.on('requestfinished', reset);
+    page.on('requestfailed',   reset);
+    reset(); // start immediately
+    setTimeout(done, timeoutMs); // hard cap
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
