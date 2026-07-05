@@ -3721,12 +3721,29 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
       }
 
       log(`[Hunt] Uploading ${rows.length} row(s) to OnBuy Bulk Import…`);
-      const validRows = rows.filter(r => r.valid);
+      let validRows = rows.filter(r => r.valid);
+
+      // Filter out restricted brands (same logic as manual bulk upload)
+      try {
+        const { rows: rbRows } = await db.query(
+          'SELECT brand_name FROM restricted_brands WHERE user_id = $1',
+          [uid]
+        );
+        if (rbRows.length) {
+          const restrictedBrands = new Set(rbRows.map(r => r.brand_name.toLowerCase()));
+          const before = validRows.length;
+          validRows = validRows.filter(r => !r.brand || !restrictedBrands.has(r.brand.toLowerCase()));
+          const filtered = before - validRows.length;
+          if (filtered > 0) log(`[Hunt] Filtered out ${filtered} row(s) with restricted brands`);
+        }
+      } catch (rbErr) {
+        log(`[Hunt] Warning: could not load restricted brands — ${rbErr.message}`);
+      }
 
       if (!validRows.length) {
         huntingJobs.get(uid).status = 'done';
         huntingJobs.get(uid).result = { imported: 0, skipped: rows.length };
-        log('[Hunt] All rows were invalid — nothing uploaded');
+        log('[Hunt] All rows were invalid or restricted — nothing uploaded');
         return;
       }
 
