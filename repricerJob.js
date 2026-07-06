@@ -2569,6 +2569,11 @@ async function processDeleteBrandsJob(job) {
           deleted += batch.length;
           await db.query(`UPDATE onbuy_delete_brand_jobs SET listings_deleted=$1 WHERE id=$2`, [deleted, jobId]);
           dlog(`Deleted ${deleted}/${toDelete.length} listings`);
+          // Remove mappings for the deleted SKUs so the repricer no longer tracks them
+          await db.query(
+            `DELETE FROM product_mappings WHERE onbuy_account_id = $1 AND onbuy_sku = ANY($2::text[])`,
+            [account.id, batch],
+          ).catch(() => {});
         } catch (e) { dlog(`Delete batch error: ${e.message}`, 'error'); }
       }
 

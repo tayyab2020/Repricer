@@ -3146,11 +3146,18 @@ app.post('/api/delete-listings/delete', requireAuth, async (req, res) => {
       });
       const data        = await r.json();
       const batchResult = data?.results ?? {};
+      const deletedSkus = [];
       for (const [sku, outcome] of Object.entries(batchResult)) {
         perSku[sku] = outcome;
-        if (outcome.status === 'ok')                deleted++;
+        if (outcome.status === 'ok')                { deleted++; deletedSkus.push(sku); }
         else if (outcome.error === 'SKU not found') notFound++;
         else                                        failed++;
+      }
+      if (deletedSkus.length) {
+        await db.query(
+          `DELETE FROM product_mappings WHERE onbuy_account_id = $1 AND onbuy_sku = ANY($2::text[])`,
+          [onbuy_account_id, deletedSkus],
+        ).catch(() => {});
       }
     }
 

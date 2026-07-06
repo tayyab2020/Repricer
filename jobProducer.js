@@ -76,6 +76,7 @@ async function fetchAllListingsForAccount(token, siteId, log) {
   const allListings = [];
   let offset = 0;
   const limit = 1000;
+  let complete = false;
 
   while (true) {
     try {
@@ -87,14 +88,14 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       }
       const data = await r.json().catch(() => ({}));
       const results = Array.isArray(data) ? data : (data.results ?? data.payload ?? data.listings ?? []);
-      if (!results.length) break;
+      if (!results.length) { complete = true; break; }
 
       allListings.push(...results);
       log(`[ListingSync] Fetched page offset=${offset}: ${results.length} listings (total so far: ${allListings.length})`);
 
-      if (results.length < limit) break;
+      if (results.length < limit) { complete = true; break; }
       const total = data.total ?? data.count ?? null;
-      if (total !== null && allListings.length >= total) break;
+      if (total !== null && allListings.length >= total) { complete = true; break; }
 
       offset += limit;
       await new Promise(r => setTimeout(r, 300));
@@ -104,7 +105,7 @@ async function fetchAllListingsForAccount(token, siteId, log) {
     }
   }
 
-  return allListings;
+  return { listings: allListings, complete };
 }
 
 // Returns true only if the value matches the Amazon ASIN pattern (B + 9 alphanumeric chars).
@@ -134,12 +135,12 @@ async function syncAccountListings(account, db, log) {
     if (sRows[0]?.value) defaultRoi = parseFloat(sRows[0].value);
   } catch {}
 
-  const listings = await fetchAllListingsForAccount(token, siteId, log);
+  const { listings, complete } = await fetchAllListingsForAccount(token, siteId, log);
   if (!listings.length) {
     log(`[ListingSync] "${label}" — no listings returned`);
     return;
   }
-  log(`[ListingSync] "${label}" — ${listings.length} listing(s) to sync`);
+  log(`[ListingSync] "${label}" — ${listings.length} listing(s) to sync${complete ? '' : ' (partial fetch — stale cleanup skipped)'}`);
 
   // Look up existing rows by BOTH sku and uid to avoid creating duplicates when
   // the same listing was previously imported via Excel with a different key.
@@ -256,6 +257,18 @@ async function syncAccountListings(account, db, log) {
   }
 
   log(`[ListingSync] "${label}" — updated ${toUpdate.length}, inserted ${toInsert.length - skippedNonAsin}${skippedNonAsin ? ` (${skippedNonAsin} skipped — non-ASIN SKU)` : ''}`);
+
+  // Remove mappings for listings that no longer exist in the store.
+  // Only safe when the fetch was complete (all pages retrieved without error).
+  if (complete && skus.length) {
+    const { rowCount } = await db.query(
+      `DELETE FROM product_mappings
+       WHERE onbuy_account_id = $1 AND user_id = $2
+         AND onbuy_sku != ALL($3::text[])`,
+      [accountId, userId, skus],
+    );
+    if (rowCount > 0) log(`[ListingSync] "${label}" — removed ${rowCount} stale mapping(s) no longer in OnBuy store`);
+  }
 }
 
 export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
