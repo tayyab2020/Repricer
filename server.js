@@ -521,6 +521,8 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   try {
     const uid = req.effectiveUserId;
     const onlyUnsynced = req.body?.onlyUnsynced === true;
+    // Clear any post-cancel cooldown so a manual sync always runs immediately
+    await redis.del(`keepa:cancelled:${uid}`).catch(() => {});
     console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid} onlyUnsynced=${onlyUnsynced}`);
     redisPub.publish('repricer:manual-sync', JSON.stringify({ userId: uid, onlyUnsynced })).catch(() => {});
     res.json({ message: 'Sync job started successfully' });
@@ -1011,8 +1013,8 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          secret_key             = COALESCE(NULLIF($3,''), secret_key),
          site_id                = COALESCE($4, site_id),
          is_active              = COALESCE($5, is_active),
-         keepa_email            = COALESCE(NULLIF($6,''), keepa_email),
-         keepa_password         = COALESCE(NULLIF($7,''), keepa_password),
+         keepa_email            = CASE WHEN $6::text IS NOT NULL THEN NULLIF($6,'') ELSE keepa_email END,
+         keepa_password         = CASE WHEN $7::text IS NOT NULL THEN NULLIF($7,'') ELSE keepa_password END,
          enable_puppeteer       = COALESCE($8, enable_puppeteer),
          enable_twister         = COALESCE($9, enable_twister),
          enable_cheerio         = COALESCE($10, enable_cheerio),
