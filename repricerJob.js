@@ -1447,6 +1447,12 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
   };
   plog('[QueuePoller] Starting poll run');
 
+  // Mark any queues that hit the attempt cap as timed_out so they don't silently disappear
+  await db.query(
+    `UPDATE onbuy_bulk_pending_queues SET status='timed_out'
+     WHERE  status='pending' AND attempts >= 96`
+  ).catch(() => {});
+
   const { rows: pending } = await db.query(
     `SELECT pq.*, oa.consumer_key, oa.secret_key,
             COALESCE(oa.site_id, '2000')::int AS acct_site_id

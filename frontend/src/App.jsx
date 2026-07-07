@@ -4044,6 +4044,17 @@ function OnBuyBulkPage() {
               ↻ Refresh
             </button>
             <button onClick={async () => {
+              try {
+                const r = await api("/onbuy-bulk/restart-polling", { method: "POST" });
+                alert(`Polling restarted — ${r?.reset ?? 0} queue(s) reset. Poll will run within 30 seconds.`);
+                api("/onbuy-bulk/pending-queue-status").then(s => { if (s) setPendingStatus(s); }).catch(() => {});
+                api("/onbuy-bulk/history").then(rows => { if (rows) setHistory(rows); }).catch(() => {});
+              } catch (e) { alert("Restart failed: " + e.message); }
+            }} style={{ background: "none", border: `1px solid ${C.accent}`, borderRadius: 6,
+              color: C.accent, cursor: "pointer", padding: "4px 10px", fontSize: 12, fontWeight: 600 }}>
+              ↺ Restart Polling
+            </button>
+            <button onClick={async () => {
               if (!confirm(`Cancel all ${parseInt(pendingStatus.pending).toLocaleString()} pending product queues? Listings will not be created for these products.`)) return;
               try {
                 await api("/onbuy-bulk/cancel-all-pending", { method: "POST" });

@@ -2529,6 +2529,31 @@ app.post('/api/onbuy-bulk/cancel-all-pending', requireAuth, async (req, res) => 
   }
 });
 
+// POST /api/onbuy-bulk/restart-polling — reset maxed-out pending queues and trigger a fresh poll
+app.post('/api/onbuy-bulk/restart-polling', requireAuth, async (req, res) => {
+  try {
+    const uid = req.effectiveUserId;
+    // Reset attempts to 0 for all pending/timed_out queues so polling restarts
+    const { rowCount } = await db.query(
+      `UPDATE onbuy_bulk_pending_queues
+          SET attempts = 0, last_polled_at = NULL, status = 'pending'
+        WHERE user_id = $1 AND status IN ('pending', 'timed_out')`,
+      [uid]
+    );
+    // Trigger an immediate poll job
+    await queuePollerQueue.add('poll', {}, {
+      jobId:            `queue-poller-restart-${Date.now()}`,
+      delay:            0,
+      removeOnComplete: true,
+      removeOnFail:     true,
+      attempts:         1,
+    }).catch(() => {});
+    res.json({ reset: rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/onbuy-bulk/sessions/:sessionId — live status for a background import
 app.get('/api/onbuy-bulk/sessions/:sessionId', requireAuth, async (req, res) => {
   try {
