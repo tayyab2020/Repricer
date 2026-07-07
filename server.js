@@ -2872,6 +2872,7 @@ app.get('/api/onbuy-bulk/pending-queue-status', requireAuth, async (req, res) =>
     const { rows } = await db.query(
       `SELECT
          COUNT(*) FILTER (WHERE status = 'pending')         AS pending,
+         COUNT(*) FILTER (WHERE status = 'timed_out')       AS timed_out,
          COUNT(*) FILTER (WHERE status = 'success')         AS success,
          COUNT(*) FILTER (WHERE status = 'listing_created') AS listing_created,
          COUNT(*) FILTER (WHERE status = 'failed')          AS failed,
@@ -2880,7 +2881,10 @@ app.get('/api/onbuy-bulk/pending-queue-status', requireAuth, async (req, res) =>
        WHERE user_id = $1`,
       [req.effectiveUserId]
     );
-    res.json(rows[0]);
+    // Treat timed_out as pending for banner display purposes
+    const row = rows[0];
+    row.pending = String(parseInt(row.pending || 0) + parseInt(row.timed_out || 0));
+    res.json(row);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2890,6 +2894,7 @@ app.get('/api/onbuy-bulk/pending-queue-status/:sessionId', requireAuth, async (r
     const { rows } = await db.query(
       `SELECT
          COUNT(*) FILTER (WHERE status = 'pending')         AS pending,
+         COUNT(*) FILTER (WHERE status = 'timed_out')       AS timed_out,
          COUNT(*) FILTER (WHERE status = 'success')         AS success,
          COUNT(*) FILTER (WHERE status = 'listing_created') AS listing_created,
          COUNT(*) FILTER (WHERE status = 'failed')          AS failed,
@@ -2898,7 +2903,9 @@ app.get('/api/onbuy-bulk/pending-queue-status/:sessionId', requireAuth, async (r
        WHERE user_id = $1 AND session_id = $2`,
       [req.effectiveUserId, req.params.sessionId]
     );
-    res.json(rows[0]);
+    const sRow = rows[0];
+    sRow.pending = String(parseInt(sRow.pending || 0) + parseInt(sRow.timed_out || 0));
+    res.json(sRow);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

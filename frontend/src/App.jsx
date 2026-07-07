@@ -4028,7 +4028,9 @@ function OnBuyBulkPage() {
                 {parseInt(pendingStatus.pending).toLocaleString()} product queue{parseInt(pendingStatus.pending) !== 1 ? "s" : ""} pending on OnBuy
               </div>
               <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
-                Background worker polls every 30 min and creates listings when queues resolve.
+                {parseInt(pendingStatus.timed_out || 0) > 0
+                  ? `${parseInt(pendingStatus.timed_out).toLocaleString()} queue(s) timed out — click ↺ Restart Polling to resume.`
+                  : "Background worker polls every 30 min and creates listings when queues resolve."}
               </div>
             </div>
           </div>
