@@ -77,6 +77,7 @@ async function fetchAllListingsForAccount(token, siteId, log) {
   let offset = 0;
   const limit = 1000;
   let complete = false;
+  let knownTotal = null;
 
   while (true) {
     try {
@@ -88,14 +89,37 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       }
       const data = await r.json().catch(() => ({}));
       const results = Array.isArray(data) ? data : (data.results ?? data.payload ?? data.listings ?? []);
-      if (!results.length) { complete = true; break; }
+
+      // OnBuy v2 reports the authoritative count in data.metadata.total_rows
+      if (knownTotal === null) {
+        knownTotal = data.metadata?.total_rows ?? data.total ?? data.count ?? null;
+        if (knownTotal !== null) {
+          log(`[ListingSync] API reports ${knownTotal} total listing(s)`);
+        }
+      }
+
+      if (!results.length) {
+        // Empty page — only mark complete if we've reached the known total or total is unknown
+        if (knownTotal === null || allListings.length >= knownTotal) complete = true;
+        else log(`[ListingSync] ⚠️  Empty page at offset=${offset} but only ${allListings.length}/${knownTotal} fetched — API may have an offset cap`);
+        break;
+      }
 
       allListings.push(...results);
-      log(`[ListingSync] Fetched page offset=${offset}: ${results.length} listings (total so far: ${allListings.length})`);
+      log(`[ListingSync] Fetched page offset=${offset}: ${results.length} listings (total so far: ${allListings.length}${knownTotal != null ? `/${knownTotal}` : ''})`);
 
-      if (results.length < limit) { complete = true; break; }
-      const total = data.total ?? data.count ?? null;
-      if (total !== null && allListings.length >= total) { complete = true; break; }
+      if (knownTotal !== null) {
+        // With a known total, only stop when we've actually reached it
+        if (allListings.length >= knownTotal) { complete = true; break; }
+        // Short page is NOT a stop signal when total is known — API may have an internal page-size cap
+        if (results.length < limit) {
+          log(`[ListingSync] ⚠️  Short page (${results.length} < ${limit}) at offset=${offset} with ${allListings.length}/${knownTotal} fetched — API offset cap reached`);
+          break; // complete stays false — stale deletion will be skipped
+        }
+      } else {
+        // No known total: a short page reliably means the last page
+        if (results.length < limit) { complete = true; break; }
+      }
 
       offset += limit;
       await new Promise(r => setTimeout(r, 300));
@@ -103,6 +127,10 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       log(`[ListingSync] Fetch error at offset=${offset}: ${err.message}`);
       break;
     }
+  }
+
+  if (!complete && knownTotal !== null && allListings.length < knownTotal) {
+    log(`[ListingSync] ⚠️  Incomplete fetch: got ${allListings.length} of ${knownTotal} listing(s) — stale mapping cleanup will be skipped to avoid false deletions`);
   }
 
   return { listings: allListings, complete };
