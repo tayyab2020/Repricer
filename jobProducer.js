@@ -111,10 +111,9 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       if (knownTotal !== null) {
         // With a known total, only stop when we've actually reached it
         if (allListings.length >= knownTotal) { complete = true; break; }
-        // Short page is NOT a stop signal when total is known — API may have an internal page-size cap
+        // Short page when total is known: a gap in the data, not the end — keep fetching
         if (results.length < limit) {
-          log(`[ListingSync] ⚠️  Short page (${results.length} < ${limit}) at offset=${offset} with ${allListings.length}/${knownTotal} fetched — API offset cap reached`);
-          break; // complete stays false — stale deletion will be skipped
+          log(`[ListingSync] Short page (${results.length} < ${limit}) at offset=${offset} — gap in data, continuing`);
         }
       } else {
         // No known total: a short page reliably means the last page
