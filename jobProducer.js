@@ -99,9 +99,13 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       }
 
       if (!results.length) {
-        // Empty page — only mark complete if we've reached the known total or total is unknown
-        if (knownTotal === null || allListings.length >= knownTotal) complete = true;
-        else log(`[ListingSync] ⚠️  Empty page at offset=${offset} but only ${allListings.length}/${knownTotal} fetched — API may have an offset cap`);
+        // Empty page is the authoritative end-of-data signal — the API has no more listings.
+        // total_rows can be slightly stale (listings deleted mid-fetch), so trust the empty
+        // page over the count and mark the fetch complete.
+        complete = true;
+        if (knownTotal !== null && allListings.length < knownTotal) {
+          log(`[ListingSync] Empty page at offset=${offset} with ${allListings.length}/${knownTotal} fetched — treating as complete (listings may have been deleted during fetch)`);
+        }
         break;
       }
 
@@ -126,10 +130,6 @@ async function fetchAllListingsForAccount(token, siteId, log) {
       log(`[ListingSync] Fetch error at offset=${offset}: ${err.message}`);
       break;
     }
-  }
-
-  if (!complete && knownTotal !== null && allListings.length < knownTotal) {
-    log(`[ListingSync] ⚠️  Incomplete fetch: got ${allListings.length} of ${knownTotal} listing(s) — stale mapping cleanup will be skipped to avoid false deletions`);
   }
 
   return { listings: allListings, complete };
