@@ -1704,8 +1704,18 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
   const [saving,        setSaving]        = useState(false);
   const [msg,           setMsg]           = useState(null);
   const [catCount,      setCatCount]      = useState(null);
-  const [catUploading,  setCatUploading]  = useState(false);
+  const [catBySite,     setCatBySite]     = useState([]);
+  const [catSyncing,    setCatSyncing]    = useState(false);
   const [catMsg,        setCatMsg]        = useState(null);
+  const [catSiteId,     setCatSiteId]     = useState("2000");
+  const [catSyncJob,    setCatSyncJob]    = useState(null); // latest sync job for selected site
+  const catPollRef                        = useRef(null);
+  const [rbCount,       setRbCount]       = useState(null);
+  const [rbUploading,   setRbUploading]   = useState(false);
+  const [rbMsg,         setRbMsg]         = useState(null);
+  const [rpCount,       setRpCount]       = useState(null);
+  const [rpUploading,   setRpUploading]   = useState(false);
+  const [rpMsg,         setRpMsg]         = useState(null);
 
   useEffect(() => {
     api("/settings").then(s => {
@@ -1717,8 +1727,53 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
       setStartTime(s.job_start_time         || "00:00");
       setStatus(s._proxy_status);
     }).catch(console.error);
-    api("/settings/categories/count").then(d => setCatCount(d.count)).catch(() => setCatCount(0));
+    api("/settings/categories/count").then(d => { setCatCount(d.count); setCatBySite(d.by_site ?? []); }).catch(() => { setCatCount(0); setCatBySite([]); });
+    api("/restricted-brands").then(d => setRbCount(d.count)).catch(() => setRbCount(0));
+    api("/restricted-products").then(d => setRpCount(d.count)).catch(() => setRpCount(0));
   }, []);
+
+  // Fetch sync job status whenever selected site changes (or on mount)
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    fetchCatSyncStatus(catSiteId);
+  }, [catSiteId, isSuperAdmin]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clean up poller on unmount
+  useEffect(() => () => { if (catPollRef.current) clearInterval(catPollRef.current); }, []);
+
+  async function fetchCatSyncStatus(siteId) {
+    try {
+      const d = await api(`/admin/categories/sync/status?site_id=${siteId}`);
+      const job = d?.job ?? null;
+      setCatSyncJob(job);
+      if (job?.status === 'running') {
+        setCatSyncing(true);
+        if (!catPollRef.current) {
+          catPollRef.current = setInterval(async () => {
+            try {
+              const d2 = await api(`/admin/categories/sync/status?site_id=${siteId}`);
+              const j = d2?.job ?? null;
+              setCatSyncJob(j ? { ...j } : j);
+              if (j?.status !== 'running') {
+                clearInterval(catPollRef.current); catPollRef.current = null;
+                setCatSyncing(false);
+                if (j?.status === 'completed') {
+                  const counts = await api("/settings/categories/count").catch(() => null);
+                  if (counts) { setCatCount(counts.count); setCatBySite(counts.by_site ?? []); }
+                  setCatMsg({ ok: true, text: `Synced ${(j.stored ?? 0).toLocaleString()} lvl-5 categories for site_id ${siteId}` });
+                } else if (j?.status === 'failed') {
+                  setCatMsg({ ok: false, text: j.error || 'Sync failed' });
+                }
+              }
+            } catch {}
+          }, 1000);
+        }
+      } else {
+        setCatSyncing(false);
+        if (catPollRef.current) { clearInterval(catPollRef.current); catPollRef.current = null; }
+      }
+    } catch {}
+  }
 
   const save = async () => {
     setSaving(true); setMsg(null);
@@ -1771,6 +1826,10 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
 
   return (
     <div style={{ maxWidth: 660, display: "flex", flexDirection: "column", gap: 20 }}>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(350%); } }
+      `}</style>
 
       {/* App Theme — super admin only */}
       {isSuperAdmin && (
@@ -2048,64 +2107,297 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
       </Btn>
 
       {isSuperAdmin && (
+        <>
         <Section title="OnBuy Categories">
-          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-              <div>
-                <p style={{ color: C.textDim, fontSize: 12, marginBottom: 2 }}>Categories in database</p>
-                <p style={{ color: catCount === 0 ? C.red : C.accent, fontWeight: 700, fontSize: 22 }}>
-                  {catCount === null ? "…" : catCount.toLocaleString()}
-                </p>
-              </div>
-              {catCount === 0 && (
-                <p style={{ color: C.amber, fontSize: 12, maxWidth: 320 }}>
-                  No categories loaded. Bulk listing imports will fail until a categories file is uploaded.
-                </p>
-              )}
-            </div>
+          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
+            {/* Count row */}
             <div>
-              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 6 }}>
-                Upload Categories File <span style={{ color: C.muted }}>(CSV or XLSX — must have ID and Category columns)</span>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 6 }}>Categories in database</p>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
+                <p style={{ color: catCount === 0 ? C.red : C.accent, fontWeight: 700, fontSize: 22, margin: 0 }}>
+                  {catCount === null ? "…" : catCount.toLocaleString()}
+                  <span style={{ color: C.muted, fontWeight: 400, fontSize: 13 }}> total</span>
+                </p>
+                {catCount === 0 && (
+                  <p style={{ color: C.amber, fontSize: 12 }}>
+                    No categories synced yet. Bulk listing imports will fail until categories are synced.
+                  </p>
+                )}
+              </div>
+              {/* Per-site breakdown */}
+              {catBySite.length > 0 && (() => {
+                const SITES = {2000:"UK",2001:"France",2002:"Germany",2003:"Czech Rep.",2004:"Netherlands",2007:"Austria",2008:"Belgium",2011:"Denmark",2013:"Spain",2014:"Finland",2015:"Greece",2017:"Hungary",2019:"Ireland",2020:"Italy",2026:"Norway",2027:"Poland",2028:"Portugal",2029:"Romania",2030:"Sweden",2031:"Switzerland",2033:"Slovakia"};
+                return (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                    {catBySite.map(s => (
+                      <span key={s.site_id} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 10px", fontSize: 11, color: C.textDim }}>
+                        <span style={{ color: C.accent, fontWeight: 700 }}>{s.count.toLocaleString()}</span>
+                        {" "}{SITES[s.site_id] ?? `site ${s.site_id}`}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+            {/* Site selector + sync button */}
+            <div>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 8 }}>
+                Fetch categories from OnBuy API and sync to database
               </p>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <input
-                  type="file"
-                  accept=".csv,.xlsx,.xls"
-                  style={{ color: C.text, fontSize: 13 }}
-                  disabled={catUploading}
-                  onChange={async e => {
-                    const file = e.target.files?.[0];
-                    if (!file) return;
-                    setCatUploading(true); setCatMsg(null);
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <select
+                  value={catSiteId}
+                  onChange={e => setCatSiteId(e.target.value)}
+                  disabled={catSyncing}
+                  style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "8px 12px", color: C.text, fontSize: 13, minWidth: 200 }}
+                >
+                  {[
+                    [2000,"OnBuy UK"],[2001,"OnBuy France"],[2002,"OnBuy Germany"],
+                    [2003,"OnBuy Czech Republic"],[2004,"OnBuy Netherlands"],[2007,"OnBuy Austria"],
+                    [2008,"OnBuy Belgium"],[2011,"OnBuy Denmark"],[2013,"OnBuy Spain"],
+                    [2014,"OnBuy Finland"],[2015,"OnBuy Greece"],[2017,"OnBuy Hungary"],
+                    [2019,"OnBuy Ireland"],[2020,"OnBuy Italy"],[2026,"OnBuy Norway"],
+                    [2027,"OnBuy Poland"],[2028,"OnBuy Portugal"],[2029,"OnBuy Romania"],
+                    [2030,"OnBuy Sweden"],[2031,"OnBuy Switzerland"],[2033,"OnBuy Slovakia"],
+                  ].map(([id, label]) => (
+                    <option key={id} value={String(id)}>{label} (site_id: {id})</option>
+                  ))}
+                </select>
+                <button
+                  disabled={catSyncing}
+                  onClick={async () => {
+                    setCatSyncing(true); setCatMsg(null); setCatSyncJob(null);
                     try {
-                      const token = localStorage.getItem("repricer_token");
-                      const fd = new FormData();
-                      fd.append("file", file);
-                      const r = await fetch(`${API}/settings/categories/upload`, {
+                      const d = await api("/admin/categories/sync", {
                         method: "POST",
-                        headers: token ? { Authorization: `Bearer ${token}` } : {},
-                        body: fd,
+                        body: JSON.stringify({ site_id: parseInt(catSiteId) }),
                       });
-                      const data = await r.json();
-                      if (!r.ok) throw new Error(data.error || "Upload failed");
-                      setCatCount(data.count);
-                      setCatMsg({ ok: true, text: `Uploaded ${data.count.toLocaleString()} categories` });
+                      // Job started — begin polling (fetchCatSyncStatus manages catSyncing state)
+                      await fetchCatSyncStatus(catSiteId);
                     } catch (err) {
                       setCatMsg({ ok: false, text: err.message });
-                    } finally {
-                      setCatUploading(false);
-                      e.target.value = "";
+                      setCatSyncing(false);
                     }
                   }}
-                />
-                {catUploading && <span style={{ color: C.muted, fontSize: 12 }}>Uploading…</span>}
+                  style={{
+                    background: catSyncing ? C.surface : C.accent + "22",
+                    border: `1px solid ${catSyncing ? C.border : C.accent + "66"}`,
+                    borderRadius: 8, color: catSyncing ? C.muted : C.accent,
+                    cursor: catSyncing ? "not-allowed" : "pointer",
+                    padding: "8px 18px", fontSize: 13, fontWeight: 600,
+                    display: "flex", alignItems: "center", gap: 8,
+                  }}
+                >
+                  {catSyncing ? (
+                    <><span style={{ display: "inline-block", width: 14, height: 14, border: `2px solid ${C.accent}`, borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.7s linear infinite" }} /> Fetching categories…</>
+                  ) : (
+                    <>↓ Fetch &amp; Sync Categories</>
+                  )}
+                </button>
               </div>
+              <p style={{ color: C.muted, fontSize: 11, marginTop: 8 }}>
+                Fetches all categories from OnBuy for the selected country and replaces the current database. Uses an existing OnBuy account token automatically.
+              </p>
             </div>
+
+            {/* Live sync status panel */}
+            {catSyncJob && (() => {
+              const job = catSyncJob;
+              const pct = job.total > 0 ? Math.min(100, Math.round((job.fetched ?? 0) / job.total * 100)) : null;
+              const statusColor = job.status === 'completed' ? C.accent : job.status === 'failed' ? C.red : C.amber;
+              const statusLabel = job.status === 'completed' ? '✓ Completed' : job.status === 'failed' ? '✗ Failed' : '⟳ Syncing…';
+              return (
+                <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                    <span style={{ fontWeight: 700, fontSize: 13, color: C.text }}>
+                      Sync status — site_id {job.site_id ?? catSiteId}
+                    </span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: statusColor, background: statusColor + "18", border: `1px solid ${statusColor}44`, borderRadius: 20, padding: "2px 10px" }}>
+                      {statusLabel}
+                    </span>
+                  </div>
+
+                  {/* Progress bar */}
+                  {job.status === 'running' && (
+                    <div style={{ background: C.border, borderRadius: 4, height: 6, overflow: "hidden" }}>
+                      <div style={{
+                        height: "100%", borderRadius: 4,
+                        background: C.accent,
+                        width: pct !== null ? `${pct}%` : "40%",
+                        transition: "width 0.4s ease",
+                        animation: pct === null ? "indeterminate 1.5s ease infinite" : undefined,
+                      }} />
+                    </div>
+                  )}
+
+                  {/* Waiting hint when job just started */}
+                  {job.status === 'running' && (job.fetched ?? 0) === 0 && (
+                    <p style={{ color: C.amber, fontSize: 12, opacity: 0.85 }}>
+                      Contacting OnBuy API, waiting for first page…
+                    </p>
+                  )}
+
+                  {/* Stats row */}
+                  <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                    {job.fetched != null && (
+                      <div>
+                        <p style={{ color: C.muted, fontSize: 10, marginBottom: 1 }}>FETCHED</p>
+                        <p style={{ color: C.text, fontSize: 14, fontWeight: 600 }}>{(job.fetched ?? 0).toLocaleString()}{job.total ? ` / ${job.total.toLocaleString()}` : ""}</p>
+                      </div>
+                    )}
+                    {job.stored != null && (
+                      <div>
+                        <p style={{ color: C.muted, fontSize: 10, marginBottom: 1 }}>LVL-5 STORED</p>
+                        <p style={{ color: C.accent, fontSize: 14, fontWeight: 600 }}>{(job.stored ?? 0).toLocaleString()}</p>
+                      </div>
+                    )}
+                    {pct !== null && (
+                      <div>
+                        <p style={{ color: C.muted, fontSize: 10, marginBottom: 1 }}>PROGRESS</p>
+                        <p style={{ color: C.text, fontSize: 14, fontWeight: 600 }}>{pct}%</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {job.status === 'failed' && job.error && (
+                    <p style={{ color: C.red, fontSize: 12, background: C.red + "11", border: `1px solid ${C.red}33`, borderRadius: 6, padding: "6px 10px" }}>
+                      {job.error}
+                    </p>
+                  )}
+                  {job.completed_at && (
+                    <p style={{ color: C.muted, fontSize: 11 }}>
+                      Finished: {new Date(job.completed_at).toLocaleString()}
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
+
             {catMsg && (
               <p style={{ color: catMsg.ok ? C.accent : C.red, fontSize: 13 }}>{catMsg.text}</p>
             )}
           </div>
         </Section>
+
+        {/* Restricted Lists — brands + products */}
+        <Section title="Restricted Lists">
+          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 24 }}>
+
+            {/* Restricted Brands */}
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10 }}>
+                <div>
+                  <p style={{ color: C.textDim, fontSize: 12, marginBottom: 2 }}>Restricted brands in database</p>
+                  <p style={{ color: rbCount === 0 ? C.amber : C.accent, fontWeight: 700, fontSize: 22 }}>
+                    {rbCount === null ? "…" : rbCount.toLocaleString()}
+                  </p>
+                </div>
+              </div>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 8 }}>
+                Upload Restricted Brands <span style={{ color: C.muted }}>(CSV or XLSX — first column: brand name)</span>
+              </p>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <button
+                  onClick={async () => {
+                    const token = localStorage.getItem("repricer_token");
+                    const r = await fetch(`${API}/restricted-brands/template`, { headers: { Authorization: `Bearer ${token}` } });
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a"); a.href = url; a.download = "restricted-brands-template.xlsx"; a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "6px 14px", fontSize: 12, fontWeight: 600 }}
+                >
+                  📋 Template
+                </button>
+                <label style={{ cursor: rbUploading ? "not-allowed" : "pointer" }}>
+                  <input type="file" accept=".xlsx,.csv" style={{ display: "none" }} disabled={rbUploading}
+                    onChange={async e => {
+                      const file = e.target.files?.[0]; if (!file) return;
+                      setRbUploading(true); setRbMsg(null);
+                      try {
+                        const token = localStorage.getItem("repricer_token");
+                        const fd = new FormData(); fd.append("file", file);
+                        const r = await fetch(`${API}/restricted-brands/upload`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
+                        const d = await r.json();
+                        if (!r.ok) throw new Error(d.error || "Upload failed");
+                        setRbCount(d.count);
+                        setRbMsg({ ok: true, text: `${d.count} restricted brands uploaded` });
+                      } catch (err) { setRbMsg({ ok: false, text: err.message }); }
+                      setRbUploading(false); e.target.value = "";
+                    }}
+                  />
+                  <span style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: rbUploading ? C.muted : C.text, padding: "6px 14px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, cursor: rbUploading ? "not-allowed" : "pointer" }}>
+                    {rbUploading ? "⏳ Uploading…" : "📤 Upload Brands Sheet"}
+                  </span>
+                </label>
+              </div>
+              {rbMsg && <p style={{ color: rbMsg.ok ? C.accent : C.red, fontSize: 12, marginTop: 8 }}>{rbMsg.text}</p>}
+              <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>
+                Replaces the existing brand list. All users' "Delete Restricted Brand Listings" jobs read from this global list.
+              </p>
+            </div>
+
+            <div style={{ borderTop: `1px solid ${C.border}` }} />
+
+            {/* Restricted Products */}
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10 }}>
+                <div>
+                  <p style={{ color: C.textDim, fontSize: 12, marginBottom: 2 }}>Restricted product titles in database</p>
+                  <p style={{ color: rpCount === 0 ? C.amber : C.accent, fontWeight: 700, fontSize: 22 }}>
+                    {rpCount === null ? "…" : rpCount.toLocaleString()}
+                  </p>
+                </div>
+              </div>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 8 }}>
+                Upload Restricted Products <span style={{ color: C.muted }}>(CSV or XLSX — first column: product title keyword)</span>
+              </p>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <button
+                  onClick={async () => {
+                    const token = localStorage.getItem("repricer_token");
+                    const r = await fetch(`${API}/admin/restricted-products/template`, { headers: { Authorization: `Bearer ${token}` } });
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a"); a.href = url; a.download = "restricted-products-template.xlsx"; a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "6px 14px", fontSize: 12, fontWeight: 600 }}
+                >
+                  📋 Template
+                </button>
+                <label style={{ cursor: rpUploading ? "not-allowed" : "pointer" }}>
+                  <input type="file" accept=".xlsx,.csv" style={{ display: "none" }} disabled={rpUploading}
+                    onChange={async e => {
+                      const file = e.target.files?.[0]; if (!file) return;
+                      setRpUploading(true); setRpMsg(null);
+                      try {
+                        const token = localStorage.getItem("repricer_token");
+                        const fd = new FormData(); fd.append("file", file);
+                        const r = await fetch(`${API}/admin/restricted-products/upload`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
+                        const d = await r.json();
+                        if (!r.ok) throw new Error(d.error || "Upload failed");
+                        setRpCount(d.count);
+                        setRpMsg({ ok: true, text: `${d.count} restricted product titles uploaded` });
+                      } catch (err) { setRpMsg({ ok: false, text: err.message }); }
+                      setRpUploading(false); e.target.value = "";
+                    }}
+                  />
+                  <span style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: rpUploading ? C.muted : C.text, padding: "6px 14px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, cursor: rpUploading ? "not-allowed" : "pointer" }}>
+                    {rpUploading ? "⏳ Uploading…" : "📤 Upload Products Sheet"}
+                  </span>
+                </label>
+              </div>
+              {rpMsg && <p style={{ color: rpMsg.ok ? C.accent : C.red, fontSize: 12, marginTop: 8 }}>{rpMsg.text}</p>}
+              <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>
+                Listing titles containing any of these keywords will be deleted when a user runs "Delete Restricted Products".
+              </p>
+            </div>
+
+          </div>
+        </Section>
+        </>
       )}
     </div>
   );
@@ -2515,6 +2807,7 @@ function AccountsPage() {
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
   const [testResult, setResult] = useState({});
+  const [jobsMenu, setJobsMenu] = useState(null); // account id whose jobs dropdown is open
   const [loading, setLoading]       = useState(false);
   const [err, setErr]               = useState("");
   const [fetchingLabel, setFetchingLabel] = useState(false);
@@ -2523,6 +2816,13 @@ function AccountsPage() {
     try { setAccounts(await api("/accounts")); } catch {}
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!jobsMenu) return;
+    const close = () => setJobsMenu(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [jobsMenu]);
 
   async function save() {
     if (!form.account_name || !form.consumer_key || !form.secret_key)
@@ -2569,8 +2869,9 @@ function AccountsPage() {
     setFetchingLabel(false);
   }
 
-  async function toggleActive(a) {
-    await api(`/accounts/${a.id}`, { method:"PUT", body: JSON.stringify({ is_active: !a.is_active }) });
+  async function toggleFlag(a, field) {
+    const currentlyOn = a[field] !== false;
+    await api(`/accounts/${a.id}`, { method:"PUT", body: JSON.stringify({ [field]: !currentlyOn }) });
     load();
   }
 
@@ -2831,7 +3132,7 @@ function AccountsPage() {
                         </div>
                       )}
                     </div>
-                    <div style={{ display:"flex", gap:6, flexShrink:0, alignItems:"center" }}>
+                    <div style={{ display:"flex", gap:6, flexShrink:0, alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
                       <Btn small variant="secondary" loading={testing[a.id]}
                         onClick={() => testAccount(a.id)}>Test</Btn>
                       <Btn small variant="secondary" onClick={async () => {
@@ -2855,13 +3156,77 @@ function AccountsPage() {
                           }));
                         } catch {}
                       }}>Edit</Btn>
-                      <button onClick={() => toggleActive(a)} title={a.is_active ? "Disable account" : "Enable account"} style={{
-                        background: a.is_active ? "#00d4aa18" : "#ef444418",
-                        border: `1px solid ${a.is_active ? C.accent + "44" : C.red + "44"}`,
-                        color: a.is_active ? C.accent : C.red,
-                        borderRadius: 8, padding: "4px 10px", fontSize: 11,
-                        fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
-                      }}>{a.is_active ? "Enabled" : "Disabled"}</button>
+
+                      {/* ── Jobs dropdown ── */}
+                      {(() => {
+                        const JOB_FLAGS = [
+                          { field: "repricer_enabled", label: "Repricer",  desc: "Repricer job" },
+                          { field: "bulk_enabled",     label: "Bulk",      desc: "Bulk listing import" },
+                          { field: "orders_enabled",   label: "Orders",    desc: "Orders sync" },
+                          { field: "is_active",        label: "Active",    desc: "All other jobs (master switch)" },
+                        ];
+                        const allOn   = JOB_FLAGS.every(({ field }) => a[field] !== false);
+                        const anyOff  = JOB_FLAGS.some(({ field }) => a[field] === false);
+                        const isOpen  = jobsMenu === a.id;
+                        return (
+                          <div style={{ position: "relative" }} onClick={e => e.stopPropagation()}>
+                            <button
+                              onClick={() => setJobsMenu(isOpen ? null : a.id)}
+                              style={{
+                                background: anyOff ? "#ef444418" : "#00d4aa18",
+                                border: `1px solid ${anyOff ? C.red + "55" : C.accent + "55"}`,
+                                color: anyOff ? C.red : C.accent,
+                                borderRadius: 8, padding: "5px 10px", fontSize: 11,
+                                fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+                                display: "flex", alignItems: "center", gap: 5,
+                              }}
+                            >
+                              Jobs {anyOff ? `(${JOB_FLAGS.filter(({ field }) => a[field] === false).length} off)` : "✓"}
+                              <span style={{ fontSize: 9, opacity: 0.6 }}>{isOpen ? "▲" : "▼"}</span>
+                            </button>
+
+                            {isOpen && (
+                              <div style={{
+                                position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 200,
+                                background: C.panel, border: `1px solid ${C.border}`,
+                                borderRadius: 10, padding: "6px 0", minWidth: 200,
+                                boxShadow: "0 8px 24px #0006",
+                              }}>
+                                {JOB_FLAGS.map(({ field, label, desc }) => {
+                                  const on = a[field] !== false;
+                                  return (
+                                    <button key={field} onClick={() => { toggleFlag(a, field); }}
+                                      style={{
+                                        width: "100%", display: "flex", alignItems: "center",
+                                        justifyContent: "space-between", gap: 12,
+                                        background: "transparent", border: "none", cursor: "pointer",
+                                        padding: "8px 14px", textAlign: "left",
+                                        color: C.text,
+                                      }}
+                                      onMouseEnter={e => e.currentTarget.style.background = C.surface}
+                                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                                    >
+                                      <div>
+                                        <div style={{ fontSize: 12, fontWeight: 600 }}>{label}</div>
+                                        <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>{desc}</div>
+                                      </div>
+                                      <span style={{
+                                        fontSize: 11, fontWeight: 700,
+                                        color: on ? C.accent : C.red,
+                                        background: on ? "#00d4aa18" : "#ef444418",
+                                        border: `1px solid ${on ? C.accent + "44" : C.red + "44"}`,
+                                        borderRadius: 6, padding: "2px 8px",
+                                        whiteSpace: "nowrap",
+                                      }}>{on ? "On" : "Off"}</span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
                       <Btn small variant="danger" onClick={() => del(a.id)}>Del</Btn>
                     </div>
                   </div>
@@ -3720,15 +4085,20 @@ function OnBuyBulkPage() {
   const [exportMenuOpen, setExportMenuOpen] = useState(null); // sessionId with open menu
   const [exportLoading, setExportLoading]   = useState(false);
   const [catExportLoading, setCatExportLoading] = useState(false);
-  const [restrictedBrands, setRestrictedBrands]         = useState({ count: 0 });
-  const [rbUploading, setRbUploading]                   = useState(false);
-  const [liveJobData, setLiveJobData]                   = useState(null); // { job, logs }
-  const liveLogsPollRef                                  = useRef(null);
+  const [catSitePicker, setCatSitePicker]       = useState(false);
+  const [catExportSiteId, setCatExportSiteId]   = useState("2000");
+  const [restrictedBrands, setRestrictedBrands]   = useState({ count: 0 });
+  const [restrictedProducts, setRestrictedProducts] = useState({ count: 0 });
+  const [liveJobData, setLiveJobData]             = useState(null); // { job, logs } — delete brands
+  const [liveProductJobData, setLiveProductJobData] = useState(null); // { job, logs } — delete products
+  const liveLogsPollRef                             = useRef(null);
 
   useEffect(() => {
     api("/accounts").then(setAccounts).catch(() => {});
     api("/restricted-brands").then(d => { if (d) setRestrictedBrands(d); }).catch(() => {});
+    api("/restricted-products").then(d => { if (d) setRestrictedProducts(d); }).catch(() => {});
     api("/delete-brands/active").then(d => { if (d) setLiveJobData(d); }).catch(() => {});
+    api("/delete-products/active").then(d => { if (d) setLiveProductJobData(d); }).catch(() => {});
     // Load global pending queue status on mount and start live poll if queues exist
     api("/onbuy-bulk/pending-queue-status").then(s => {
       if (s && parseInt(s.pending) > 0) { setPendingStatus(s); startPendingPoll(); }
@@ -3746,8 +4116,8 @@ function OnBuyBulkPage() {
   useEffect(() => {
     if (tab === "history") loadHistory();
     if (tab === "logs") {
-      fetchLiveJob();
-      liveLogsPollRef.current = setInterval(fetchLiveJob, 5000);
+      fetchLiveJob(); fetchLiveProductJob();
+      liveLogsPollRef.current = setInterval(() => { fetchLiveJob(); fetchLiveProductJob(); }, 5000);
     } else {
       if (liveLogsPollRef.current) { clearInterval(liveLogsPollRef.current); liveLogsPollRef.current = null; }
     }
@@ -3758,6 +4128,13 @@ function OnBuyBulkPage() {
     try {
       const data = await api("/delete-brands/active");
       if (data) setLiveJobData(data);
+    } catch {}
+  }
+
+  async function fetchLiveProductJob() {
+    try {
+      const data = await api("/delete-products/active");
+      if (data) setLiveProductJobData(data);
     } catch {}
   }
 
@@ -3833,18 +4210,24 @@ function OnBuyBulkPage() {
     setHistLoading(false);
   }
 
-  async function downloadCategoriesSheet() {
+  async function downloadCategoriesSheet(siteId) {
+    setCatSitePicker(false);
     setCatExportLoading(true);
     try {
       const token = localStorage.getItem("repricer_token");
-      const r = await fetch(`${API}/onbuy-bulk/categories/export`, {
+      const r = await fetch(`${API}/onbuy-bulk/categories/export?site_id=${siteId}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) {
+        const body = await r.text();
+        let msg = body;
+        try { msg = JSON.parse(body).error ?? body; } catch {}
+        throw new Error(msg);
+      }
       const blob = await r.blob();
       const url  = URL.createObjectURL(blob);
       const a    = document.createElement("a");
-      a.href = url; a.download = "onbuy-categories.xlsx";
+      a.href = url; a.download = `onbuy-categories-${siteId}.xlsx`;
       document.body.appendChild(a); a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
@@ -3852,49 +4235,33 @@ function OnBuyBulkPage() {
     finally { setCatExportLoading(false); }
   }
 
-  async function uploadRestrictedBrands(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setRbUploading(true);
-    try {
-      const token = localStorage.getItem("repricer_token");
-      const form = new FormData();
-      form.append("file", file);
-      const r = await fetch(`${API}/restricted-brands/upload`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
-      const t = await r.text();
-      let d; try { d = JSON.parse(t); } catch {}
-      if (!r.ok) throw new Error(d?.error || t);
-      setRestrictedBrands({ count: d.count });
-      alert(`✅ ${d.count} restricted brands uploaded successfully.`);
-    } catch (e) { alert("Upload failed: " + e.message); }
-    setRbUploading(false);
-    e.target.value = "";
-  }
-
-  async function downloadRestrictedBrandsTemplate() {
-    const token = localStorage.getItem("repricer_token");
-    const r = await fetch(`${API}/restricted-brands/template`, { headers: { Authorization: `Bearer ${token}` } });
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "restricted-brands-template.xlsx"; a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  async function runDeleteRestrictedJob() {
-    if (!window.confirm("This will search all OnBuy product catalogues for restricted brands and delete matching listings. This runs in the background and may take a long time. Continue?")) return;
+  async function runDeleteBrandsJob() {
+    if (!window.confirm("This will search all OnBuy listings for restricted brands and delete matching listings. This runs in the background and may take a long time. Continue?")) return;
     try {
       const data = await api("/restricted-brands/delete-job", { method: "POST" });
-      if (data?.jobId) {
-        setTab("logs");
-        await fetchLiveJob();
-      }
+      if (data?.jobId) { setTab("logs"); await fetchLiveJob(); }
     } catch (e) { alert("Failed to start job: " + (e.message || "Unknown error")); }
   }
 
-  async function cancelDeleteJob(jobId) {
+  async function cancelDeleteBrandsJob(jobId) {
     try {
       await api(`/delete-brands/${jobId}/cancel`, { method: "POST" });
       await fetchLiveJob();
+    } catch (e) { alert("Cancel failed: " + e.message); }
+  }
+
+  async function runDeleteProductsJob() {
+    if (!window.confirm("This will search all OnBuy listings for restricted product titles and delete matching listings. This runs in the background and may take a long time. Continue?")) return;
+    try {
+      const data = await api("/restricted-products/delete-job", { method: "POST" });
+      if (data?.jobId) { setTab("logs"); await fetchLiveProductJob(); }
+    } catch (e) { alert("Failed to start job: " + (e.message || "Unknown error")); }
+  }
+
+  async function cancelDeleteProductsJob(jobId) {
+    try {
+      await api(`/delete-products/${jobId}/cancel`, { method: "POST" });
+      await fetchLiveProductJob();
     } catch (e) { alert("Cancel failed: " + e.message); }
   }
 
@@ -4085,110 +4452,220 @@ function OnBuyBulkPage() {
         ))}
       </div>
 
-      {/* Action toolbar — restricted brands & utilities */}
+      {/* Action toolbar — delete restricted & utilities */}
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "12px 0", marginBottom: 16, borderBottom: `1px solid ${C.border}` }}>
-        <button
-          onClick={downloadRestrictedBrandsTemplate}
-          style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, cursor: "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
-        >
-          <span style={{ fontSize: 13 }}>📋</span> Restricted Brands Template
-        </button>
-        <label style={{ cursor: rbUploading ? "not-allowed" : "pointer" }}>
-          <input type="file" accept=".xlsx,.csv" style={{ display: "none" }} onChange={uploadRestrictedBrands} disabled={rbUploading} />
-          <span style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, color: rbUploading ? C.muted : C.text, padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 13 }}>{rbUploading ? "⏳" : "📤"}</span>
-            {rbUploading ? "Uploading…" : `Upload Restricted Brands${restrictedBrands.count ? ` (${restrictedBrands.count})` : ""}`}
-          </span>
-        </label>
-        <button
-          onClick={runDeleteRestrictedJob}
-          disabled={liveJobData?.job?.status === "running" || !restrictedBrands.count}
-          style={{ background: liveJobData?.job?.status === "running" ? C.surface : "#ef444415", border: `1px solid ${liveJobData?.job?.status === "running" || !restrictedBrands.count ? C.border : "#ef444466"}`, borderRadius: 6, color: liveJobData?.job?.status === "running" || !restrictedBrands.count ? C.muted : "#ef4444", cursor: liveJobData?.job?.status === "running" || !restrictedBrands.count ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
-        >
-          <span style={{ fontSize: 13 }}>{liveJobData?.job?.status === "running" ? "⏳" : "🗑️"}</span>
-          {liveJobData?.job?.status === "running" ? "Job Running…" : "Delete Restricted Brand Listings"}
-        </button>
+        {/* Delete Restricted Brand Listings */}
+        {(() => {
+          const brandsRunning = liveJobData?.job?.status === "running";
+          const brandsDisabled = brandsRunning || !restrictedBrands.count;
+          return (
+            <button
+              onClick={runDeleteBrandsJob}
+              disabled={brandsDisabled}
+              style={{ background: brandsRunning ? C.surface : "#ef444415", border: `1px solid ${brandsDisabled ? C.border : "#ef444466"}`, borderRadius: 6, color: brandsDisabled ? C.muted : "#ef4444", cursor: brandsDisabled ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
+              title={!restrictedBrands.count ? "No restricted brands uploaded — ask your admin to upload a brands list" : ""}
+            >
+              <span style={{ fontSize: 13 }}>{brandsRunning ? "⏳" : "🗑️"}</span>
+              {brandsRunning ? "Brands Job Running…" : `Delete Restricted Brand Listings${restrictedBrands.count ? ` (${restrictedBrands.count})` : ""}`}
+            </button>
+          );
+        })()}
+        {/* Delete Restricted Products */}
+        {(() => {
+          const prodRunning = liveProductJobData?.job?.status === "running";
+          const prodDisabled = prodRunning || !restrictedProducts.count;
+          return (
+            <button
+              onClick={runDeleteProductsJob}
+              disabled={prodDisabled}
+              style={{ background: prodRunning ? C.surface : "#f97316" + "15", border: `1px solid ${prodDisabled ? C.border : "#f9731666"}`, borderRadius: 6, color: prodDisabled ? C.muted : "#f97316", cursor: prodDisabled ? "not-allowed" : "pointer", padding: "5px 13px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}
+              title={!restrictedProducts.count ? "No restricted products uploaded — ask your admin to upload a products list" : ""}
+            >
+              <span style={{ fontSize: 13 }}>{prodRunning ? "⏳" : "🗑️"}</span>
+              {prodRunning ? "Products Job Running…" : `Delete Restricted Products${restrictedProducts.count ? ` (${restrictedProducts.count})` : ""}`}
+            </button>
+          );
+        })()}
         <div style={{ flex: 1 }} />
-        <button
-          onClick={downloadCategoriesSheet}
-          disabled={catExportLoading}
-          style={{
-            background: catExportLoading ? C.surface : "transparent",
-            border: `1px solid ${C.border}`, borderRadius: 6,
-            color: catExportLoading ? C.muted : C.text,
-            cursor: catExportLoading ? "not-allowed" : "pointer",
-            padding: "5px 13px", fontSize: 12, fontWeight: 600,
-            display: "flex", alignItems: "center", gap: 6,
-          }}
-        >
-          {catExportLoading
-            ? <><span style={{ fontSize: 13 }}>⏳</span> Fetching…</>
-            : <><span style={{ fontSize: 13 }}>📥</span> Download Categories Sheet</>
-          }
-        </button>
+        <>
+          <button
+            onClick={() => !catExportLoading && setCatSitePicker(p => !p)}
+            disabled={catExportLoading}
+            style={{
+              background: catExportLoading ? C.surface : "transparent",
+              border: `1px solid ${C.border}`, borderRadius: 6,
+              color: catExportLoading ? C.muted : C.text,
+              cursor: catExportLoading ? "not-allowed" : "pointer",
+              padding: "5px 13px", fontSize: 12, fontWeight: 600,
+              display: "flex", alignItems: "center", gap: 6,
+            }}
+          >
+            {catExportLoading
+              ? <><span style={{ fontSize: 13 }}>⏳</span> Fetching…</>
+              : <><span style={{ fontSize: 13 }}>📥</span> Download Categories Sheet</>
+            }
+          </button>
+
+          {catSitePicker && (
+            <div
+              onClick={() => setCatSitePicker(false)}
+              style={{
+                position: "fixed", inset: 0, zIndex: 1000,
+                background: "#00000066",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              <div
+                onClick={e => e.stopPropagation()}
+                style={{
+                  background: C.surface, border: `1px solid ${C.border}`,
+                  borderRadius: 12, padding: 24, minWidth: 280,
+                  boxShadow: "0 16px 48px #0009",
+                }}
+              >
+                <p style={{ fontSize: 14, fontWeight: 700, marginBottom: 14, color: C.text }}>Select Marketplace</p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 18 }}>
+                  {[
+                    { id: "2000", label: "🇬🇧 UK (site_id 2000)" },
+                    { id: "2001", label: "🇫🇷 France (site_id 2001)" },
+                    { id: "2002", label: "🇩🇪 Germany (site_id 2002)" },
+                    { id: "2007", label: "🇦🇹 Austria (site_id 2007)" },
+                    { id: "2013", label: "🇪🇸 Spain (site_id 2013)" },
+                    { id: "2020", label: "🇮🇹 Italy (site_id 2020)" },
+                  ].map(({ id, label }) => (
+                    <label key={id} style={{
+                      display: "flex", alignItems: "center", gap: 10,
+                      fontSize: 13, cursor: "pointer", color: C.text,
+                      padding: "8px 10px", borderRadius: 7,
+                      background: catExportSiteId === id ? C.panel : "transparent",
+                      border: `1px solid ${catExportSiteId === id ? C.border : "transparent"}`,
+                    }}>
+                      <input
+                        type="radio" name="catExportSite" value={id}
+                        checked={catExportSiteId === id}
+                        onChange={() => setCatExportSiteId(id)}
+                        style={{ accentColor: C.accent }}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => downloadCategoriesSheet(catExportSiteId)}
+                    style={{
+                      flex: 1, background: C.accent, color: "#000", border: "none",
+                      borderRadius: 8, padding: "9px 0", fontSize: 13, fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >Download</button>
+                  <button
+                    onClick={() => setCatSitePicker(false)}
+                    style={{
+                      background: "transparent", color: C.muted, border: `1px solid ${C.border}`,
+                      borderRadius: 8, padding: "9px 14px", fontSize: 13, cursor: "pointer",
+                    }}
+                  >Cancel</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       </div>
 
       {/* ── Live Logs Tab ── */}
       {tab === "logs" && (() => {
-        const job  = liveJobData?.job;
-        const logs = liveJobData?.logs ?? [];
-        const isRunning = job?.status === "running";
-        const statusColor = job?.status === "completed" ? C.accent : job?.status === "failed" ? C.red : job?.status === "cancelled" ? C.amber : C.info;
-        return (
-          <div>
-            {!job ? (
-              <div style={{ textAlign: "center", padding: 48, color: C.muted, border: `1px dashed ${C.border}`, borderRadius: 12 }}>
-                <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>No delete brands job found</div>
-                <div style={{ fontSize: 13 }}>Use the "Delete Restricted Brand Listings" button to start a job.</div>
+        function JobPanel({ jobData, title, statsFields, onCancel, accentColor = "#ef4444" }) {
+          const job  = jobData?.job;
+          const logs = jobData?.logs ?? [];
+          const isRunning = job?.status === "running";
+          const statusColor = job?.status === "completed" ? C.accent : job?.status === "failed" ? C.red : job?.status === "cancelled" ? C.amber : C.info;
+          if (!job) return (
+            <div style={{ textAlign: "center", padding: 32, color: C.muted, border: `1px dashed ${C.border}`, borderRadius: 12 }}>
+              <div style={{ fontSize: 28, marginBottom: 10 }}>📊</div>
+              <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 13 }}>No {title} job yet</div>
+              <div style={{ fontSize: 12 }}>Use the button above to start one.</div>
+            </div>
+          );
+          return (
+            <>
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, color: C.text }}>
+                    {isRunning ? "⏳" : job.status === "completed" ? "✅" : job.status === "cancelled" ? "🚫" : "❌"}&nbsp;
+                    {title} Job #{job.id}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, background: statusColor + "22", color: statusColor, border: `1px solid ${statusColor}44`, borderRadius: 20, padding: "2px 10px" }}>
+                      {(job.status || "").toUpperCase()}
+                    </span>
+                    {isRunning && (
+                      <button onClick={() => onCancel(job.id)} style={{ background: accentColor + "15", border: `1px solid ${accentColor}66`, borderRadius: 6, color: accentColor, cursor: "pointer", padding: "4px 12px", fontSize: 12, fontWeight: 600 }}>
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: `repeat(${statsFields.length},1fr)`, gap: 8 }}>
+                  {statsFields.map(([label, val]) => (
+                    <div key={label} style={{ background: C.bg, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: C.text }}>{val ?? 0}</div>
+                      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop: 8, fontSize: 11, color: C.muted }}>
+                  Started: {new Date(job.created_at).toLocaleString()}
+                  {job.completed_at && ` · Finished: ${new Date(job.completed_at).toLocaleString()}`}
+                  {isRunning && " · Auto-refreshes every 5s"}
+                </div>
               </div>
-            ) : (
-              <>
-                <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16, marginBottom: 16 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                    <div style={{ fontWeight: 700, fontSize: 15, color: C.text }}>
-                      {isRunning ? "⏳" : job.status === "completed" ? "✅" : job.status === "cancelled" ? "🚫" : "❌"}&nbsp;
-                      Delete Restricted Brands Job #{job.id}
+              <div style={{ background: "#0a0f1a", border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, fontFamily: "monospace", fontSize: 11, marginBottom: 4 }}>
+                <div style={{ color: C.muted, marginBottom: 8, fontSize: 11, fontWeight: 700 }}>JOB LOGS</div>
+                <div style={{ maxHeight: 280, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                  {logs.length === 0 && <div style={{ color: C.muted }}>No logs yet…</div>}
+                  {logs.map((log, i) => (
+                    <div key={i} style={{ color: log.level === "error" ? "#f87171" : log.level === "warn" ? "#fbbf24" : "#86efac", wordBreak: "break-word" }}>
+                      <span style={{ color: "#4b5563", marginRight: 8 }}>{new Date(log.created_at).toLocaleTimeString()}</span>
+                      {log.message}
                     </div>
-                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, background: statusColor + "22", color: statusColor, border: `1px solid ${statusColor}44`, borderRadius: 20, padding: "2px 10px" }}>
-                        {(job.status || "").toUpperCase()}
-                      </span>
-                      {isRunning && (
-                        <button onClick={() => cancelDeleteJob(job.id)} style={{ background: "#ef444415", border: "1px solid #ef444466", borderRadius: 6, color: "#ef4444", cursor: "pointer", padding: "4px 12px", fontSize: 12, fontWeight: 600 }}>
-                          Cancel
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
-                    {[["Brands", job.brands_count], ["Matched (Total)", job.opcs_found], ["Listings Scanned", job.listings_scanned], ["Listings Deleted", job.listings_deleted]].map(([label, val]) => (
-                      <div key={label} style={{ background: C.bg, borderRadius: 8, padding: "10px 12px", textAlign: "center" }}>
-                        <div style={{ fontSize: 20, fontWeight: 700, color: C.text }}>{val ?? 0}</div>
-                        <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{label}</div>
-                      </div>
-                    ))}
-                  </div>
-                  <div style={{ marginTop: 8, fontSize: 11, color: C.muted }}>
-                    Started: {new Date(job.created_at).toLocaleString()}
-                    {job.completed_at && ` · Finished: ${new Date(job.completed_at).toLocaleString()}`}
-                    {isRunning && " · Auto-refreshes every 5s"}
-                  </div>
+                  ))}
                 </div>
-                <div style={{ background: "#0a0f1a", border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, fontFamily: "monospace", fontSize: 11 }}>
-                  <div style={{ color: C.muted, marginBottom: 8, fontSize: 11, fontWeight: 700 }}>JOB LOGS</div>
-                  <div style={{ maxHeight: 400, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
-                    {logs.length === 0 && <div style={{ color: C.muted }}>No logs yet…</div>}
-                    {logs.map((log, i) => (
-                      <div key={i} style={{ color: log.level === "error" ? "#f87171" : log.level === "warn" ? "#fbbf24" : "#86efac", wordBreak: "break-word" }}>
-                        <span style={{ color: "#4b5563", marginRight: 8 }}>{new Date(log.created_at).toLocaleTimeString()}</span>
-                        {log.message}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </>
-            )}
+              </div>
+            </>
+          );
+        }
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 28 }}>
+            {/* Delete Brands Job */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.textDim, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 10, height: 10, borderRadius: "50%", background: "#ef4444", display: "inline-block" }} />
+                Delete Restricted Brand Listings
+              </div>
+              <JobPanel
+                jobData={liveJobData}
+                title="Delete Restricted Brands"
+                statsFields={[["Brands", liveJobData?.job?.brands_count], ["Matched", liveJobData?.job?.opcs_found], ["Scanned", liveJobData?.job?.listings_scanned], ["Deleted", liveJobData?.job?.listings_deleted]]}
+                onCancel={cancelDeleteBrandsJob}
+                accentColor="#ef4444"
+              />
+            </div>
+            <div style={{ borderTop: `1px solid ${C.border}` }} />
+            {/* Delete Products Job */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 13, color: C.textDim, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 10, height: 10, borderRadius: "50%", background: "#f97316", display: "inline-block" }} />
+                Delete Restricted Products
+              </div>
+              <JobPanel
+                jobData={liveProductJobData}
+                title="Delete Restricted Products"
+                statsFields={[["Products", liveProductJobData?.job?.products_count], ["Matched", liveProductJobData?.job?.opcs_found], ["Scanned", liveProductJobData?.job?.listings_scanned], ["Deleted", liveProductJobData?.job?.listings_deleted]]}
+                onCancel={cancelDeleteProductsJob}
+                accentColor="#f97316"
+              />
+            </div>
           </div>
         );
       })()}
@@ -5670,56 +6147,123 @@ function OrdersPage() {
 //  PRODUCT HUNTING PAGE
 // ════════════════════════════════════════════
 
-// ── Amazon UK bestseller category tree (matches Keepa's sidebar) ──
-// Flat list matching Keepa's Product Best Sellers category nav exactly
-const HUNT_CATEGORIES = [
-  { id:"alexa-skills",          label:"Alexa Skills" },
-  { id:"amazon-devices",        label:"Amazon Devices & Accessories" },
-  { id:"amazon-luxury",         label:"Amazon Luxury" },
-  { id:"apps-games",            label:"Apps & Games" },
-  { id:"audible",               label:"Audible Books & Originals" },
-  { id:"automotive",            label:"Automotive" },
-  { id:"baby",                  label:"Baby Products" },
-  { id:"beauty",                label:"Beauty" },
-  { id:"books",                 label:"Books" },
-  { id:"business",              label:"Business, Industry & Science" },
-  { id:"cds-vinyl",             label:"CDs & Vinyl" },
-  { id:"computers",             label:"Computers & Accessories" },
-  { id:"credit-cards",          label:"Credit & Payment Cards" },
-  { id:"digital-music",         label:"Digital Music" },
-  { id:"diy",                   label:"DIY & Tools" },
-  { id:"dvd",                   label:"DVD & Blu-ray" },
-  { id:"electronics",           label:"Electronics & Photo" },
-  { id:"everything-else",       label:"Everything Else" },
-  { id:"fashion",               label:"Fashion" },
-  { id:"garden",                label:"Garden" },
-  { id:"gift-cards",            label:"Gift Cards" },
-  { id:"grocery",               label:"Grocery" },
-  { id:"handmade",              label:"Handmade Products" },
-  { id:"health",                label:"Health & Personal Care" },
-  { id:"home-business",         label:"Home & Business Services" },
-  { id:"home-garden",           label:"Home & Garden" },
-  { id:"home-kitchen",          label:"Home & Kitchen" },
-  { id:"kindle",                label:"Kindle Store" },
-  { id:"kosmetik",              label:"Kosmetik" },
-  { id:"large-appliances",      label:"Large Appliances" },
-  { id:"lighting",              label:"Lighting" },
-  { id:"musical-instruments",   label:"Musical Instruments & DJ" },
-  { id:"outlet",                label:"Outlet" },
-  { id:"pc-games",              label:"PC & Video Games" },
-  { id:"pet",                   label:"Pet Supplies" },
-  { id:"premium-beauty",        label:"Premium Beauty" },
-  { id:"prime-video",           label:"Prime Video" },
-  { id:"software",              label:"Software" },
-  { id:"sports",                label:"Sports & Outdoors" },
-  { id:"stationery",            label:"Stationery & Office Supplies" },
-  { id:"toys",                  label:"Toys & Games" },
-];
+// Keepa Product Best Sellers categories per Amazon locale
+// Keys are OnBuy site_ids that map to the corresponding Amazon marketplace
+const HUNT_CATEGORIES_BY_SITE = {
+  // Amazon UK (default)
+  2000: [
+    { id:"alexa-skills",          label:"Alexa Skills" },
+    { id:"amazon-devices",        label:"Amazon Devices & Accessories" },
+    { id:"amazon-luxury",         label:"Amazon Luxury" },
+    { id:"apps-games",            label:"Apps & Games" },
+    { id:"audible",               label:"Audible Books & Originals" },
+    { id:"automotive",            label:"Automotive" },
+    { id:"baby",                  label:"Baby Products" },
+    { id:"beauty",                label:"Beauty" },
+    { id:"books",                 label:"Books" },
+    { id:"business",              label:"Business, Industry & Science" },
+    { id:"cds-vinyl",             label:"CDs & Vinyl" },
+    { id:"computers",             label:"Computers & Accessories" },
+    { id:"credit-cards",          label:"Credit & Payment Cards" },
+    { id:"digital-music",         label:"Digital Music" },
+    { id:"diy",                   label:"DIY & Tools" },
+    { id:"dvd",                   label:"DVD & Blu-ray" },
+    { id:"electronics",           label:"Electronics & Photo" },
+    { id:"everything-else",       label:"Everything Else" },
+    { id:"fashion",               label:"Fashion" },
+    { id:"garden",                label:"Garden" },
+    { id:"gift-cards",            label:"Gift Cards" },
+    { id:"grocery",               label:"Grocery" },
+    { id:"handmade",              label:"Handmade Products" },
+    { id:"health",                label:"Health & Personal Care" },
+    { id:"home-kitchen",          label:"Home & Kitchen" },
+    { id:"kindle",                label:"Kindle Store" },
+    { id:"large-appliances",      label:"Large Appliances" },
+    { id:"lighting",              label:"Lighting" },
+    { id:"musical-instruments",   label:"Musical Instruments & DJ" },
+    { id:"pc-games",              label:"PC & Video Games" },
+    { id:"pet",                   label:"Pet Supplies" },
+    { id:"premium-beauty",        label:"Premium Beauty" },
+    { id:"prime-video",           label:"Prime Video" },
+    { id:"software",              label:"Software" },
+    { id:"sports",                label:"Sports & Outdoors" },
+    { id:"stationery",            label:"Stationery & Office Supplies" },
+    { id:"toys",                  label:"Toys & Games" },
+  ],
+  // Amazon.de — Germany (and Austria site_id=2007)
+  2002: [
+    { id:"alexa-skills",          label:"Alexa Skills" },
+    { id:"amazon-luxury",         label:"Amazon Luxury" },
+    { id:"amazon-geraete",        label:"Amazon-Geräte & Zubehör" },
+    { id:"apps-spiele",           label:"Apps & Spiele" },
+    { id:"audible",               label:"Audible Hörbücher & Originals" },
+    { id:"auto-motorrad",         label:"Auto & Motorrad" },
+    { id:"baby",                  label:"Baby" },
+    { id:"baumarkt",              label:"Baumarkt" },
+    { id:"beleuchtung",           label:"Beleuchtung" },
+    { id:"bier-wein",             label:"Bier, Wein & Spirituosen" },
+    { id:"buecher",               label:"Bücher" },
+    { id:"buerobedarf",           label:"Bürobedarf & Schreibwaren" },
+    { id:"computer",              label:"Computer & Zubehör" },
+    { id:"drogerie",              label:"Drogerie & Körperpflege" },
+    { id:"dvd",                   label:"DVD & Blu-ray" },
+    { id:"elektro-grossgeraete",  label:"Elektro-Großgeräte" },
+    { id:"elektronik",            label:"Elektronik & Foto" },
+    { id:"erotik",                label:"Erotik" },
+    { id:"fashion",               label:"Fashion" },
+    { id:"games",                 label:"Games" },
+    { id:"garten",                label:"Garten" },
+    { id:"geschenkgutscheine",    label:"Geschenkgutscheine" },
+    { id:"gewerbe",               label:"Gewerbe, Industrie & Wissenschaft" },
+    { id:"handmade",              label:"Handmade-Produkte" },
+    { id:"haustier",              label:"Haustier" },
+    { id:"kindle",                label:"Kindle-Shop" },
+    { id:"kosmetik",              label:"Kosmetik" },
+    { id:"kredit",                label:"Kredit- & Zahlungskarten" },
+    { id:"kueche",                label:"Küche, Haushalt & Wohnen" },
+    { id:"lebensmittel",          label:"Lebensmittel & Getränke" },
+    { id:"magazine",              label:"Magazine" },
+    { id:"musik-cds",             label:"Musik-CDs & Vinyl" },
+    { id:"musik-downloads",       label:"Musik-Downloads" },
+    { id:"musikinstrumente",      label:"Musikinstrumente & DJ-Equipment" },
+    { id:"premium-beauty",        label:"Premium Beauty" },
+    { id:"prime-video",           label:"Prime Video" },
+    { id:"software",              label:"Software" },
+    { id:"sonstiges",             label:"Sonstiges" },
+    { id:"spielzeug",             label:"Spielzeug" },
+    { id:"sport",                 label:"Sport & Freizeit" },
+  ],
+  // Amazon.fr — France
+  2001: [
+    { id:"livres",                label:"Livres" },
+    { id:"electronique",          label:"High-Tech" },
+    { id:"informatique",          label:"Informatique" },
+    { id:"musique",               label:"Musique" },
+    { id:"dvd",                   label:"DVD & Blu-ray" },
+    { id:"jeux-video",            label:"Jeux vidéo" },
+    { id:"jouets",                label:"Jouets & Jeux" },
+    { id:"cuisine",               label:"Cuisine & Maison" },
+    { id:"sports",                label:"Sports & Loisirs" },
+    { id:"jardin",                label:"Jardin" },
+    { id:"auto-moto",             label:"Auto et Moto" },
+    { id:"mode",                  label:"Vêtements et accessoires" },
+    { id:"beaute",                label:"Beauté et Parfum" },
+    { id:"sante",                 label:"Hygiène et Santé" },
+    { id:"epicerie",              label:"Epicerie" },
+    { id:"bebe",                  label:"Bébé et Puériculture" },
+    { id:"animaux",               label:"Animalerie" },
+    { id:"outils",                label:"Bricolage" },
+    { id:"kindle",                label:"Boutique Kindle" },
+    { id:"prime-video",           label:"Prime Vidéo" },
+    { id:"logiciels",             label:"Logiciels" },
+    { id:"bureautique",           label:"Fournitures de Bureau" },
+  ],
+};
+// Aliases: Austria uses .de categories
+HUNT_CATEGORIES_BY_SITE[2007] = HUNT_CATEGORIES_BY_SITE[2002];
 
-// Build the path (breadcrumb) for a given category id
-function _buildCategoryPath(id) {
-  const node = HUNT_CATEGORIES.find(n => n.id === id);
-  return node ? [node.label] : null;
+function _getHuntCategories(siteId) {
+  return HUNT_CATEGORIES_BY_SITE[parseInt(siteId)] ?? HUNT_CATEGORIES_BY_SITE[2000];
 }
 
 // Single collapsible category node (recursive)
@@ -5793,8 +6337,14 @@ function ProductHuntingPage() {
   const [history,     setHistory]     = useState([]);
   const [err,         setErr]         = useState("");
   const [starting,    setStarting]    = useState(false);
+  const [catSyncWarn, setCatSyncWarn] = useState(null); // warning if OnBuy cats not synced
   const logsEndRef = useRef(null);
   const esRef      = useRef(null);
+
+  // Derive selected account's site_id from accounts list
+  const selectedAccount = accounts.find(a => String(a.id) === String(accountId));
+  const activeSiteId    = selectedAccount?.site_id ?? 2000;
+  const huntCategories  = _getHuntCategories(activeSiteId);
 
   const loadHistory = useCallback(() => {
     api("/product-hunting/history").then(d => { if (Array.isArray(d)) setHistory(d); }).catch(() => {});
@@ -5812,6 +6362,16 @@ function ProductHuntingPage() {
     }).catch(() => {});
     loadHistory();
   }, [loadHistory]);
+
+  // When account changes: check if OnBuy categories are synced for its site_id
+  useEffect(() => {
+    setCatSyncWarn(null);
+    setSelectedCat(null);
+    if (!accountId) return;
+    api(`/product-hunting/categories?account_id=${accountId}`)
+      .then(d => { if (d?.needs_sync) setCatSyncWarn(d.warning); })
+      .catch(() => {});
+  }, [accountId]);
 
   // Auto-scroll logs to bottom
   useEffect(() => {
@@ -5848,12 +6408,14 @@ function ProductHuntingPage() {
     if (!selectedCat) return setErr("Please select a Keepa category.");
     setErr(""); setLogs([]); setResult(null); setStarting(true);
     try {
-      const path = _buildCategoryPath(selectedCat.id) ?? [selectedCat.label];
+      const pathLabels = huntCategories.find(n => n.id === selectedCat.id)?.label
+        ? [huntCategories.find(n => n.id === selectedCat.id).label]
+        : [selectedCat.label];
       await api("/product-hunting/start", {
         method: "POST",
         body: JSON.stringify({
           account_id:   parseInt(accountId),
-          category:     { label: selectedCat.label, path },
+          category:     { label: selectedCat.label, path: pathLabels },
           max_listings: parseInt(maxListings) || 100,
         }),
       });
@@ -5879,8 +6441,8 @@ function ProductHuntingPage() {
   // Filter categories by search
   const catFilter = catSearch.trim().toLowerCase();
   const filteredCats = catFilter
-    ? HUNT_CATEGORIES.filter(node => node.label.toLowerCase().includes(catFilter))
-    : HUNT_CATEGORIES;
+    ? huntCategories.filter(node => node.label.toLowerCase().includes(catFilter))
+    : huntCategories;
 
   const isRunning = jobStatus === "running";
   const isDone    = jobStatus === "done";
@@ -5907,13 +6469,19 @@ function ProductHuntingPage() {
           >
             <option value="">— Select account —</option>
             {accounts.map(a => (
-              <option key={a.id} value={a.id}>{a.account_name}</option>
+              <option key={a.id} value={a.id}>{a.account_name} (site_id: {a.site_id ?? 2000})</option>
             ))}
           </select>
         </Section>
 
         {/* Category tree */}
-        <Section title="Keepa Category">
+        <Section title={`Keepa Category${activeSiteId !== 2000 ? ` (site_id ${activeSiteId})` : ""}`}>
+          {/* Sync warning */}
+          {catSyncWarn && (
+            <div style={{ background: C.amber + "18", border: `1px solid ${C.amber}44`, borderRadius: 8, padding: "8px 10px", marginBottom: 8, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
+              ⚠ {catSyncWarn}
+            </div>
+          )}
           {/* Search */}
           <div style={{ position: "relative", marginBottom: 8 }}>
             <Search size={13} color={C.muted} style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)" }} />

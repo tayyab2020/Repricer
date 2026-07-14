@@ -30,7 +30,8 @@ export const slowQueue        = new Queue('repricer-slow',  { connection: redis 
 export const keepaQueue       = new Queue('keepa-scrape',   { connection: redis });
 export const queuePollerQueue = new Queue('queue-poller',   { connection: redis });
 export const bulkImportQueue    = new Queue('bulk-import',    { connection: redis });
-export const deleteBrandsQueue  = new Queue('delete-brands',  { connection: redis });
+export const deleteBrandsQueue   = new Queue('delete-brands',   { connection: redis });
+export const deleteProductsQueue = new Queue('delete-products', { connection: redis });
 
 export async function getTokenForAccount(account, { retries = 2, log = null } = {}) {
   const label = account.account_name || `id=${account.id}`;
@@ -548,18 +549,18 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
       }
     }
 
-    // Guard: skip repricing for any user who has a delete-brands job running
+    // Guard: skip repricing for any user who has a delete-brands or delete-products job running
     const pricingUserIds = [...new Set(pricingMappings.map(m => m.user_id).filter(Boolean))];
     if (pricingUserIds.length) {
-      const { rows: deletingUsers } = await db.query(
-        `SELECT DISTINCT user_id FROM onbuy_delete_brand_jobs WHERE user_id = ANY($1) AND status = 'running'`,
-        [pricingUserIds]
-      );
-      if (deletingUsers.length) {
-        const blocked = new Set(deletingUsers.map(r => r.user_id));
-        const before  = pricingMappings.length;
+      const [{ rows: deletingBrands }, { rows: deletingProducts }] = await Promise.all([
+        db.query(`SELECT DISTINCT user_id FROM onbuy_delete_brand_jobs WHERE user_id = ANY($1) AND status = 'running'`, [pricingUserIds]),
+        db.query(`SELECT DISTINCT user_id FROM onbuy_delete_product_jobs WHERE user_id = ANY($1) AND status = 'running'`, [pricingUserIds]),
+      ]);
+      const blocked = new Set([...deletingBrands, ...deletingProducts].map(r => r.user_id));
+      if (blocked.size) {
+        const before = pricingMappings.length;
         pricingMappings = pricingMappings.filter(m => !blocked.has(m.user_id));
-        jlog(`[Job] ⚠️  Skipped repricing for ${before - pricingMappings.length} mapping(s) — Delete Restricted Brands job running for user(s): ${[...blocked].join(', ')}`);
+        jlog(`[Job] ⚠️  Skipped repricing for ${before - pricingMappings.length} mapping(s) — Delete Restricted job running for user(s): ${[...blocked].join(', ')}`);
       }
     }
 

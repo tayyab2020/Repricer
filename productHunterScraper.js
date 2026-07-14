@@ -26,6 +26,17 @@ const KEEPA_HOME        = 'https://keepa.com/#!';
 const KEEPA_BESTSELLERS = 'https://keepa.com/#!bestseller';  // note: #!bestseller (no 's')
 const _sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// OnBuy site_id → Keepa #language_domains span[setting] value
+// Only sites that have a matching Amazon locale on Keepa
+const SITE_TO_KEEPA_SETTING = {
+  2000: '2',  // UK    → .uk
+  2001: '4',  // France → .fr
+  2002: '3',  // Germany → .de
+  2007: '3',  // Austria → .de (Amazon.de serves Austria)
+  2013: '9',  // Spain  → .es
+  2020: '8',  // Italy  → .it
+};
+
 // ─────────────────────────────────────────────────────────────
 // Column names to enable (exact Keepa column headers)
 // ─────────────────────────────────────────────────────────────
@@ -43,6 +54,7 @@ const TARGET_COLUMNS = [
   'Description & Features: Feature 3',
   'Description & Features: Feature 4',
   'Description & Features: Feature 5',
+  'Product Codes: EAN',
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -60,7 +72,7 @@ const TARGET_COLUMNS = [
  * @returns {object[]}  array of OnBuy bulk-import row objects
  */
 export async function runProductHunting(
-  { account, category, maxListings = 100, signal = {} },
+  { account, category, maxListings = 100, signal = {}, siteId = 2000 },
   log = console.log,
 ) {
   if (!account?.keepa_email || !account?.keepa_password) {
@@ -91,6 +103,11 @@ export async function runProductHunting(
 
     // ── 1. Login ────────────────────────────────────────────────────────
     await _login(page, account.keepa_email, account.keepa_password, log);
+
+    _checkCancelled(signal);
+
+    // ── 1b. Switch Keepa marketplace if needed ──────────────────────────
+    await _selectKeepaMarketplace(page, siteId, log);
 
     _checkCancelled(signal);
 
@@ -169,6 +186,75 @@ export async function runProductHunting(
 // ─────────────────────────────────────────────────────────────
 function _checkCancelled(signal) {
   if (signal.cancelled) throw Object.assign(new Error('CANCELLED'), { isCancelled: true });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Switch Keepa to the correct Amazon marketplace for the given
+// OnBuy site_id.  Keepa shows the current Amazon locale in
+// #currentLanguage → clicks it to open #languageOverlay →
+// then clicks the matching span[rel="domain"][setting="X"] in
+// #language_domains.
+// ─────────────────────────────────────────────────────────────
+async function _selectKeepaMarketplace(page, siteId, log) {
+  const setting = SITE_TO_KEEPA_SETTING[parseInt(siteId)] ?? '2'; // default .uk
+
+  // Check the currently active domain setting
+  const currentSetting = await page.evaluate(() => {
+    // The overlay may be hidden; we can still read the active span if visible,
+    // or fall back to the text shown in #currentLanguage
+    const active = document.querySelector('#language_domains span[rel="domain"].active');
+    if (active) return active.getAttribute('setting');
+    // Not visible — open overlay briefly to read it, then read from current display
+    const cur = document.querySelector('#currentLanguage span.languageMenuImg[rel="domain"]');
+    if (cur) {
+      const txt = cur.textContent.trim().replace(/^\./, ''); // ".uk" → "uk" / ".de" → "de"
+      const map = { uk: '2', fr: '4', de: '3', it: '8', es: '9',
+                    com: '1', ca: '5', mx: '6', br: '7', jp: '10', 'in': '11', 'co.uk': '2' };
+      return map[txt] ?? null;
+    }
+    return null;
+  });
+
+  if (currentSetting === setting) {
+    log(`[Hunt] Keepa marketplace already correct (setting=${setting})`);
+    return;
+  }
+
+  log(`[Hunt] Switching Keepa marketplace to setting=${setting} (site_id=${siteId})…`);
+
+  // 1. Open language overlay by clicking #currentLanguage
+  await page.evaluate(() => {
+    const el = document.querySelector('#currentLanguage') ??
+               document.querySelector('#panelLanguage');
+    if (el) el.click();
+  });
+  await _sleep(1500);
+
+  // 2. Wait for #language_domains to be visible
+  await page.waitForFunction(
+    () => {
+      const ov = document.querySelector('#languageOverlay');
+      return ov && (ov.style.display !== 'none') && ov.offsetParent !== null;
+    },
+    { timeout: 8000 },
+  ).catch(() => log('[Hunt] Warning: language overlay did not open'));
+
+  // 3. Click the matching domain span
+  const clicked = await page.evaluate((s) => {
+    const span = document.querySelector(`#language_domains span[rel="domain"][setting="${s}"]`);
+    if (span) { span.click(); return true; }
+    return false;
+  }, setting);
+
+  if (clicked) {
+    log(`[Hunt] Keepa marketplace switched ✓ — waiting for page to reload…`);
+    await _sleep(3000);
+  } else {
+    log(`[Hunt] Warning: domain setting="${setting}" not found in Keepa overlay — proceeding with current locale`);
+    // Close overlay
+    await page.keyboard.press('Escape');
+    await _sleep(500);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -697,6 +783,7 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
   const iASIN     = col('ASIN');
   const iBrand    = col('Brand');
   const iColor    = _findCol(headers, ['Color', 'Colour']);
+  const iEan      = _findCol(headers, ['EAN', 'Product Codes: EAN', 'Ean', 'GTIN', 'Barcode', 'UPC']);
 
   log(`[Hunt] CSV columns (${headers.length}): ${headers.slice(0, 16).join(' | ')}`);
 
@@ -730,13 +817,21 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
     // Category: keep the full tree path so the OnBuy category matcher has maximum context
     const catTree = iCatTree >= 0 ? (cols[iCatTree] ?? '').trim() : '';
 
-    const brand = iBrand >= 0 ? (cols[iBrand] ?? '').trim() : '';
-    const color = iColor >= 0 ? (cols[iColor] ?? '').trim() : '';
+    const brand   = iBrand >= 0 ? (cols[iBrand] ?? '').trim() : '';
+    const color   = iColor >= 0 ? (cols[iColor] ?? '').trim() : '';
+    // EAN field may contain multiple comma-separated codes — use first, keep rest for retry
+    const eanList = (iEan >= 0 ? (cols[iEan] ?? '') : '')
+      .split(',').map(e => e.trim()).filter(Boolean);
+    const ean = eanList[0] || '';
 
     rows.push({
       _row:     i + 1,
-      valid:    !!(title && price),
-      errors:   [...(!title ? ['Product Name required'] : []), ...(!price ? ['Price required'] : [])],
+      valid:    !!(title && price && ean),
+      errors:   [
+        ...(!title ? ['Product Name required'] : []),
+        ...(!price ? ['Price required'] : []),
+        ...(!ean   ? ['EAN required — product skipped (no fake EANs)'] : []),
+      ],
       name:      title,
       sku:       asin || `HUNT-${Date.now()}-${i}`,
       description,
@@ -753,7 +848,8 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
       summary3:  f3,
       summary4:  f4,
       summary5:  f5,
-      ean:       '',
+      ean,
+      ean_list:  eanList,
       mpn:       '',
       delivery_weight: null,
     });

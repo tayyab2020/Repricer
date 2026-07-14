@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
 import https from 'https';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, redis, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, deleteProductsQueue, redis, getTokenForAccount } from './jobProducer.js';
 import IORedis from 'ioredis';
 import { appendFile, appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch as fsWatch } from 'fs';
 import { join, dirname } from 'path';
@@ -936,6 +936,7 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
               keepa_email,
               CASE WHEN keepa_password IS NOT NULL AND keepa_password != '' THEN true ELSE false END AS has_keepa_password,
               enable_puppeteer, enable_twister, enable_cheerio,
+              repricer_enabled, bulk_enabled, orders_enabled,
               google_sheet_id,
               CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet
        FROM onbuy_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
@@ -994,6 +995,7 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
           enable_puppeteer, enable_twister, enable_cheerio,
+          repricer_enabled, bulk_enabled, orders_enabled,
           google_sheet_id, google_service_account } = req.body;
   try {
     let sheetCreds = undefined; // undefined = don't change; null = clear
@@ -1015,22 +1017,28 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          is_active              = COALESCE($5, is_active),
          keepa_email            = CASE WHEN $6::text IS NOT NULL THEN NULLIF($6,'') ELSE keepa_email END,
          keepa_password         = CASE WHEN $7::text IS NOT NULL THEN NULLIF($7,'') ELSE keepa_password END,
-         enable_puppeteer       = COALESCE($8, enable_puppeteer),
-         enable_twister         = COALESCE($9, enable_twister),
+         enable_puppeteer       = COALESCE($8,  enable_puppeteer),
+         enable_twister         = COALESCE($9,  enable_twister),
          enable_cheerio         = COALESCE($10, enable_cheerio),
+         repricer_enabled       = COALESCE($15, repricer_enabled),
+         bulk_enabled           = COALESCE($16, bulk_enabled),
+         orders_enabled         = COALESCE($17, orders_enabled),
          google_sheet_id        = CASE WHEN $13::text IS NOT NULL THEN NULLIF($13,'') ELSE google_sheet_id END,
          google_service_account = CASE WHEN $14::text IS NOT NULL THEN $14::jsonb ELSE google_service_account END,
          updated_at             = NOW()
        WHERE id = $11 AND user_id = $12
        RETURNING id, account_name, site_id, is_active, keepa_email,
-                 enable_puppeteer, enable_twister, enable_cheerio, google_sheet_id,
+                 enable_puppeteer, enable_twister, enable_cheerio,
+                 repricer_enabled, bulk_enabled, orders_enabled,
+                 google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name || null, consumer_key || null, secret_key || null, site_id || null,
        is_active ?? null, keepa_email ?? null, keepa_password ?? null,
        enable_puppeteer ?? null, enable_twister ?? null, enable_cheerio ?? null,
        req.params.id, req.effectiveUserId,
        google_sheet_id !== undefined ? (google_sheet_id || '') : null,
-       sheetCreds !== undefined ? (sheetCreds ?? null) : null]
+       sheetCreds !== undefined ? (sheetCreds ?? null) : null,
+       repricer_enabled ?? null, bulk_enabled ?? null, orders_enabled ?? null]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
@@ -1784,7 +1792,10 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_puppeteer BOOLEAN NOT NULL DEFAULT false`,
     // Per-account Twister/Cheerio toggles — default off, rely on Keepa by default
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_twister BOOLEAN NOT NULL DEFAULT false`,
-    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_cheerio BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_cheerio    BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS repricer_enabled  BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS bulk_enabled      BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled    BOOLEAN NOT NULL DEFAULT true`,
     // Index for the repricer job query: ORDER BY last_synced_at per active user avoids a full table scan
     `CREATE INDEX IF NOT EXISTS idx_pm_active_synced ON product_mappings (user_id, last_synced_at ASC NULLS FIRST) WHERE is_active = true`,
     // OnBuy bulk import history tables
@@ -1843,6 +1854,30 @@ async function runMigrations() {
        END IF;
      END $$`,
     `CREATE INDEX IF NOT EXISTS idx_onbuy_cats_name ON onbuy_categories(lower(name))`,
+    // Add site_id to onbuy_categories so each country's categories are stored separately
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name='onbuy_categories' AND column_name='site_id'
+       ) THEN
+         ALTER TABLE onbuy_categories ADD COLUMN site_id INTEGER NOT NULL DEFAULT 2000;
+         ALTER TABLE onbuy_categories DROP CONSTRAINT IF EXISTS onbuy_categories_pkey;
+         ALTER TABLE onbuy_categories ADD PRIMARY KEY (site_id, category_id);
+       END IF;
+     END $$`,
+    `CREATE INDEX IF NOT EXISTS idx_onbuy_cats_site ON onbuy_categories(site_id)`,
+    `CREATE TABLE IF NOT EXISTS onbuy_category_sync_jobs (
+       id           SERIAL PRIMARY KEY,
+       site_id      INTEGER NOT NULL,
+       status       TEXT NOT NULL DEFAULT 'running',
+       total        INTEGER DEFAULT 0,
+       fetched      INTEGER DEFAULT 0,
+       stored       INTEGER DEFAULT 0,
+       error        TEXT,
+       started_at   TIMESTAMP DEFAULT NOW(),
+       completed_at TIMESTAMP
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_cat_sync_jobs_site ON onbuy_category_sync_jobs(site_id, started_at DESC)`,
     `CREATE TABLE IF NOT EXISTS onbuy_bulk_pending_queues (
        id           SERIAL PRIMARY KEY,
        session_id   INTEGER,
@@ -1959,6 +1994,33 @@ async function runMigrations() {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_dbj_user   ON onbuy_delete_brand_jobs(user_id, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_dbjl_job   ON onbuy_delete_brand_job_logs(job_id, created_at ASC)`,
+    // Global restricted products list — managed by super admin, shared across all users
+    `CREATE TABLE IF NOT EXISTS restricted_products (
+       id         SERIAL PRIMARY KEY,
+       title      TEXT NOT NULL UNIQUE,
+       created_at TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `CREATE TABLE IF NOT EXISTS onbuy_delete_product_jobs (
+       id               SERIAL PRIMARY KEY,
+       user_id          INTEGER NOT NULL,
+       status           TEXT NOT NULL DEFAULT 'running',
+       products_count   INTEGER DEFAULT 0,
+       listings_scanned INTEGER DEFAULT 0,
+       opcs_found       INTEGER DEFAULT 0,
+       listings_deleted INTEGER DEFAULT 0,
+       created_at       TIMESTAMP DEFAULT NOW(),
+       completed_at     TIMESTAMP
+     )`,
+    `CREATE TABLE IF NOT EXISTS onbuy_delete_product_job_logs (
+       id         SERIAL PRIMARY KEY,
+       job_id     INTEGER REFERENCES onbuy_delete_product_jobs(id) ON DELETE CASCADE,
+       user_id    INTEGER NOT NULL,
+       message    TEXT NOT NULL,
+       level      TEXT NOT NULL DEFAULT 'info',
+       created_at TIMESTAMP DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_dpj_user   ON onbuy_delete_product_jobs(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_dpjl_job   ON onbuy_delete_product_job_logs(job_id, created_at ASC)`,
     // markup_is_explicit: true = ROI was set explicitly in the import sheet; false = defaulted from global setting.
     // Rows default to false so the repricer always uses the user's current default ROI for pre-existing products.
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS markup_is_explicit BOOLEAN NOT NULL DEFAULT FALSE`,
@@ -2219,14 +2281,16 @@ app.get('/api/onbuy-bulk/template', requireAuth, (req, res) => {
   res.send(buf);
 });
 
-// GET /api/onbuy-bulk/categories/export — download categories sheet (populated by admin upload)
+// GET /api/onbuy-bulk/categories/export — download categories sheet filtered by site_id
 app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
+  const exportSiteId = parseInt(req.query.site_id ?? 2000);
   try {
     const { rows: cats } = await db.query(
-      `SELECT category_id, name, tree FROM onbuy_categories ORDER BY tree ASC, name ASC`
+      `SELECT category_id, name, tree FROM onbuy_categories WHERE site_id = $1 ORDER BY tree ASC, name ASC`,
+      [exportSiteId]
     );
     if (!cats.length) {
-      return res.status(400).json({ error: 'No categories found. Please ask the admin to upload the OnBuy categories file in Settings.' });
+      return res.status(400).json({ error: `No categories found for site_id=${exportSiteId}. Please ask the admin to sync categories for this site in Settings.` });
     }
     const wsData = [['ID', 'Category']];
     for (const c of cats) {
@@ -2247,11 +2311,136 @@ app.get('/api/onbuy-bulk/categories/export', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/settings/categories/count — return total categories in DB
+// GET /api/settings/categories/count — return total categories and per-site breakdown
 app.get('/api/settings/categories/count', requireAuth, async (req, res) => {
   try {
     const { rows: [{ count }] } = await db.query(`SELECT COUNT(*) AS count FROM onbuy_categories`);
-    res.json({ count: parseInt(count) });
+    const { rows: bySite } = await db.query(
+      `SELECT site_id, COUNT(*) AS cnt FROM onbuy_categories GROUP BY site_id ORDER BY site_id`
+    );
+    res.json({ count: parseInt(count), by_site: bySite.map(r => ({ site_id: r.site_id, count: parseInt(r.cnt) })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Background worker function — runs after response is sent
+async function runCategorySyncJob(jobId, siteId, token) {
+  async function progress(fields) {
+    const sets = Object.entries(fields).map(([k, v], i) => `${k}=$${i + 1}`);
+    const vals = Object.values(fields);
+    await db.query(`UPDATE onbuy_category_sync_jobs SET ${sets.join(',')} WHERE id=$${vals.length + 1}`, [...vals, jobId]).catch(() => {});
+  }
+
+  try {
+    let offset = 0;
+    const limit = 100;
+    let totalRows = null;
+    let fetched = 0;
+    const toInsert = [];   // only lvl=5 categories
+
+    while (true) {
+      const r = await fetch(
+        `https://api.onbuy.com/v2/categories?site_id=${siteId}&limit=${limit}&offset=${offset}`,
+        { headers: { Authorization: token } }
+      );
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        throw new Error(`OnBuy API error ${r.status}: ${txt.slice(0, 200)}`);
+      }
+      const data = await r.json();
+      const results = Array.isArray(data) ? data : (data.results ?? data.payload ?? data.categories ?? []);
+      if (!results.length) break;
+
+      if (totalRows === null) {
+        totalRows = data.metadata?.total_rows ?? null;
+        if (totalRows !== null) await progress({ total: totalRows });
+      }
+
+      // Only keep lvl=5 categories
+      for (const cat of results) {
+        const lvl = cat.lvl ?? cat.level ?? null;
+        if (lvl === 5) toInsert.push(cat);
+      }
+
+      fetched += results.length;
+      await progress({ fetched, stored: toInsert.length });
+
+      if (totalRows !== null && fetched >= totalRows) break;
+      offset += limit;
+    }
+
+    if (!toInsert.length) throw new Error('No lvl=5 categories found in API response');
+
+    // Build upsert
+    const vals = [], params = [];
+    let p = 1;
+    for (const cat of toInsert) {
+      const catId = cat.category_id ?? cat.id;
+      const name  = (cat.name ?? '').trim();
+      const tree  = (cat.category_tree ?? cat.tree ?? '').trim();
+      const level = cat.lvl ?? cat.level ?? 5;
+      if (!catId || !name) continue;
+      vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
+      params.push(siteId, catId, name, tree, level);
+    }
+
+    await db.query(`DELETE FROM onbuy_categories WHERE site_id = $1`, [siteId]);
+    if (vals.length) {
+      await db.query(
+        `INSERT INTO onbuy_categories (site_id, category_id, name, tree, level, synced_at)
+         VALUES ${vals.join(',')}
+         ON CONFLICT (site_id, category_id) DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
+        params
+      );
+    }
+
+    await progress({ status: 'completed', stored: vals.length, total: totalRows ?? fetched, fetched, completed_at: new Date() });
+    console.log(`[Categories] Synced ${vals.length} lvl=5 categories for site_id=${siteId}`);
+  } catch (err) {
+    await progress({ status: 'failed', error: err.message, completed_at: new Date() });
+    console.error('[Categories sync]', err.message);
+  }
+}
+
+// POST /api/admin/categories/sync — start background sync, return job immediately
+app.post('/api/admin/categories/sync', requireAuth, requireAdmin, async (req, res) => {
+  const siteId = parseInt(req.body?.site_id ?? 2000);
+  try {
+    // Block if already running for this site
+    const { rows: running } = await db.query(
+      `SELECT id FROM onbuy_category_sync_jobs WHERE site_id=$1 AND status='running' LIMIT 1`, [siteId]
+    );
+    if (running.length) return res.status(409).json({ error: 'A sync is already running for this site.' });
+
+    const { rows: accounts } = await db.query(`SELECT * FROM onbuy_accounts WHERE is_active=true ORDER BY id LIMIT 1`);
+    if (!accounts.length) return res.status(400).json({ error: 'No active OnBuy accounts found. Add an account first.' });
+
+    const token = await getTokenForAccount(accounts[0]);
+    if (!token) return res.status(400).json({ error: 'Could not obtain OnBuy token — check account credentials.' });
+
+    const { rows: [job] } = await db.query(
+      `INSERT INTO onbuy_category_sync_jobs (site_id, status) VALUES ($1,'running') RETURNING id`, [siteId]
+    );
+
+    // Fire-and-forget — response is sent before sync completes
+    setImmediate(() => runCategorySyncJob(job.id, siteId, token));
+
+    res.json({ jobId: job.id, site_id: siteId, status: 'running' });
+  } catch (e) {
+    console.error('[Categories sync start]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/categories/sync/status?site_id=2000 — latest job for a site
+app.get('/api/admin/categories/sync/status', requireAuth, requireAdmin, async (req, res) => {
+  const siteId = parseInt(req.query.site_id ?? 2000);
+  try {
+    const { rows: [job] } = await db.query(
+      `SELECT * FROM onbuy_category_sync_jobs WHERE site_id=$1 ORDER BY started_at DESC LIMIT 1`, [siteId]
+    );
+    res.json({ job: job ?? null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2278,6 +2467,7 @@ app.post('/api/settings/categories/upload', requireAuth, requireAdmin, upload.si
 
     const dataRows = rows.slice(headerIdx + 1).filter(r => r[idCol] !== '' && r[catCol] !== '');
 
+    const uploadSiteId = parseInt(req.body?.site_id ?? 2000);
     const vals = [], params = [];
     let p = 1;
     for (const row of dataRows) {
@@ -2288,17 +2478,17 @@ app.post('/api/settings/categories/upload', requireAuth, requireAdmin, upload.si
       const name  = parts[parts.length - 1];
       const tree  = parts.length > 1 ? parts.slice(0, -1).join(' > ') : '';
       const level = parts.length;
-      vals.push(`($${p++},$${p++},$${p++},$${p++},NOW())`);
-      params.push(catId, name, tree, level);
+      vals.push(`($${p++},$${p++},$${p++},$${p++},$${p++},NOW())`);
+      params.push(uploadSiteId, catId, name, tree, level);
     }
 
     if (!vals.length) return res.status(400).json({ error: 'No valid category rows found in file' });
 
-    await db.query(`TRUNCATE TABLE onbuy_categories`);
+    await db.query(`DELETE FROM onbuy_categories WHERE site_id = $1`, [uploadSiteId]);
     await db.query(
-      `INSERT INTO onbuy_categories (category_id, name, tree, level, synced_at)
+      `INSERT INTO onbuy_categories (site_id, category_id, name, tree, level, synced_at)
        VALUES ${vals.join(',')}
-       ON CONFLICT (category_id) DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
+       ON CONFLICT (site_id, category_id) DO UPDATE SET name=EXCLUDED.name, tree=EXCLUDED.tree, level=EXCLUDED.level, synced_at=NOW()`,
       params
     );
 
@@ -2353,7 +2543,10 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const name      = getCell(row, 'name');
       const category  = getCell(row, 'category');
       const brand     = getCell(row, 'brand');
-      const ean       = getCell(row, 'ean');
+      // EAN cell may contain multiple comma-separated codes — use first, keep rest for retry
+      const eanRaw    = getCell(row, 'ean');
+      const eanList   = eanRaw.split(',').map(e => e.trim()).filter(Boolean);
+      const ean       = eanList[0] || '';
       const mpn       = getCell(row, 'mpn');
       const condition = normalizeCondition(getCell(row, 'condition'));
       const desc      = getCell(row, 'description');
@@ -2378,6 +2571,7 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const errors = [];
       if (!name)     errors.push('Product Name required');
       if (!category) errors.push('Category Name required');
+      if (!ean)      errors.push('EAN / UPC required — product will be skipped (no fake EANs)');
       if (!price)    errors.push('Price (£) required');
       if (!sku)      errors.push('SKU required');
       if (!stock)    errors.push('Stock must be > 0');
@@ -2387,7 +2581,7 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const images = [img1, img2, img3, img4, img5, img6];
       return {
         _row: i + 2, valid: errors.length === 0, errors,
-        name, category, brand, ean, mpn, condition, description: desc,
+        name, category, brand, ean, ean_list: eanList, mpn, condition, description: desc,
         images,
         sku, price, stock, delivery_weight,
         handling_time, colour, summary1, summary2, summary3, summary4, summary5,
@@ -2435,13 +2629,13 @@ app.post('/api/onbuy-bulk/import', requireAuth, async (req, res) => {
   if (parseInt(cat_count) === 0)
     return res.status(400).json({ error: 'OnBuy categories not found. Please ask the admin to upload the categories file in Settings before importing.' });
 
-  // Guard: block import if a delete-brands job is running for this user
-  const { rows: runningDeleteJobs } = await db.query(
-    `SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`,
-    [req.effectiveUserId]
-  );
-  if (runningDeleteJobs.length) {
-    return res.status(409).json({ error: 'A Delete Restricted Brands job is currently running. Please wait for it to complete before starting a new import.' });
+  // Guard: block import if a delete-brands or delete-products job is running for this user
+  const [{ rows: runningBrandJobs }, { rows: runningProductJobs }] = await Promise.all([
+    db.query(`SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [req.effectiveUserId]),
+    db.query(`SELECT id FROM onbuy_delete_product_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [req.effectiveUserId]),
+  ]);
+  if (runningBrandJobs.length || runningProductJobs.length) {
+    return res.status(409).json({ error: 'A Delete Restricted job is currently running. Please wait for it to complete before starting a new import.' });
   }
 
   const account = await getImportAccount(account_id);
@@ -3437,10 +3631,10 @@ app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
   res.end();
 });
 
-// ── Restricted Brands ────────────────────────────────────────────────────────
+// ── Restricted Brands (Super Admin managed) ──────────────────────────────────
 
-// GET /api/restricted-brands/template — download template Excel
-app.get('/api/restricted-brands/template', requireAuth, (req, res) => {
+// GET /api/restricted-brands/template — download template (super admin only)
+app.get('/api/restricted-brands/template', requireAuth, requireAdmin, (req, res) => {
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet([['Restricted brands'], ['Example Brand']]);
   XLSX.utils.book_append_sheet(wb, ws, 'Restricted Brands');
@@ -3450,43 +3644,89 @@ app.get('/api/restricted-brands/template', requireAuth, (req, res) => {
   res.send(buf);
 });
 
-// POST /api/restricted-brands/upload — parse CSV/Excel and store brands
-app.post('/api/restricted-brands/upload', requireAuth, upload.single('file'), async (req, res) => {
+// POST /api/restricted-brands/upload — super admin only; stores brands globally under admin's user_id
+app.post('/api/restricted-brands/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-    // Skip header row, collect non-empty brand names
     const brands = rows.slice(1)
       .map(r => String(r[0] || '').trim())
       .filter(Boolean);
     if (!brands.length) return res.status(400).json({ error: 'No brands found in file' });
-    const uid = req.effectiveUserId;
-    // Replace all brands for this user
-    await db.query('DELETE FROM restricted_brands WHERE user_id = $1', [uid]);
-    if (brands.length > 0) {
-      await db.query(
-        `INSERT INTO restricted_brands (user_id, brand_name)
-         SELECT $1, unnest($2::text[])
-         ON CONFLICT DO NOTHING`,
-        [uid, brands]
-      );
-    }
+    // Store under the super admin's own user_id so all delete-brands jobs can read from it
+    const adminId = req.user.userId;
+    await db.query('DELETE FROM restricted_brands WHERE user_id = $1', [adminId]);
+    await db.query(
+      `INSERT INTO restricted_brands (user_id, brand_name)
+       SELECT $1, unnest($2::text[])
+       ON CONFLICT DO NOTHING`,
+      [adminId, brands]
+    );
     res.json({ count: brands.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/restricted-brands — get current user's restricted brands
+// GET /api/restricted-brands — return super admin's global brand list count (all users)
 app.get('/api/restricted-brands', requireAuth, async (req, res) => {
   try {
+    const { rows: [admin] } = await db.query(`SELECT id FROM users WHERE role = 'super_admin' LIMIT 1`);
+    if (!admin) return res.json({ brands: [], count: 0 });
     const { rows } = await db.query(
       'SELECT brand_name FROM restricted_brands WHERE user_id = $1 ORDER BY brand_name',
-      [req.effectiveUserId]
+      [admin.id]
     );
     res.json({ brands: rows.map(r => r.brand_name), count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Restricted Products (Super Admin managed) ─────────────────────────────────
+
+// GET /api/admin/restricted-products/template — super admin only
+app.get('/api/admin/restricted-products/template', requireAuth, requireAdmin, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([['Restricted Product Title'], ['Example Restricted Product Name']]);
+  XLSX.utils.book_append_sheet(wb, ws, 'Restricted Products');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="restricted-products-template.xlsx"');
+  res.send(buf);
+});
+
+// POST /api/admin/restricted-products/upload — super admin only
+app.post('/api/admin/restricted-products/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    const titles = rows.slice(1)
+      .map(r => String(r[0] || '').trim())
+      .filter(Boolean);
+    if (!titles.length) return res.status(400).json({ error: 'No product titles found in file' });
+    await db.query('TRUNCATE restricted_products');
+    await db.query(
+      `INSERT INTO restricted_products (title)
+       SELECT unnest($1::text[])
+       ON CONFLICT (title) DO NOTHING`,
+      [titles]
+    );
+    res.json({ count: titles.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/restricted-products — count of restricted product titles (all users)
+app.get('/api/restricted-products', requireAuth, async (req, res) => {
+  try {
+    const { rows: [{ cnt }] } = await db.query('SELECT COUNT(*) AS cnt FROM restricted_products');
+    res.json({ count: parseInt(cnt) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3535,6 +3775,56 @@ app.get('/api/delete-brands/active', requireAuth, async (req, res) => {
 app.post('/api/delete-brands/:jobId/cancel', requireAuth, async (req, res) => {
   await db.query(
     `UPDATE onbuy_delete_brand_jobs SET status='cancelled', completed_at=NOW() WHERE id=$1 AND user_id=$2`,
+    [req.params.jobId, req.effectiveUserId]
+  );
+  res.json({ ok: true });
+});
+
+// ── Delete Restricted Products Job ───────────────────────────────────────────
+
+// POST /api/restricted-products/delete-job — enqueue background job for current user
+app.post('/api/restricted-products/delete-job', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+
+  const { rows: runningImports } = await db.query(
+    `SELECT id FROM onbuy_bulk_import_sessions WHERE user_id = $1 AND status = 'processing' LIMIT 1`, [uid]
+  );
+  if (runningImports.length) return res.status(409).json({ error: 'A bulk import job is currently running. Please wait for it to complete.' });
+
+  const { rows: existingJobs } = await db.query(
+    `SELECT id FROM onbuy_delete_product_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [uid]
+  );
+  if (existingJobs.length) return res.status(409).json({ error: 'A Delete Restricted Products job is already running.' });
+
+  const { rows: [{ cnt }] } = await db.query('SELECT COUNT(*) AS cnt FROM restricted_products');
+  if (parseInt(cnt) === 0) return res.status(400).json({ error: 'No restricted products uploaded by admin yet.' });
+
+  const { rows: [jobRow] } = await db.query(
+    `INSERT INTO onbuy_delete_product_jobs (user_id, status) VALUES ($1, 'running') RETURNING id`, [uid]
+  );
+  await deleteProductsQueue.add('delete', { jobId: jobRow.id, userId: uid }, {
+    jobId: `delete-products-${jobRow.id}`, removeOnComplete: true, removeOnFail: true, attempts: 1,
+  });
+  res.json({ jobId: jobRow.id, status: 'running' });
+});
+
+// GET /api/delete-products/active — most recent delete-products job + logs
+app.get('/api/delete-products/active', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  const { rows: [job] } = await db.query(
+    `SELECT * FROM onbuy_delete_product_jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [uid]
+  );
+  if (!job) return res.json({ job: null, logs: [] });
+  const { rows: logs } = await db.query(
+    `SELECT message, level, created_at FROM onbuy_delete_product_job_logs WHERE job_id = $1 ORDER BY created_at ASC`, [job.id]
+  );
+  res.json({ job, logs });
+});
+
+// POST /api/delete-products/:jobId/cancel
+app.post('/api/delete-products/:jobId/cancel', requireAuth, async (req, res) => {
+  await db.query(
+    `UPDATE onbuy_delete_product_jobs SET status='cancelled', completed_at=NOW() WHERE id=$1 AND user_id=$2`,
     [req.params.jobId, req.effectiveUserId]
   );
   res.json({ ok: true });
@@ -3621,9 +3911,9 @@ app.post('/api/orders/sync', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
   try {
     const { rows: accounts } = await db.query(
-      `SELECT id FROM onbuy_accounts WHERE user_id = $1 AND is_active = true`, [uid]
+      `SELECT id FROM onbuy_accounts WHERE user_id = $1 AND is_active = true AND orders_enabled = true`, [uid]
     );
-    if (!accounts.length) return res.json({ message: 'No active OnBuy accounts found' });
+    if (!accounts.length) return res.json({ message: 'No active OnBuy accounts with orders sync enabled' });
     await redisPub.publish('orders:sync', String(uid));
     res.json({ message: `Sync started for ${accounts.length} account(s)` });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3699,6 +3989,44 @@ function _huntLog(uid, msg) {
   for (const fn of job.logListeners) { try { fn(line); } catch {} }
 }
 
+// GET /api/product-hunting/categories?account_id=X
+// Returns OnBuy categories for the account's site_id.  Warns if not synced.
+app.get('/api/product-hunting/categories', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  const { account_id } = req.query;
+  if (!account_id) return res.status(400).json({ error: 'account_id required' });
+  try {
+    const { rows: [account] } = await db.query(
+      'SELECT site_id FROM onbuy_accounts WHERE id=$1 AND user_id=$2',
+      [account_id, uid],
+    );
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const siteId = account.site_id ?? 2000;
+    const { rows: [{ cnt }] } = await db.query(
+      'SELECT COUNT(*) AS cnt FROM onbuy_categories WHERE site_id=$1', [siteId],
+    );
+
+    if (parseInt(cnt) === 0) {
+      return res.status(200).json({
+        site_id: siteId,
+        count: 0,
+        categories: [],
+        needs_sync: true,
+        warning: `No OnBuy categories synced for site_id=${siteId}. Go to Settings → OnBuy Categories, select the matching site, and click "Fetch & Sync Categories".`,
+      });
+    }
+
+    const { rows: cats } = await db.query(
+      'SELECT category_id, name, tree FROM onbuy_categories WHERE site_id=$1 ORDER BY tree, name',
+      [siteId],
+    );
+    res.json({ site_id: siteId, count: cats.length, categories: cats, needs_sync: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/product-hunting/start
 app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
@@ -3744,7 +4072,7 @@ app.post('/api/product-hunting/start', requireAuth, async (req, res) => {
     try {
       log(`[Hunt] Starting job — category: "${category.label}", max: ${max_listings ?? 100}`);
       const rows = await runProductHunting(
-        { account, category, maxListings: max_listings ?? 100, signal },
+        { account, category, maxListings: max_listings ?? 100, signal, siteId: account.site_id ?? 2000 },
         log,
       );
 

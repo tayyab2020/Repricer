@@ -34,7 +34,7 @@ import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from 'fs'
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeProductFast, scrapeProductSlow, setProxyApiUrl, jobContext } from './amazonScraper.js';
-import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, getTokenForAccount } from './jobProducer.js';
+import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, deleteProductsQueue, getTokenForAccount } from './jobProducer.js';
 import { getKeepaPrice, createKeepaSession } from './keepaScraper.js';
 
 dotenv.config();
@@ -534,7 +534,7 @@ class OnBuyUpdater {
               const { rows } = await db.query(`
                 SELECT oa.consumer_key, oa.secret_key
                 FROM product_mappings pm
-                JOIN onbuy_accounts oa ON oa.id = pm.onbuy_account_id AND oa.is_active = true
+                JOIN onbuy_accounts oa ON oa.id = pm.onbuy_account_id AND oa.is_active = true AND oa.repricer_enabled = true
                 WHERE pm.id = $1
               `, [mappingId]);
               if (rows[0]) {
@@ -1457,7 +1457,7 @@ const queuePollerWorker = new Worker('queue-poller', async (job) => {
     `SELECT pq.*, oa.consumer_key, oa.secret_key,
             COALESCE(oa.site_id, '2000')::int AS acct_site_id
      FROM   onbuy_bulk_pending_queues pq
-     JOIN   onbuy_accounts oa ON oa.id = pq.account_id AND oa.is_active = true
+     JOIN   onbuy_accounts oa ON oa.id = pq.account_id AND oa.is_active = true AND oa.bulk_enabled = true
      WHERE  pq.status = 'pending' AND pq.attempts < 96
      ORDER  BY pq.created_at ASC`
   ).catch(e => { plog(`[QueuePoller] DB query error: ${e.message}`); return { rows: [] }; });
@@ -1785,19 +1785,21 @@ async function processBulkImportJob(job) {
   if (!sess?.rows_data) throw new Error(`Session ${sessionId} has no rows_data`);
   const validRows = sess.rows_data;
 
-  // Guard: abort if a delete-brands job is running for this user
-  const { rows: activeDeleteJobs } = await db.query(
-    `SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [userId]
-  );
+  // Guard: abort if a delete-brands or delete-products job is running for this user
+  const [{ rows: activeDeleteBrandJobs }, { rows: activeDeleteProductJobs }] = await Promise.all([
+    db.query(`SELECT id FROM onbuy_delete_brand_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [userId]),
+    db.query(`SELECT id FROM onbuy_delete_product_jobs WHERE user_id = $1 AND status = 'running' LIMIT 1`, [userId]),
+  ]);
+  const activeDeleteJobs = [...activeDeleteBrandJobs, ...activeDeleteProductJobs];
   if (activeDeleteJobs.length) {
-    blog('⚠️  Delete Restricted Brands job is running — aborting bulk import to prevent conflicts');
+    blog('⚠️  Delete Restricted job is running — aborting bulk import to prevent conflicts');
     await db.query(`UPDATE onbuy_bulk_import_sessions SET status='failed', completed_at=NOW() WHERE id=$1`, [sessionId]);
     return;
   }
 
   // Get fresh account + token
   const { rows: [account] } = await db.query(
-    `SELECT * FROM onbuy_accounts WHERE id=$1 AND is_active=true`, [accountId]
+    `SELECT * FROM onbuy_accounts WHERE id=$1 AND is_active=true AND bulk_enabled=true`, [accountId]
   );
   if (!account) throw new Error(`Account ${accountId} not found`);
   const token = await getTokenForAccount(account);
@@ -1821,18 +1823,11 @@ async function processBulkImportJob(job) {
   }
 
   async function syncCategoriesIfNeeded() {
-    const { rows: [{ cnt }] } = await db.query(`SELECT COUNT(*) AS cnt FROM onbuy_categories`);
-    if (parseInt(cnt) === 0) throw new Error('No OnBuy categories found. Ask the admin to upload the categories file in Settings.');
-    blog(`Categories ready — ${cnt} categories in DB`);
-  }
-
-  // Generate a structurally valid EAN-13 using GS1 UK prefix 500 + 9 random digits.
-  // Used as a fallback when the original product code is rejected by OnBuy.
-  function generateEan13() {
-    const base = '500' + String(Math.floor(Math.random() * 1_000_000_000)).padStart(9, '0');
-    let sum = 0;
-    for (let i = 0; i < 12; i++) sum += parseInt(base[i]) * (i % 2 === 0 ? 1 : 3);
-    return base + ((10 - (sum % 10)) % 10);
+    const { rows: [{ cnt }] } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM onbuy_categories WHERE site_id = $1`, [parseInt(siteId)]
+    );
+    if (parseInt(cnt) === 0) throw new Error(`No OnBuy categories found for site_id=${siteId}. Ask the admin to sync categories for this site in Settings.`);
+    blog(`Categories ready — ${cnt} categories in DB for site_id=${siteId}`);
   }
 
   // Normalize "A › B > C" → ["A", "B", "C"] regardless of separator
@@ -1935,13 +1930,43 @@ async function processBulkImportJob(job) {
       return categoryCache[trimmed];
     }
 
+    // ── Tier 2b: leaf-word subset match.
+    //    Handles "Cola" → "Cola Drinks", "Ground Coffee" → "Ground Coffee (500g)" etc.
+    //    All words extracted from the input leaf must appear in the DB category's name.
+    //    If multiple candidates exist, pick by full-path IDF scoring.
+    const leafWords = new Set(extractWords(leafName));
+    if (leafWords.size >= 1) {
+      const t2b = categoryList.filter(c => {
+        const nw = new Set(extractWords(c.nameLower));
+        return [...leafWords].every(w => nw.has(w));
+      });
+      if (t2b.length === 1) {
+        categoryCache[trimmed] = t2b[0].category_id;
+        blog(`Category "${leafName}" → id=${t2b[0].category_id} (leaf-words subset)`);
+        return categoryCache[trimmed];
+      }
+      if (t2b.length > 1) {
+        const pw = extractPathWords(segments);
+        let b2b = null, bs2b = -1;
+        for (const c of t2b) {
+          const s = scoreCategory(c, pw);
+          if (s > bs2b) { bs2b = s; b2b = c; }
+        }
+        if (b2b && bs2b > 0) {
+          categoryCache[trimmed] = b2b.category_id;
+          blog(`Category "${leafName}" → id=${b2b.category_id} (leaf-words subset + path score)`);
+          return categoryCache[trimmed];
+        }
+      }
+    }
+
     // ── Tier 3: weighted path-word scoring across all DB categories.
     //    Leaf segments (weight 3.0) outweigh root segments (weight 1.0), so
     //    "Card" from "Card Games" (leaf, w=3) beats "Accessories" from the
     //    intermediate segment (w=1.67) even if both hit 3 words total. ──
     const pathWordWeights = extractPathWords(segments);
     if (pathWordWeights.size) {
-      const t3id = bestCategory(pathWordWeights, 0.35, 2);
+      const t3id = bestCategory(pathWordWeights, 0.28, 2);
       if (t3id) {
         categoryCache[trimmed] = t3id;
         blog(`Category "${trimmed}" → id=${t3id} (path word-overlap)`);
@@ -2024,7 +2049,9 @@ async function processBulkImportJob(job) {
   // ── Phase 1b: verify categories exist, preload into memory, compute IDF frequencies ──
   await syncCategoriesIfNeeded();
   {
-    const { rows: cats } = await db.query('SELECT category_id, name, tree FROM onbuy_categories');
+    const { rows: cats } = await db.query(
+      'SELECT category_id, name, tree FROM onbuy_categories WHERE site_id = $1', [parseInt(siteId)]
+    );
     categoryList = cats.map(r => ({
       category_id:   r.category_id,
       nameLower:     r.name.toLowerCase(),
@@ -2136,9 +2163,26 @@ async function processBulkImportJob(job) {
   }
 
   for (let i = 0; i < toCreate.length; i += CREATE_CHUNK) {
-    const chunk    = toCreate.slice(i, i + CREATE_CHUNK);
+    const rawChunk = toCreate.slice(i, i + CREATE_CHUNK);
+
+    // Skip any rows that have no EAN — fake EANs are not allowed
+    const chunk = [];
+    for (const item of rawChunk) {
+      if (!item.row.ean) {
+        const msg = 'No EAN / UPC provided — skipped';
+        results.errors.push({ row: item.row._row, product: item.row.name, error: msg });
+        results.skipped++;
+        db.query(
+          `INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+          [sessionId,userId,item.row._row,item.row.name,item.row.sku,item.row.ean,item.row.category,item.row.brand,item.sourcePrice,item.sellingPrice,parseInt(item.row.stock)||0,_bulkNormCond(item.row.condition),msg]
+        ).catch(() => {});
+      } else {
+        chunk.push(item);
+      }
+    }
+    if (!chunk.length) continue;
+
     const products = chunk.map(({ row, sellingPrice, categoryId }) => {
-      if (!row.ean) row.ean = generateEan13(); // generate before payload so DB writes use the same EAN
       const brandVal = row.brand?.trim();
       const addImgs  = (row.images || []).slice(1).filter(Boolean);
       return {
@@ -2191,7 +2235,7 @@ async function processBulkImportJob(job) {
     await new Promise(res => setTimeout(res, 15_000));
     await checkCancelled();
     const pendingToSave = [];
-    const eanRetries   = []; // collected during poll; sent in batch after all queues are processed
+    const eanRetries   = []; // rows whose first EAN was rejected — retry with next EAN from list
     for (let i = 0; i < queueItems.length; i += 1000) {
       const batch   = queueItems.slice(i, i + 1000);
       const pollMap = await batchPollQueues(batch.map(q => q.queueId));
@@ -2221,32 +2265,43 @@ async function processBulkImportJob(job) {
                 [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),searchErr.message]).catch(() => {});
             }
           } else if (/is not a valid product code|reserved GTIN group/i.test(error)) {
-            // Collect for batched retry — sent together after all queues are processed
-            const newEan   = generateEan13();
-            const brandVal = meta.row.brand?.trim();
-            const addImgs  = (meta.row.images || []).slice(1).filter(Boolean);
-            eanRetries.push({
-              prod: {
-                uid:          meta.row.sku || `bulk-${meta.row._row ?? Date.now()}`,
-                published:    '1',
-                category_id:  meta.categoryId,
-                product_name: _bulkTruncateToBytes(meta.row.name, 150),
-                ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
-                default_image: meta.row.images[0],
-                ...(addImgs.length       ? { additional_images: addImgs }                                   : {}),
-                ...(meta.row.description ? { description: String(meta.row.description).replace(/[<>]/g, '') } : {}),
-                product_codes: [newEan],
-                ...(meta.row.mpn             ? { mpn: meta.row.mpn }                              : {}),
-                ...(meta.row.delivery_weight ? { delivery_weight: parseFloat(meta.row.delivery_weight) } : {}),
-                ...(meta.row.summary1 ? { summary_point_one:   meta.row.summary1 } : {}),
-                ...(meta.row.summary2 ? { summary_point_two:   meta.row.summary2 } : {}),
-                ...(meta.row.summary3 ? { summary_point_three: meta.row.summary3 } : {}),
-                ...(meta.row.summary4 ? { summary_point_four:  meta.row.summary4 } : {}),
-                ...(meta.row.summary5 ? { summary_point_five:  meta.row.summary5 } : {}),
-              },
-              meta: { ...meta, row: { ...meta.row, ean: newEan } },
-            });
-            blog(`Phase 3: invalid product code for "${meta.row.name}" → EAN ${newEan} queued for batch retry`);
+            // Try the next EAN from the list (Keepa rows can have multiple comma-separated EANs)
+            const eanList   = Array.isArray(meta.row.ean_list) ? meta.row.ean_list : [meta.row.ean];
+            const usedIdx   = eanList.indexOf(meta.row.ean);
+            const nextEan   = eanList[usedIdx + 1] ?? null;
+            if (nextEan) {
+              const updatedRow = { ...meta.row, ean: nextEan };
+              const brandVal   = updatedRow.brand?.trim();
+              const addImgs    = (updatedRow.images || []).slice(1).filter(Boolean);
+              eanRetries.push({
+                prod: {
+                  uid:          updatedRow.sku || `bulk-${updatedRow._row ?? Date.now()}`,
+                  published:    '1',
+                  category_id:  meta.categoryId,
+                  product_name: _bulkTruncateToBytes(updatedRow.name, 150),
+                  ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
+                  default_image: updatedRow.images[0],
+                  ...(addImgs.length         ? { additional_images: addImgs }                                      : {}),
+                  ...(updatedRow.description ? { description: String(updatedRow.description).replace(/[<>]/g, '') } : {}),
+                  product_codes: [nextEan],
+                  ...(updatedRow.mpn             ? { mpn: updatedRow.mpn }                               : {}),
+                  ...(updatedRow.delivery_weight ? { delivery_weight: parseFloat(updatedRow.delivery_weight) }  : {}),
+                  ...(updatedRow.summary1 ? { summary_point_one:   updatedRow.summary1 } : {}),
+                  ...(updatedRow.summary2 ? { summary_point_two:   updatedRow.summary2 } : {}),
+                  ...(updatedRow.summary3 ? { summary_point_three: updatedRow.summary3 } : {}),
+                  ...(updatedRow.summary4 ? { summary_point_four:  updatedRow.summary4 } : {}),
+                  ...(updatedRow.summary5 ? { summary_point_five:  updatedRow.summary5 } : {}),
+                },
+                meta: { ...meta, row: updatedRow },
+              });
+              blog(`Phase 3: EAN ${meta.row.ean} rejected for "${meta.row.name}" → retrying with next EAN ${nextEan} (${usedIdx + 2}/${eanList.length})`);
+            } else {
+              const msg = `All EAN(s) rejected by OnBuy (tried: ${eanList.join(', ')}) — skipped`;
+              results.errors.push({ row: meta.row._row, product: meta.row.name, error: msg }); results.skipped++;
+              db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+                [sessionId,userId,meta.row._row,meta.row.name,meta.row.sku,meta.row.ean,meta.row.category,meta.row.brand,meta.sourcePrice,meta.sellingPrice,parseInt(meta.row.stock)||0,_bulkNormCond(meta.row.condition),msg]).catch(() => {});
+              blog(`Phase 3: all EANs exhausted for "${meta.row.name}" — skipped`);
+            }
           } else {
             results.errors.push({ row: meta.row._row, product: meta.row.name, error }); results.skipped++;
             db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
@@ -2257,9 +2312,9 @@ async function processBulkImportJob(job) {
         }
       }
     }
-    // ── Phase 3 EAN retry: send all invalid-EAN products in CREATE_CHUNK batches ──
+    // ── Phase 3 EAN retry: send products whose first EAN was rejected, using next EAN ──
     if (eanRetries.length > 0) {
-      blog(`Phase 3 EAN retry: sending ${eanRetries.length} product(s) in ${Math.ceil(eanRetries.length / CREATE_CHUNK)} batch(es)`);
+      blog(`Phase 3 EAN retry: ${eanRetries.length} product(s) with alternate EAN(s) in ${Math.ceil(eanRetries.length / CREATE_CHUNK)} batch(es)`);
       for (let i = 0; i < eanRetries.length; i += CREATE_CHUNK) {
         const retryChunk   = eanRetries.slice(i, i + CREATE_CHUNK);
         const retryResults = await sendChunk(retryChunk.map(r => r.prod), retryChunk.map(r => r.meta));
@@ -2270,14 +2325,48 @@ async function processBulkImportJob(job) {
             pendingToSave.push({ queueId: rr.queue_id, meta: retryMeta, uid: null });
             blog(`Phase 3 EAN retry: queued → queue_id=${rr.queue_id}, ean=${retryMeta.row.ean}`);
           } else {
-            const retryMsg = `EAN retry failed: ${rr?.message || 'no queue_id'}`;
-            results.errors.push({ row: retryMeta.row._row, product: retryMeta.row.name, error: retryMsg }); results.skipped++;
-            db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
-              [sessionId,userId,retryMeta.row._row,retryMeta.row.name,retryMeta.row.sku,retryMeta.row.ean,retryMeta.row.category,retryMeta.row.brand,retryMeta.sourcePrice,retryMeta.sellingPrice,parseInt(retryMeta.row.stock)||0,_bulkNormCond(retryMeta.row.condition),retryMsg]).catch(() => {});
+            // Check if there are yet more EANs to try
+            const eanList = Array.isArray(retryMeta.row.ean_list) ? retryMeta.row.ean_list : [retryMeta.row.ean];
+            const usedIdx = eanList.indexOf(retryMeta.row.ean);
+            const nextEan = eanList[usedIdx + 1] ?? null;
+            if (nextEan && /is not a valid product code|reserved GTIN group/i.test(rr?.message || '')) {
+              // Still more EANs — push another retry
+              const updatedRow = { ...retryMeta.row, ean: nextEan };
+              const brandVal   = updatedRow.brand?.trim();
+              const addImgs    = (updatedRow.images || []).slice(1).filter(Boolean);
+              eanRetries.push({
+                prod: {
+                  uid:          updatedRow.sku || `bulk-${updatedRow._row ?? Date.now()}`,
+                  published:    '1',
+                  category_id:  retryMeta.categoryId,
+                  product_name: _bulkTruncateToBytes(updatedRow.name, 150),
+                  ...(brandVal ? { brand_name: brandVal } : { brand_id: 1 }),
+                  default_image: updatedRow.images[0],
+                  ...(addImgs.length         ? { additional_images: addImgs }                                      : {}),
+                  ...(updatedRow.description ? { description: String(updatedRow.description).replace(/[<>]/g, '') } : {}),
+                  product_codes: [nextEan],
+                  ...(updatedRow.mpn             ? { mpn: updatedRow.mpn }                              : {}),
+                  ...(updatedRow.delivery_weight ? { delivery_weight: parseFloat(updatedRow.delivery_weight) } : {}),
+                  ...(updatedRow.summary1 ? { summary_point_one:   updatedRow.summary1 } : {}),
+                  ...(updatedRow.summary2 ? { summary_point_two:   updatedRow.summary2 } : {}),
+                  ...(updatedRow.summary3 ? { summary_point_three: updatedRow.summary3 } : {}),
+                  ...(updatedRow.summary4 ? { summary_point_four:  updatedRow.summary4 } : {}),
+                  ...(updatedRow.summary5 ? { summary_point_five:  updatedRow.summary5 } : {}),
+                },
+                meta: { ...retryMeta, row: updatedRow },
+              });
+              blog(`Phase 3 EAN retry: EAN ${retryMeta.row.ean} also rejected → trying ${nextEan} (${usedIdx + 2}/${eanList.length})`);
+            } else {
+              const retryMsg = nextEan ? `EAN retry failed: ${rr?.message || 'no queue_id'}` : `All EAN(s) exhausted — skipped`;
+              results.errors.push({ row: retryMeta.row._row, product: retryMeta.row.name, error: retryMsg }); results.skipped++;
+              db.query(`INSERT INTO onbuy_bulk_import_items (session_id,user_id,row_number,product_name,sku,ean,category,brand,source_price,selling_price,stock,condition,status,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'error',$13)`,
+                [sessionId,userId,retryMeta.row._row,retryMeta.row.name,retryMeta.row.sku,retryMeta.row.ean,retryMeta.row.category,retryMeta.row.brand,retryMeta.sourcePrice,retryMeta.sellingPrice,parseInt(retryMeta.row.stock)||0,_bulkNormCond(retryMeta.row.condition),retryMsg]).catch(() => {});
+            }
           }
         }
       }
     }
+
     if (pendingToSave.length > 0) {
       blog(`Phase 3: ${pendingToSave.length} queue(s) still pending → background poller`);
       for (const { queueId, meta, uid } of pendingToSave) {
@@ -2473,8 +2562,11 @@ async function processDeleteBrandsJob(job) {
   }
 
   try {
-    const { rows: brandRows } = await db.query(`SELECT brand_name FROM restricted_brands WHERE user_id=$1`, [userId]);
-    if (!brandRows.length) throw new Error('No restricted brands found');
+    // Read from super admin's global brand list
+    const { rows: [admin] } = await db.query(`SELECT id FROM users WHERE role = 'super_admin' LIMIT 1`);
+    if (!admin) throw new Error('No super admin account found');
+    const { rows: brandRows } = await db.query(`SELECT brand_name FROM restricted_brands WHERE user_id=$1`, [admin.id]);
+    if (!brandRows.length) throw new Error('No restricted brands uploaded by admin');
     const brandNames = brandRows.map(r => r.brand_name);
     await db.query(`UPDATE onbuy_delete_brand_jobs SET brands_count=$1 WHERE id=$2`, [brandNames.length, jobId]);
     dlog(`Starting — ${brandNames.length} restricted brand(s): ${brandNames.join(', ')}`);
@@ -2603,6 +2695,143 @@ const deleteBrandsWorker = new Worker('delete-brands', processDeleteBrandsJob, {
 });
 deleteBrandsWorker.on('failed', (job, err) =>
   console.error(`[DeleteBrands] ❌ job ${job?.id} failed: ${err.message}`)
+);
+
+// ── Delete Restricted Products Worker ────────────────────────────────────────
+
+async function processDeleteProductsJob(job) {
+  const { jobId, userId } = job.data;
+  const logFile = join(LOGS_DIR, `user-${userId}-delete-products.log`);
+
+  function dlog(message, level = 'info') {
+    rotatingAppend(logFile, `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}\n`);
+    console.log(`[DeleteProducts][job=${jobId}]`, message);
+    db.query(
+      `INSERT INTO onbuy_delete_product_job_logs (job_id, user_id, message, level) VALUES ($1, $2, $3, $4)`,
+      [jobId, userId, message, level]
+    ).catch(() => {});
+  }
+
+  async function checkCancelled() {
+    const { rows: [j] } = await db.query(`SELECT status FROM onbuy_delete_product_jobs WHERE id=$1`, [jobId]);
+    if (j?.status === 'cancelled') throw Object.assign(new Error('Job cancelled'), { _cancelled: true });
+  }
+
+  try {
+    // Load global restricted product titles
+    const { rows: productRows } = await db.query(`SELECT title FROM restricted_products`);
+    if (!productRows.length) throw new Error('No restricted products found');
+    const productTitles = productRows.map(r => r.title.toLowerCase());
+    await db.query(`UPDATE onbuy_delete_product_jobs SET products_count=$1 WHERE id=$2`, [productTitles.length, jobId]);
+    dlog(`Starting — ${productTitles.length} restricted product title(s)`);
+
+    const { rows: accounts } = await db.query(
+      `SELECT * FROM onbuy_accounts WHERE user_id=$1 AND is_active=true`, [userId]
+    );
+    if (!accounts.length) throw new Error('No active OnBuy accounts found');
+
+    for (const account of accounts) {
+      await checkCancelled();
+      dlog(`── Account: ${account.account_name} ──`);
+
+      let token = await getTokenForAccount(account, { log: (...a) => dlog(a.join(' '), 'warn') });
+      if (!token) { dlog(`Could not get token for ${account.account_name} — skipping`, 'error'); continue; }
+      const siteId = parseInt(account.site_id) || 2000;
+
+      // Scan all listings; match by title substring
+      const toDeleteSet = new Set();
+      let lOffset = 0, lTotal = Infinity;
+
+      while (lOffset < lTotal) {
+        await checkCancelled();
+        let r;
+        try {
+          r = await fetch(
+            `https://api.onbuy.com/v2/listings?site_id=${siteId}&limit=1000&offset=${lOffset}`,
+            { headers: { Authorization: token } }
+          );
+        } catch (e) { dlog(`Error scanning listings: ${e.message}`, 'error'); break; }
+
+        if (r.status === 429) {
+          dlog('Rate limit (429) while scanning listings — waiting 1 hour', 'warn');
+          await new Promise(res => setTimeout(res, 3_600_000));
+          const t = await getTokenForAccount(account); if (t) token = t;
+          continue;
+        }
+        if (r.status === 500) {
+          dlog(`HTTP 500 while scanning listings at offset ${lOffset} — retrying in 10s`, 'warn');
+          await new Promise(res => setTimeout(res, 10_000));
+          continue;
+        }
+        if (!r.ok) { dlog(`HTTP ${r.status} while scanning listings — stopping scan`, 'error'); break; }
+
+        let data;
+        try { data = await r.json(); } catch (e) { dlog(`JSON error: ${e.message}`, 'error'); break; }
+
+        const listings = data.results ?? data.payload ?? data.listings ?? (Array.isArray(data) ? data : []);
+        if (!listings.length) break;
+        lTotal = parseInt(data.metadata?.total_rows ?? listings.length);
+
+        let newThisPage = 0;
+        for (const listing of listings) {
+          const sku   = listing.sku || listing.seller_sku;
+          const title = (listing.name || listing.product_name || listing.title || '').toLowerCase();
+          if (!sku || toDeleteSet.has(sku)) continue;
+          if (productTitles.some(pt => title.includes(pt))) {
+            toDeleteSet.add(sku);
+            newThisPage++;
+          }
+        }
+        lOffset += listings.length;
+        await db.query(`UPDATE onbuy_delete_product_jobs SET listings_scanned=$1, opcs_found=$2 WHERE id=$3`, [lOffset, toDeleteSet.size, jobId]);
+        dlog(`Scanned ${lOffset}/${lTotal} listings — ${toDeleteSet.size} flagged for deletion${newThisPage ? ` (+${newThisPage} this page)` : ''}`);
+        if (lOffset >= lTotal) break;
+      }
+
+      const toDelete = [...toDeleteSet];
+      dlog(`Scan complete — ${toDelete.length} listing(s) to delete`);
+
+      // Delete in batches of 1000
+      let deleted = 0;
+      for (let i = 0; i < toDelete.length; i += 1000) {
+        await checkCancelled();
+        const batch = toDelete.slice(i, i + 1000);
+        try {
+          await fetch('https://api.onbuy.com/v2/listings/by-sku', {
+            method: 'DELETE',
+            headers: { Authorization: token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ site_id: siteId, skus: batch }),
+          });
+          deleted += batch.length;
+          await db.query(`UPDATE onbuy_delete_product_jobs SET listings_deleted=$1 WHERE id=$2`, [deleted, jobId]);
+          dlog(`Deleted ${deleted}/${toDelete.length} listings`);
+          await db.query(
+            `DELETE FROM product_mappings WHERE onbuy_account_id = $1 AND onbuy_sku = ANY($2::text[])`,
+            [account.id, batch],
+          ).catch(() => {});
+        } catch (e) { dlog(`Delete batch error: ${e.message}`, 'error'); }
+      }
+
+      dlog(`Account ${account.account_name} done — deleted ${deleted} listings`);
+    }
+
+    await db.query(`UPDATE onbuy_delete_product_jobs SET status='completed', completed_at=NOW() WHERE id=$1`, [jobId]);
+    dlog('All accounts processed — job complete');
+
+  } catch (err) {
+    if (err._cancelled) { dlog('Job cancelled by user'); return; }
+    dlog(`Fatal error: ${err.message}`, 'error');
+    await db.query(`UPDATE onbuy_delete_product_jobs SET status='failed', completed_at=NOW() WHERE id=$1`, [jobId]).catch(() => {});
+    throw err;
+  }
+}
+
+const deleteProductsWorker = new Worker('delete-products', processDeleteProductsJob, {
+  connection:  redis,
+  concurrency: 1,
+});
+deleteProductsWorker.on('failed', (job, err) =>
+  console.error(`[DeleteProducts] ❌ job ${job?.id} failed: ${err.message}`)
 );
 
 // ─────────────────────────────────────────────
