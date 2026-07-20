@@ -820,17 +820,18 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
     const brand   = iBrand >= 0 ? (cols[iBrand] ?? '').trim() : '';
     const color   = iColor >= 0 ? (cols[iColor] ?? '').trim() : '';
     // EAN field may contain multiple comma-separated codes — use first, keep rest for retry
-    const eanList = (iEan >= 0 ? (cols[iEan] ?? '') : '')
+    const eanListRaw = (iEan >= 0 ? (cols[iEan] ?? '') : '')
       .split(',').map(e => e.trim()).filter(Boolean);
-    const ean = eanList[0] || '';
+    const ean     = eanListRaw[0] || generateEAN13();
+    const eanList = eanListRaw.length ? eanListRaw : [ean];
+    const eanGenerated = !eanListRaw.length;
 
     rows.push({
       _row:     i + 1,
-      valid:    !!(title && price && ean),
+      valid:    !!(title && price),
       errors:   [
         ...(!title ? ['Product Name required'] : []),
         ...(!price ? ['Price required'] : []),
-        ...(!ean   ? ['EAN required — product skipped (no fake EANs)'] : []),
       ],
       name:      title,
       sku:       asin || `HUNT-${Date.now()}-${i}`,
@@ -850,6 +851,7 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
       summary5:  f5,
       ean,
       ean_list:  eanList,
+      ean_generated: eanGenerated,
       mpn:       '',
       delivery_weight: null,
     });
@@ -858,6 +860,14 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
   const valid = rows.filter(r => r.valid).length;
   log(`[Hunt] CSV mapped: ${rows.length} rows total, ${valid} valid`);
   return rows;
+}
+
+// Generate a valid EAN-13 using the 200-prefix internal-use range
+function generateEAN13() {
+  const base = '200' + String(Math.floor(Math.random() * 1e9)).padStart(9, '0');
+  let s = 0;
+  for (let i = 0; i < 12; i++) s += parseInt(base[i]) * (i % 2 === 0 ? 1 : 3);
+  return base + String((10 - s % 10) % 10);
 }
 
 // Find the first matching column index from a list of candidate names

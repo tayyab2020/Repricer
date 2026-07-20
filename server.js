@@ -2544,9 +2544,11 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const category  = getCell(row, 'category');
       const brand     = getCell(row, 'brand');
       // EAN cell may contain multiple comma-separated codes — use first, keep rest for retry
-      const eanRaw    = getCell(row, 'ean');
-      const eanList   = eanRaw.split(',').map(e => e.trim()).filter(Boolean);
-      const ean       = eanList[0] || '';
+      const eanRaw      = getCell(row, 'ean');
+      const eanListRaw  = eanRaw.split(',').map(e => e.trim()).filter(Boolean);
+      const ean         = eanListRaw[0] || generateEAN13();
+      const eanList     = eanListRaw.length ? eanListRaw : [ean];
+      const eanGenerated = !eanListRaw.length;
       const mpn       = getCell(row, 'mpn');
       const condition = normalizeCondition(getCell(row, 'condition'));
       const desc      = getCell(row, 'description');
@@ -2571,7 +2573,6 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const errors = [];
       if (!name)     errors.push('Product Name required');
       if (!category) errors.push('Category Name required');
-      if (!ean)      errors.push('EAN / UPC required — product will be skipped (no fake EANs)');
       if (!price)    errors.push('Price (£) required');
       if (!sku)      errors.push('SKU required');
       if (!stock)    errors.push('Stock must be > 0');
@@ -2581,7 +2582,8 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
       const images = [img1, img2, img3, img4, img5, img6];
       return {
         _row: i + 2, valid: errors.length === 0, errors,
-        name, category, brand, ean, ean_list: eanList, mpn, condition, description: desc,
+        name, category, brand, ean, ean_list: eanList, ean_generated: eanGenerated,
+        mpn, condition, description: desc,
         images,
         sku, price, stock, delivery_weight,
         handling_time, colour, summary1, summary2, summary3, summary4, summary5,
@@ -2594,6 +2596,14 @@ app.post('/api/onbuy-bulk/preview', requireAuth, upload.single('file'), async (r
     res.status(400).json({ error: `Failed to parse file: ${err.message}` });
   }
 });
+
+// Generate a valid EAN-13 in the 200-prefix internal-use range
+function generateEAN13() {
+  const base = '200' + String(Math.floor(Math.random() * 1e9)).padStart(9, '0');
+  let s = 0;
+  for (let i = 0; i < 12; i++) s += parseInt(base[i]) * (i % 2 === 0 ? 1 : 3);
+  return base + String((10 - s % 10) % 10);
+}
 
 const ONBUY_CONDITIONS = new Set(['new', 'used', 'good', 'fair', 'poor', 'refurbished', 'atypical']);
 function normalizeCondition(val) {
