@@ -1713,9 +1713,11 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
   const [rbCount,       setRbCount]       = useState(null);
   const [rbUploading,   setRbUploading]   = useState(false);
   const [rbMsg,         setRbMsg]         = useState(null);
+  const [rbDeleting,    setRbDeleting]    = useState(false);
   const [rpCount,       setRpCount]       = useState(null);
   const [rpUploading,   setRpUploading]   = useState(false);
   const [rpMsg,         setRpMsg]         = useState(null);
+  const [rpDeleting,    setRpDeleting]    = useState(false);
 
   useEffect(() => {
     api("/settings").then(s => {
@@ -2331,6 +2333,24 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
                     {rbUploading ? "⏳ Uploading…" : "📤 Upload Brands Sheet"}
                   </span>
                 </label>
+                {rbCount > 0 && (
+                  <button
+                    disabled={rbDeleting}
+                    onClick={async () => {
+                      if (!window.confirm(`Delete all ${rbCount} restricted brands from the database?`)) return;
+                      setRbDeleting(true); setRbMsg(null);
+                      try {
+                        const r = await api("/restricted-brands", { method: "DELETE" });
+                        setRbCount(0);
+                        setRbMsg({ ok: true, text: "Restricted brands list cleared" });
+                      } catch (err) { setRbMsg({ ok: false, text: err.message }); }
+                      setRbDeleting(false);
+                    }}
+                    style={{ background: "transparent", border: `1px solid ${C.red}`, borderRadius: 6, color: rbDeleting ? C.muted : C.red, cursor: rbDeleting ? "not-allowed" : "pointer", padding: "6px 14px", fontSize: 12, fontWeight: 600 }}
+                  >
+                    {rbDeleting ? "Deleting…" : "🗑 Delete List"}
+                  </button>
+                )}
               </div>
               {rbMsg && <p style={{ color: rbMsg.ok ? C.accent : C.red, fontSize: 12, marginTop: 8 }}>{rbMsg.text}</p>}
               <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>
@@ -2388,6 +2408,24 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
                     {rpUploading ? "⏳ Uploading…" : "📤 Upload Products Sheet"}
                   </span>
                 </label>
+                {rpCount > 0 && (
+                  <button
+                    disabled={rpDeleting}
+                    onClick={async () => {
+                      if (!window.confirm(`Delete all ${rpCount} restricted product titles from the database?`)) return;
+                      setRpDeleting(true); setRpMsg(null);
+                      try {
+                        await api("/admin/restricted-products", { method: "DELETE" });
+                        setRpCount(0);
+                        setRpMsg({ ok: true, text: "Restricted products list cleared" });
+                      } catch (err) { setRpMsg({ ok: false, text: err.message }); }
+                      setRpDeleting(false);
+                    }}
+                    style={{ background: "transparent", border: `1px solid ${C.red}`, borderRadius: 6, color: rpDeleting ? C.muted : C.red, cursor: rpDeleting ? "not-allowed" : "pointer", padding: "6px 14px", fontSize: 12, fontWeight: 600 }}
+                  >
+                    {rpDeleting ? "Deleting…" : "🗑 Delete List"}
+                  </button>
+                )}
               </div>
               {rpMsg && <p style={{ color: rpMsg.ok ? C.accent : C.red, fontSize: 12, marginTop: 8 }}>{rpMsg.text}</p>}
               <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>

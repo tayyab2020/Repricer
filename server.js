@@ -3661,9 +3661,11 @@ app.post('/api/restricted-brands/upload', requireAuth, requireAdmin, upload.sing
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-    const brands = rows.slice(1)
-      .map(r => String(r[0] || '').trim())
-      .filter(Boolean);
+    const brands = [...new Set(
+      rows.slice(1)
+        .map(r => String(r[0] || '').trim())
+        .filter(Boolean)
+    )];
     if (!brands.length) return res.status(400).json({ error: 'No brands found in file' });
     // Store under the super admin's own user_id so all delete-brands jobs can read from it
     const adminId = req.user.userId;
@@ -3727,6 +3729,27 @@ app.post('/api/admin/restricted-products/upload', requireAuth, requireAdmin, upl
       [titles]
     );
     res.json({ count: titles.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/restricted-brands — super admin clears the entire global brand list
+app.delete('/api/restricted-brands', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const adminId = req.user.userId;
+    await db.query('DELETE FROM restricted_brands WHERE user_id = $1', [adminId]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/admin/restricted-products — super admin clears the entire global products list
+app.delete('/api/admin/restricted-products', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await db.query('TRUNCATE restricted_products');
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

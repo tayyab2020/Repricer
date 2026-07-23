@@ -308,7 +308,7 @@ const MANUAL_HEADERS = new Set([
 const FORMULA_COLUMNS = {
   'Total Fee':  (ci, r) => `=SUM(${colIdxToLetter(ci['Onbuy Fee'])}${r}:${colIdxToLetter(ci['VAT'])}${r})`,
   'Total Cost': (ci, r) => `=${colIdxToLetter(ci['Total Fee'])}${r}+${colIdxToLetter(ci['Source Price'])}${r}`,
-  'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}-${colIdxToLetter(ci['Delivery Fee'])}${r}`,
+  'Net Profit': (ci, r) => `=${colIdxToLetter(ci['Selling Price'])}${r}-${colIdxToLetter(ci['Total Cost'])}${r}`,
   'ROI %':      (ci, r) => `=IF(${colIdxToLetter(ci['Source Price'])}${r}=0,0,${colIdxToLetter(ci['Net Profit'])}${r}/${colIdxToLetter(ci['Source Price'])}${r}*100)`,
 };
 
@@ -400,6 +400,10 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       byTab.get(tab).push({ order, product, vatRate });
     }
   }
+  // Always include the current month's tab so the formula sweep and dispatch counter
+  // update run even on quiet periods when no orders were fetched.
+  const _currentTabName = monthTabName();
+  if (!byTab.has(_currentTabName)) byTab.set(_currentTabName, []);
 
   const meta     = (await sheets.spreadsheets.get({ spreadsheetId })).data;
   const knownTabs    = new Set((meta.sheets ?? []).map(s => s.properties?.title));
@@ -553,26 +557,6 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
       }).catch(e => log(`[Migration] header rename error: ${e.message}`));
       log(`[Migration] renamed 'Boosted' → 'Boost Fee' in ${headerRenames.length} tab(s)`);
     }
-  }
-
-  // When there are no recently-synced orders (quiet period) but we have a pre-computed
-  // dispatch count, still update V1 on the current month's tab so the counter is current.
-  if (byTab.size === 0 && preComputedDispatchCount !== null) {
-    const currentTabName = monthTabName();
-    if (knownTabs.has(currentTabName)) {
-      try {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId,
-          range: `'${currentTabName}'!W1`,
-          valueInputOption: 'RAW',
-          requestBody: { values: [[`Total Dispatch: ${preComputedDispatchCount}`]] },
-        });
-        log(`No recent orders — updated Total Dispatch: ${preComputedDispatchCount}`);
-      } catch (e) {
-        log(`Dispatch counter update error: ${e.message}`);
-      }
-    }
-    return;
   }
 
   for (const [tabName, items] of byTab) {
@@ -825,6 +809,26 @@ async function syncToGoogleSheet(account, dbOrders, enrichmentMap, log, preCompu
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId,
           requestBody: { valueInputOption: 'USER_ENTERED', data: formulaData },
+        });
+      }
+
+      // Sweep ALL existing rows and rewrite formula columns so that formula changes
+      // (e.g. Net Profit definition) propagate to rows not in the current sync batch.
+      const sweepFormulaData = [];
+      for (let i = 3; i < existingVals.length; i++) {
+        const rowNum = i + 1;
+        const oid = (existingVals[i]?.[orderNumCol] ?? '').toString().trim();
+        if (!oid) continue;
+        for (const [header, formulaFn] of Object.entries(FORMULA_COLUMNS)) {
+          const ci = colIdx[header];
+          if (ci == null) continue;
+          sweepFormulaData.push({ range: `'${tabName}'!${colIdxToLetter(ci)}${rowNum}`, values: [[formulaFn(colIdx, rowNum)]] });
+        }
+      }
+      if (sweepFormulaData.length > 0) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId,
+          requestBody: { valueInputOption: 'USER_ENTERED', data: sweepFormulaData },
         });
       }
 
@@ -1294,17 +1298,30 @@ async function syncAccount(db, account, { fullSync = false } = {}) {
       const todayDispatchCount = dispIds.length;
       log(`Today dispatch orders (${todayDispatchCount}): ${dispIds.join(', ') || 'none'}`);
 
-      // ── Sheet row sync — only for recently-fetched orders ─────────────────────
-      const monthIds = orders.filter(o => tabForOrder(o) === currentTab).map(o => o.order_id);
+      // ── Sheet row sync ────────────────────────────────────────────────────────
+      // Full sync: write ALL current-month orders from DB so the sheet is complete.
+      // Incremental sync: only write recently-fetched orders to minimise API calls.
       let dbRows = [];
-      if (monthIds.length > 0) {
+      if (fullSync) {
+        const now = new Date();
+        const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
         const { rows } = await db.query(
-          `SELECT * FROM onbuy_orders WHERE account_id = $1 AND order_id = ANY($2)`,
-          [account.id, monthIds]
+          `SELECT * FROM onbuy_orders WHERE account_id = $1 AND order_date >= $2 ORDER BY order_date`,
+          [account.id, monthStart]
         );
         dbRows = rows;
+        log(`Full sync: ${dbRows.length} current-month order(s) from DB → sheet`);
       } else {
-        log(`No recent orders for current tab (${currentTab}) — only updating dispatch counter`);
+        const monthIds = orders.filter(o => tabForOrder(o) === currentTab).map(o => o.order_id);
+        if (monthIds.length > 0) {
+          const { rows } = await db.query(
+            `SELECT * FROM onbuy_orders WHERE account_id = $1 AND order_id = ANY($2)`,
+            [account.id, monthIds]
+          );
+          dbRows = rows;
+        } else {
+          log(`No recent orders for current tab (${currentTab}) — only updating dispatch counter`);
+        }
       }
 
       // Always call syncToGoogleSheet so the dispatch counter in V1 is kept current
