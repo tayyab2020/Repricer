@@ -7,22 +7,25 @@ import {
   LayoutDashboard, Link2, TrendingUp, Store, Upload,
   Package, Trash2, ClipboardList, Settings, Terminal,
   Users, Zap, RefreshCw, X, LogOut, Search, ChevronRight, ChevronDown,
+  GitCompare, ShieldCheck, Hash,
 } from "lucide-react";
 
 // ── Nav icon map ─────────────────────────────
 const NAV_ICONS = {
-  "dashboard":        LayoutDashboard,
-  "mappings":         Link2,
-  "current-prices":   TrendingUp,
-  "accounts":         Store,
-  "import":           Upload,
-  "onbuy-bulk":       Package,
-  "delete-listings":  Trash2,
-  "orders":           ClipboardList,
-  "product-hunting":  Search,
-  "settings":         Settings,
-  "logs":             Terminal,
-  "users":            Users,
+  "dashboard":          LayoutDashboard,
+  "mappings":           Link2,
+  "current-prices":     TrendingUp,
+  "accounts":           Store,
+  "import":             Upload,
+  "onbuy-bulk":         Package,
+  "delete-listings":    Trash2,
+  "orders":             ClipboardList,
+  "product-hunting":    Search,
+  "price-comparison":   GitCompare,
+  "proxy-tester":       ShieldCheck,
+  "settings":           Settings,
+  "logs":               Terminal,
+  "users":              Users,
 };
 
 // ── Config ──────────────────────────────────
@@ -635,6 +638,7 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
   const [pageSize, setPageSize] = useState(100);
   const [search, setSearch]     = useState("");
   const [searchInput, setSearchInput] = useState("");
+  const [syncFilter, setSyncFilter]   = useState("");
   const searchTimer  = useRef(null);
   const [clearing, setClearing]   = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -644,9 +648,9 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
     min_price: "", notes: "",
   });
 
-  const load = useCallback((pg = pageNum, sz = pageSize, q = search) => {
+  const load = useCallback((pg = pageNum, sz = pageSize, q = search, sf = syncFilter) => {
     setLoading(true);
-    const params = new URLSearchParams({ page: pg, limit: sz, ...(q ? { search: q } : {}) });
+    const params = new URLSearchParams({ page: pg, limit: sz, ...(q ? { search: q } : {}), ...(sf ? { syncFilter: sf } : {}) });
     api(`/mappings?${params}`)
       .then(data => {
         setMappings(data.rows);
@@ -664,7 +668,7 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
 
   useEffect(() => { load(); }, [load]);
 
-  const reload = () => load(pageNum, pageSize, search);
+  const reload = () => load(pageNum, pageSize, search, syncFilter);
 
   const save = async () => {
     await api("/mappings", { method: "POST", body: JSON.stringify(form) });
@@ -740,12 +744,19 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
     searchTimer.current = setTimeout(() => {
       setSearch(v);
       setPageNum(1);
+      load(1, pageSize, v, syncFilter);
     }, 400);
   };
 
   const handleSizeChange = (v) => {
     setPageSize(Number(v));
     setPageNum(1);
+  };
+
+  const handleSyncFilter = (v) => {
+    setSyncFilter(v);
+    setPageNum(1);
+    load(1, pageSize, search, v);
   };
 
   const handlePageChange = (p) => {
@@ -814,6 +825,21 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
           }}
         />
         <select
+          value={syncFilter}
+          onChange={e => handleSyncFilter(e.target.value)}
+          style={{
+            background:C.surface, border:`1px solid ${syncFilter ? C.accent : C.border}`,
+            borderRadius:8, padding:"7px 10px", color: syncFilter ? C.accent : C.text,
+            fontSize:13, cursor:"pointer", fontWeight: syncFilter ? 600 : 400,
+          }}
+        >
+          <option value="">All (Last Sync)</option>
+          <option value="never">Never Synced</option>
+          <option value="today">Synced Today</option>
+          <option value="week">Synced This Week</option>
+          <option value="stale">Stale (7+ days)</option>
+        </select>
+        <select
           value={pageSize}
           onChange={e => handleSizeChange(e.target.value)}
           style={{
@@ -856,7 +882,12 @@ function MappingsPage({ onSelectMapping, defaultRoi = 20, feePercent = 15 }) {
                 <td style={{ padding:"10px 12px" }}>
                   <span style={{ color:C.text, fontWeight:500 }}>{m.product_name || "Unnamed"}</span>
                   {m.amazon_in_stock === false && (
-                    <span title="Out of stock on Amazon" style={{ color:"#ef4444", fontSize:11, fontWeight:600, marginLeft:6, letterSpacing:"0.02em" }}>⊘ OOS</span>
+                    <span style={{ display:"inline-flex", alignItems:"center", gap:4, marginLeft:6 }}>
+                      <span title="Out of stock on Amazon" style={{ color:"#ef4444", fontSize:11, fontWeight:600, letterSpacing:"0.02em" }}>⊘ OOS</span>
+                      {m.oos_reason === 'late_delivery' && (
+                        <span title="Marked OOS because Amazon delivery date is more than 10 days away" style={{ color:"#f97316", fontSize:10, fontWeight:500, background:"#f9731620", border:"1px solid #f9731650", borderRadius:3, padding:"1px 4px" }}>Late Delivery</span>
+                      )}
+                    </span>
                   )}
                   {m.supplier_count > 0 && (
                     <span style={{ color:C.muted, fontSize:11, marginLeft:6 }}>({m.supplier_count} suppliers)</span>
@@ -1098,62 +1129,129 @@ function ComparePage() {
 
 // ── Current Prices Page ───────────────────────
 function CurrentPricesPage() {
-  const [asin, setAsin]           = useState("");
-  const [result, setResult]       = useState(null);
-  const [loading, setLoading]     = useState(false);
-  const [error, setError]         = useState(null);
-  const [history, setHistory]     = useState([]);
+  const [asin, setAsin]               = useState("");
+  const [accountId, setAccountId]     = useState("");
+  const [accounts, setAccounts]       = useState([]);
+  const [result, setResult]           = useState(null);
+  const [loading, setLoading]         = useState(false);
+  const [error, setError]             = useState(null);
+  const [history, setHistory]         = useState([]);
   const [scraperLogs, setScraperLogs] = useState([]);
-  const [showLogs, setShowLogs]   = useState(false);
+  const [showLogs, setShowLogs]       = useState(false);
+  const logsSinceRef                  = useRef(0);
+  const pollTimerRef                  = useRef(null);
+  const logsEndRef                    = useRef(null);
+
+  useEffect(() => {
+    api("/accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  // Auto-scroll log panel to bottom when new entries arrive
+  useEffect(() => {
+    if (showLogs && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [scraperLogs, showLogs]);
+
+  const appendLogs = (entries) => {
+    if (!entries.length) return;
+    setScraperLogs(prev => [...prev, ...entries]);
+    logsSinceRef.current = Math.max(logsSinceRef.current, ...entries.map(e => e.ts));
+  };
 
   const refreshLogs = () =>
-    api("/scraper-logs").then(setScraperLogs).catch(() => {});
+    api(`/python-scraper-logs?since=${logsSinceRef.current}`).then(appendLogs).catch(() => {});
+
+  const startPolling = () => {
+    if (pollTimerRef.current) return;
+    pollTimerRef.current = setInterval(refreshLogs, 1000);
+  };
+
+  const stopPolling = () => {
+    clearInterval(pollTimerRef.current);
+    pollTimerRef.current = null;
+    // Final fetch to capture any trailing log lines
+    refreshLogs();
+  };
+
+  const selectedAccount = accounts.find(a => String(a.id) === String(accountId));
+  const usesPythonScraper = selectedAccount?.enable_python_scraper === true;
 
   const lookup = async () => {
     const trimmed = asin.trim().toUpperCase();
-    if (!trimmed) return;
+    if (!trimmed || !accountId) return;
     setLoading(true);
     setError(null);
     setResult(null);
+    // Reset log buffer and show panel for new fetch
+    setScraperLogs([]);
+    logsSinceRef.current = 0;
+    setShowLogs(true);
+    startPolling();
     try {
       const data = await api("/price-check", {
         method: "POST",
-        body: JSON.stringify({ asin: trimmed }),
+        body: JSON.stringify({ asin: trimmed, accountId: Number(accountId) }),
       });
       if (data.error) throw new Error(data.error);
       setResult(data);
-      setHistory(prev => [{ ...data, fetchedAt: new Date().toISOString() }, ...prev.slice(0, 9)]);
+      setHistory(prev => [{ ...data, fetchedAt: new Date().toISOString(), accountName: selectedAccount?.account_name } , ...prev.slice(0, 9)]);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
-      refreshLogs();
+      stopPolling();
     }
   };
 
   const handleKey = e => { if (e.key === "Enter") lookup(); };
 
+  const inputStyle = { width: "100%", background: C.bg, border: `1px solid ${C.border}`,
+    color: C.text, borderRadius: 8, padding: "10px 14px", fontSize: 14 };
+  const labelStyle = { display: "block", color: C.textDim, fontSize: 11,
+    textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 };
+
   return (
     <div>
       <Section title="Lookup ASIN">
-        <div style={{ padding: "20px 20px 24px", display: "flex", gap: 12, alignItems: "flex-end" }}>
+        <div style={{ padding: "20px 20px 0" }}>
+          <label style={labelStyle}>OnBuy Account</label>
+          <select
+            value={accountId}
+            onChange={e => setAccountId(e.target.value)}
+            style={{ ...inputStyle, marginBottom: 16, cursor: "pointer" }}
+          >
+            <option value="">— Select an account —</option>
+            {accounts.map(a => (
+              <option key={a.id} value={a.id}>
+                {a.account_name}{a.enable_python_scraper ? " ⚡ Python Scraper" : " · Keepa"}
+              </option>
+            ))}
+          </select>
+          {accountId && (
+            <div style={{ marginBottom: 12, padding: "8px 12px", borderRadius: 7,
+              background: usesPythonScraper ? "#3b82f618" : "#00d4aa12",
+              border: `1px solid ${usesPythonScraper ? C.blue + "44" : C.accent + "44"}`,
+              color: usesPythonScraper ? C.blue : C.accent, fontSize: 12 }}>
+              {usesPythonScraper
+                ? "⚡ Will use Python scraper — real-time price + delivery"
+                : "Using Keepa / legacy scraper for this account"}
+            </div>
+          )}
+        </div>
+        <div style={{ padding: "0 20px 24px", display: "flex", gap: 12, alignItems: "flex-end" }}>
           <div style={{ flex: 1 }}>
-            <label style={{ display: "block", color: C.textDim, fontSize: 11,
-              textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
-              Amazon ASIN
-            </label>
+            <label style={labelStyle}>Amazon ASIN</label>
             <input
               value={asin}
               onChange={e => setAsin(e.target.value)}
               onKeyDown={handleKey}
               placeholder="e.g. B08HVZV3XN"
-              style={{
-                width: "100%", background: C.bg, border: `1px solid ${C.border}`,
-                color: C.text, borderRadius: 8, padding: "10px 14px", fontSize: 14,
-              }}
+              disabled={!accountId}
+              style={{ ...inputStyle, opacity: accountId ? 1 : 0.5 }}
             />
           </div>
-          <Btn onClick={lookup} disabled={loading || !asin.trim()} style={{ flexShrink: 0 }}>
+          <Btn onClick={lookup} disabled={loading || !asin.trim() || !accountId} style={{ flexShrink: 0 }}>
             {loading ? "Fetching…" : "Fetch Price"}
           </Btn>
         </div>
@@ -1219,6 +1317,22 @@ function CurrentPricesPage() {
                       <p style={{ color: C.muted, fontSize: 11, textTransform: "uppercase",
                         letterSpacing: "0.06em", marginBottom: 4 }}>Brand</p>
                       <p style={{ color: C.textDim, fontSize: 13 }}>{result.brand}</p>
+                    </div>
+                  )}
+                  {result.delivery_price != null && (
+                    <div>
+                      <p style={{ color: C.muted, fontSize: 11, textTransform: "uppercase",
+                        letterSpacing: "0.06em", marginBottom: 4 }}>Delivery</p>
+                      <p style={{ color: C.text, fontSize: 13, fontFamily: "monospace" }}>
+                        {result.delivery_price === 0 ? "Free" : `£${parseFloat(result.delivery_price).toFixed(2)}`}
+                      </p>
+                    </div>
+                  )}
+                  {result.delivery_date && (
+                    <div>
+                      <p style={{ color: C.muted, fontSize: 11, textTransform: "uppercase",
+                        letterSpacing: "0.06em", marginBottom: 4 }}>Est. Delivery</p>
+                      <p style={{ color: C.textDim, fontSize: 13 }}>{result.delivery_date}</p>
                     </div>
                   )}
                   {result.rating && (
@@ -1288,10 +1402,15 @@ function CurrentPricesPage() {
       )}
 
       <Section
-        title="Scraper Logs"
+        title={`Scraper Logs${scraperLogs.length ? ` (${scraperLogs.length})` : ""}${loading ? " — live" : ""}`}
         action={
-          <div style={{ display: "flex", gap: 8 }}>
-            <Btn small variant="secondary" onClick={refreshLogs}>↺ Refresh</Btn>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {loading && (
+              <span style={{ color: C.blue, fontSize: 11, animation: "pulse 1.5s infinite" }}>
+                ● live
+              </span>
+            )}
+            <Btn small variant="secondary" onClick={() => { logsSinceRef.current = 0; setScraperLogs([]); refreshLogs(); }}>↺ Refresh</Btn>
             <Btn small variant="secondary" onClick={() => setShowLogs(v => !v)}>
               {showLogs ? "Hide" : "Show"}
             </Btn>
@@ -1309,7 +1428,9 @@ function CurrentPricesPage() {
             maxHeight: 320, overflowY: "auto", background: C.bg,
           }}>
             {scraperLogs.length === 0
-              ? <p style={{ color: C.muted, padding: 8 }}>No logs yet. Run a price fetch to generate logs.</p>
+              ? <p style={{ color: C.muted, padding: 8 }}>
+                  {loading ? "Waiting for Python scraper logs…" : "No logs yet. Run a price fetch to generate logs."}
+                </p>
               : scraperLogs.map((l, i) => (
                 <div key={i} style={{
                   padding: "3px 0", borderBottom: `1px solid ${C.border}20`,
@@ -1322,18 +1443,889 @@ function CurrentPricesPage() {
                     marginRight: 8, fontWeight: 600,
                     color: l.level === "error" ? C.red : l.level === "warn" ? C.amber : C.blue,
                   }}>
-                    [{l.level.toUpperCase()}]
+                    [{l.level?.toUpperCase() ?? "INFO"}]
                   </span>
                   {l.message}
-                  {l.asin && <span style={{ color: C.accent, marginLeft: 6 }}>{l.asin}</span>}
-                  {l.error && <span style={{ color: C.red, marginLeft: 6 }}>— {l.error}</span>}
-                  {l.price && <span style={{ color: C.accent, marginLeft: 6 }}>£{l.price}</span>}
                 </div>
               ))
             }
+            <div ref={logsEndRef} />
           </div>
         )}
       </Section>
+    </div>
+  );
+}
+
+// ── Proxy Tester Page ────────────────────────
+function ProxyTesterPage() {
+  const [accounts, setAccounts]       = useState([]);
+  const [accountId, setAccountId]     = useState("");
+  const [totalCount, setTotalCount]   = useState(500);
+  const [batchSize, setBatchSize]     = useState(100);
+  const [delayMs, setDelayMs]         = useState(3000);
+  const [batchGapMs, setBatchGapMs]   = useState(300000);  // 5 min default
+  const [concurrency, setConcurrency] = useState(3);
+  const [running, setRunning]         = useState(false);
+  const [results, setResults]         = useState([]);
+  const [logs, setLogs]               = useState([]);
+  const [totalScraped, setTotalScraped] = useState(0);
+  const [totalTarget, setTotalTarget]   = useState(0);
+  const [totalBatches, setTotalBatches] = useState(0);
+  const [currentBatch, setCurrentBatch] = useState(0);
+  const [gapInfo, setGapInfo]           = useState(null);
+  const [done, setDone]                 = useState(false);
+  const abortRef                        = useRef(null);
+  const logsEndRef                      = useRef(null);
+  const [, forceUpdate]                 = useState(0);
+
+  // Session history
+  const [sessions, setSessions]               = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [expandedSession, setExpandedSession] = useState(null); // session id
+  const [sessionResults, setSessionResults]   = useState({});   // { [sessionId]: rows[] }
+  const [sessionResultsLoading, setSessionResultsLoading] = useState(false);
+
+  const loadSessions = () => {
+    setSessionsLoading(true);
+    api("/proxy-test/sessions?limit=20")
+      .then(setSessions)
+      .catch(() => {})
+      .finally(() => setSessionsLoading(false));
+  };
+
+  const loadSessionResults = async (id) => {
+    if (sessionResults[id]) { setExpandedSession(id); return; }
+    setSessionResultsLoading(true);
+    try {
+      const rows = await api(`/proxy-test/sessions/${id}/results`);
+      setSessionResults(prev => ({ ...prev, [id]: rows }));
+      setExpandedSession(id);
+    } catch {}
+    setSessionResultsLoading(false);
+  };
+
+  const toggleSession = (id) => {
+    if (expandedSession === id) { setExpandedSession(null); return; }
+    loadSessionResults(id);
+  };
+
+  useEffect(() => { api("/accounts").then(setAccounts).catch(() => {}); loadSessions(); }, []);
+  useEffect(() => {
+    if (logsEndRef.current) logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  // Countdown ticker during gap
+  useEffect(() => {
+    if (!gapInfo) return;
+    const t = setInterval(() => forceUpdate(n => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [gapInfo]);
+
+  const stats = useMemo(() => {
+    if (!results.length) return null;
+    const ok      = results.filter(r => r.status === "ok").length;
+    const noPrice = results.filter(r => r.status === "no-price").length;
+    const errors  = results.filter(r => r.status === "error").length;
+    const times   = results.filter(r => r.elapsed != null).map(r => r.elapsed);
+    const avgMs   = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : 0;
+    return { ok, noPrice, errors, avgMs, total: results.length };
+  }, [results]);
+
+  // Estimated time: totalCount / concurrency * (avgScrapeTime + delay) + gaps
+  const estMinutes = useMemo(() => {
+    const batches    = Math.ceil(totalCount / batchSize);
+    const scrapeTime = 11000; // ~11s avg per scrape
+    const batchTime  = Math.ceil(batchSize / concurrency) * (scrapeTime + delayMs);
+    const totalMs    = batches * batchTime + (batches - 1) * batchGapMs;
+    return Math.round(totalMs / 60000);
+  }, [totalCount, batchSize, delayMs, batchGapMs, concurrency]);
+
+  const gapCountdown = gapInfo
+    ? Math.max(0, Math.round((gapInfo.startedAt + gapInfo.gapMs - Date.now()) / 1000))
+    : 0;
+
+  const start = async () => {
+    if (running) return;
+    setRunning(true);
+    setDone(false);
+    setResults([]);
+    setLogs([]);
+    setTotalScraped(0);
+    setTotalTarget(0);
+    setTotalBatches(0);
+    setCurrentBatch(0);
+    setGapInfo(null);
+
+    const token = localStorage.getItem("repricer_token");
+    try {
+      const resp = await fetch(`${API}/proxy-test/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ accountId: accountId ? Number(accountId) : undefined, totalCount, batchSize, delayMs, batchGapMs, concurrency }),
+        signal: (abortRef.current = new AbortController()).signal,
+      });
+      if (!resp.ok) {
+        const e = await resp.json().catch(() => ({}));
+        setLogs(l => [...l, { level: "error", message: e.error || `HTTP ${resp.status}` }]);
+        setRunning(false);
+        return;
+      }
+      const reader = resp.body.getReader();
+      const dec    = new TextDecoder();
+      let buf      = "";
+      while (true) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) break;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop();
+        for (const part of parts) {
+          const line = part.replace(/^data: /, "").trim();
+          if (!line) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === "start") {
+              setTotalTarget(ev.totalCount);
+              setTotalBatches(ev.totalBatches);
+            }
+            if (ev.type === "log")         setLogs(l => [...l, { level: "info", message: ev.message }]);
+            if (ev.type === "result")      setResults(r => [ev, ...r]);
+            if (ev.type === "batch-start") setCurrentBatch(ev.batchNum);
+            if (ev.type === "batch-end")   setTotalScraped(ev.totalScraped);
+            if (ev.type === "gap-start")   setGapInfo({ startedAt: Date.now(), gapMs: ev.gapMs, nextBatch: ev.nextBatch });
+            if (ev.type === "batch-start") setGapInfo(null);
+            if (ev.type === "done")        { setDone(true); setGapInfo(null); setTotalScraped(ev.totalScraped); loadSessions(); }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      if (e.name !== "AbortError") setLogs(l => [...l, { level: "error", message: e.message }]);
+    } finally {
+      setRunning(false);
+      setGapInfo(null);
+    }
+  };
+
+  const stop = async () => {
+    abortRef.current?.abort();
+    await api("/proxy-test/stop", { method: "POST" }).catch(() => {});
+    setRunning(false);
+    setGapInfo(null);
+  };
+
+  const successRate = stats ? Math.round((stats.ok / stats.total) * 100) : 0;
+  const sel = { background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, padding: "7px 10px", fontSize: 13 };
+  const lbl = { color: C.textDim, fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em" };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* Config panel */}
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: "20px 24px" }}>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-end" }}>
+
+          {/* Account */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Account</label>
+            <select value={accountId} onChange={e => setAccountId(e.target.value)} disabled={running} style={{ ...sel, minWidth: 170 }}>
+              <option value="">All accounts</option>
+              {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+            </select>
+          </div>
+
+          {/* Total */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Total ASINs: <span style={{ color: C.text }}>{totalCount.toLocaleString()}</span></label>
+            <input type="range" min={50} max={5000} step={50} value={totalCount}
+              onChange={e => setTotalCount(Number(e.target.value))} disabled={running}
+              style={{ width: 150, accentColor: C.accent }} />
+          </div>
+
+          {/* Batch size */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Batch size: <span style={{ color: C.text }}>{batchSize}</span></label>
+            <input type="range" min={10} max={500} step={10} value={batchSize}
+              onChange={e => setBatchSize(Number(e.target.value))} disabled={running}
+              style={{ width: 130, accentColor: C.accent }} />
+          </div>
+
+          {/* Delay */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Req delay: <span style={{ color: C.text }}>{(delayMs/1000).toFixed(1)}s</span></label>
+            <input type="range" min={500} max={15000} step={500} value={delayMs}
+              onChange={e => setDelayMs(Number(e.target.value))} disabled={running}
+              style={{ width: 120, accentColor: C.accent }} />
+          </div>
+
+          {/* Concurrency */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Concurrency</label>
+            <select value={concurrency} onChange={e => setConcurrency(Number(e.target.value))} disabled={running} style={sel}>
+              {[1,2,3,4,6,10,15,20,30,50].map(n => <option key={n} value={n}>{n} workers</option>)}
+            </select>
+          </div>
+
+          {/* Gap */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={lbl}>Gap between batches</label>
+            <select value={batchGapMs} onChange={e => setBatchGapMs(Number(e.target.value))} disabled={running} style={sel}>
+              {[[60000,"1 min"],[120000,"2 min"],[300000,"5 min"],[600000,"10 min"],[900000,"15 min"],[1800000,"30 min"]].map(([v,l]) =>
+                <option key={v} value={v}>{l}</option>)}
+            </select>
+          </div>
+
+          {/* Estimate box */}
+          <div style={{ flex: 1, minWidth: 180, background: C.bg, borderRadius: 8, padding: "10px 14px", border: `1px solid ${C.border}` }}>
+            <p style={{ color: C.textDim, fontSize: 11, margin: "0 0 3px", textTransform: "uppercase", letterSpacing: "0.05em" }}>Estimated total time</p>
+            <p style={{ color: C.text, fontSize: 15, margin: 0, fontWeight: 700 }}>
+              ~{estMinutes >= 60 ? `${Math.floor(estMinutes/60)}h ${estMinutes%60}m` : `${estMinutes} min`}
+            </p>
+            <p style={{ color: C.textDim, fontSize: 11, margin: "3px 0 0" }}>
+              {Math.ceil(totalCount/batchSize)} batches · ~{Math.round(totalCount*350/1024)} MB
+            </p>
+          </div>
+
+          {/* Button */}
+          <div style={{ marginLeft: "auto" }}>
+            {running
+              ? <button onClick={stop} style={{ background: C.red, color: "#fff", border: "none", borderRadius: 7, padding: "9px 22px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Stop</button>
+              : <button onClick={start} style={{ background: C.accent, color: "#000", border: "none", borderRadius: 7, padding: "9px 22px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Start Test</button>
+            }
+          </div>
+        </div>
+
+        {/* Progress */}
+        {(running || done) && totalTarget > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, flexWrap: "wrap", gap: 6 }}>
+              <span style={{ color: C.textDim, fontSize: 12 }}>
+                {totalScraped.toLocaleString()} / {totalTarget.toLocaleString()} scraped
+                {totalBatches > 1 && ` · Batch ${currentBatch} of ${totalBatches}`}
+              </span>
+              {gapInfo && gapCountdown > 0 && (
+                <span style={{ color: C.amber, fontSize: 12, fontWeight: 600 }}>
+                  ⏳ Batch {gapInfo.nextBatch} starts in {gapCountdown}s
+                </span>
+              )}
+              {done && <span style={{ color: C.accent, fontSize: 12, fontWeight: 600 }}>✓ Complete</span>}
+            </div>
+            <div style={{ height: 6, background: C.border, borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${(totalScraped / totalTarget) * 100}%`, background: C.accent, transition: "width 0.4s", borderRadius: 4 }} />
+            </div>
+            {/* Batch dots */}
+            {totalBatches > 1 && (
+              <div style={{ display: "flex", gap: 4, marginTop: 8, flexWrap: "wrap" }}>
+                {Array.from({ length: totalBatches }, (_, i) => {
+                  const bNum = i + 1;
+                  const done_ = bNum < currentBatch || (bNum === currentBatch && !running);
+                  const active = bNum === currentBatch && running && !gapInfo;
+                  const waiting = bNum === gapInfo?.nextBatch;
+                  const color = done_ ? C.accent : active ? C.blue : waiting ? C.amber : C.border;
+                  return (
+                    <div key={bNum} title={`Batch ${bNum}`}
+                      style={{ width: 20, height: 6, borderRadius: 3, background: color, transition: "background 0.3s" }} />
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Stats */}
+      {stats && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+          {[
+            { label: "Success Rate", value: `${successRate}%`, color: successRate >= 80 ? C.accent : successRate >= 50 ? C.amber : C.red },
+            { label: "Price Found",  value: stats.ok,          color: C.accent },
+            { label: "No Price",     value: stats.noPrice,     color: C.amber  },
+            { label: "Errors",       value: stats.errors,      color: C.red    },
+            { label: "Avg Response", value: `${(stats.avgMs/1000).toFixed(1)}s`, color: C.blue },
+          ].map(({ label, value, color }) => (
+            <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "14px 16px", textAlign: "center" }}>
+              <p style={{ color, fontSize: 22, fontWeight: 700, margin: 0 }}>{value}</p>
+              <p style={{ color: C.textDim, fontSize: 11, margin: "4px 0 0", textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Session History */}
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <p style={{ color: C.text, fontWeight: 700, fontSize: 14, margin: 0 }}>Session History</p>
+          <button onClick={loadSessions} disabled={sessionsLoading}
+            style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 6, padding: "4px 12px", color: C.textDim, fontSize: 12, cursor: "pointer" }}>
+            {sessionsLoading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+        {sessions.length === 0 && !sessionsLoading && (
+          <p style={{ color: C.textDim, fontSize: 13, padding: "24px 18px", textAlign: "center", margin: 0 }}>No previous sessions found</p>
+        )}
+        {sessions.length > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead style={{ background: C.bg }}>
+                <tr>
+                  {["Date", "Account", "Scraped", "Success", "No Price", "Errors", "Avg/Listing", "Duration", "Status", ""].map(h => (
+                    <th key={h} style={{ padding: "8px 12px", color: C.textDim, fontWeight: 600, textAlign: "left", textTransform: "uppercase", letterSpacing: "0.05em", fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sessions.map(s => {
+                  const successRate = s.total_scraped > 0 ? Math.round((s.success_count / s.total_scraped) * 100) : 0;
+                  const srColor = successRate >= 80 ? C.accent : successRate >= 50 ? C.amber : C.red;
+                  const statusColor = s.status === "done" ? C.accent : s.status === "running" ? C.blue : C.amber;
+                  const startedAt = new Date(s.started_at);
+                  const endedAt = s.ended_at ? new Date(s.ended_at) : null;
+                  const durationSec = endedAt ? Math.round((endedAt - startedAt) / 1000) : null;
+                  const durationStr = durationSec != null
+                    ? durationSec >= 3600 ? `${Math.floor(durationSec/3600)}h ${Math.floor((durationSec%3600)/60)}m`
+                      : durationSec >= 60 ? `${Math.floor(durationSec/60)}m ${durationSec%60}s`
+                      : `${durationSec}s`
+                    : "—";
+                  const isExpanded = expandedSession === s.id;
+                  return (
+                    <Fragment key={s.id}>
+                      <tr style={{ borderTop: `1px solid ${C.border}`, cursor: "pointer" }} onClick={() => toggleSession(s.id)}>
+                        <td style={{ padding: "8px 12px", color: C.textDim, whiteSpace: "nowrap" }}>
+                          {startedAt.toLocaleDateString()} {startedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </td>
+                        <td style={{ padding: "8px 12px", color: C.text }}>{s.account_name || "All accounts"}</td>
+                        <td style={{ padding: "8px 12px", color: C.text, fontWeight: 600 }}>{s.total_scraped.toLocaleString()}</td>
+                        <td style={{ padding: "8px 12px", color: srColor, fontWeight: 700 }}>{successRate}%</td>
+                        <td style={{ padding: "8px 12px", color: C.amber }}>{s.no_price_count}</td>
+                        <td style={{ padding: "8px 12px", color: C.red }}>{s.error_count}</td>
+                        <td style={{ padding: "8px 12px", color: C.textDim }}>
+                          {s.total_scraped > 0 && durationSec ? `~${Math.round(durationSec / s.total_scraped)}s` : "—"}
+                        </td>
+                        <td style={{ padding: "8px 12px", color: C.textDim }}>{durationStr}</td>
+                        <td style={{ padding: "8px 12px" }}>
+                          <span style={{ background: `${statusColor}20`, color: statusColor, fontSize: 11, fontWeight: 700, borderRadius: 4, padding: "2px 7px" }}>
+                            {s.status}
+                          </span>
+                        </td>
+                        <td style={{ padding: "8px 12px", color: C.textDim, fontSize: 11 }}>
+                          {isExpanded ? "▲ hide" : "▼ view"}
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr style={{ borderTop: `1px solid ${C.border}` }}>
+                          <td colSpan={10} style={{ padding: 0, background: C.bg }}>
+                            {sessionResultsLoading && !sessionResults[s.id]
+                              ? <p style={{ color: C.textDim, fontSize: 12, padding: "12px 18px", margin: 0 }}>Loading results…</p>
+                              : (sessionResults[s.id] || []).length === 0
+                                ? <p style={{ color: C.textDim, fontSize: 12, padding: "12px 18px", margin: 0 }}>No results stored for this session</p>
+                                : (
+                                  <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                                      <thead style={{ position: "sticky", top: 0, background: C.bg }}>
+                                        <tr>
+                                          {["#", "ASIN", "Batch", "Price", "In Stock", "Delivery", "Time", "Status"].map(h => (
+                                            <th key={h} style={{ padding: "6px 10px", color: C.textDim, fontWeight: 600, textAlign: "left", whiteSpace: "nowrap" }}>{h}</th>
+                                          ))}
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {(sessionResults[s.id] || []).map((r, i) => {
+                                          const sc = r.status === "ok" ? C.accent : r.status === "no-price" ? C.amber : C.red;
+                                          return (
+                                            <tr key={r.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                                              <td style={{ padding: "5px 10px", color: C.textDim }}>{i + 1}</td>
+                                              <td style={{ padding: "5px 10px" }}>
+                                                <a href={`https://www.amazon.co.uk/dp/${r.asin}`} target="_blank" rel="noreferrer"
+                                                  style={{ color: C.blue, textDecoration: "none", fontWeight: 600 }}>{r.asin}</a>
+                                              </td>
+                                              <td style={{ padding: "5px 10px", color: C.textDim }}>{r.batch_num ?? "—"}</td>
+                                              <td style={{ padding: "5px 10px", color: r.price ? C.accent : C.textDim, fontWeight: r.price ? 700 : 400 }}>{r.price ? `£${r.price}` : "—"}</td>
+                                              <td style={{ padding: "5px 10px", color: r.in_stock ? C.accent : C.textDim }}>{r.in_stock ? "Yes" : "No"}</td>
+                                              <td style={{ padding: "5px 10px", color: C.textDim }}>{r.delivery_date ?? "—"}</td>
+                                              <td style={{ padding: "5px 10px", color: C.textDim }}>{r.elapsed_ms != null ? `${(r.elapsed_ms/1000).toFixed(1)}s` : "—"}</td>
+                                              <td style={{ padding: "5px 10px" }}>
+                                                <span style={{ background: `${sc}20`, color: sc, fontSize: 10, fontWeight: 700, borderRadius: 4, padding: "2px 6px" }}>
+                                                  {r.status === "ok" ? "Found" : r.status === "no-price" ? "No Price" : "Error"}
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                )
+                            }
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16 }}>
+
+        {/* Results table */}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+          <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}` }}>
+            <p style={{ color: C.text, fontWeight: 700, fontSize: 14, margin: 0 }}>Results ({results.length})</p>
+          </div>
+          {results.length === 0 && !running && (
+            <p style={{ color: C.textDim, fontSize: 13, padding: "32px 18px", textAlign: "center", margin: 0 }}>
+              Configure settings above and click Start Test
+            </p>
+          )}
+          {results.length > 0 && (
+            <div style={{ maxHeight: 500, overflowY: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead style={{ position: "sticky", top: 0, background: C.bg, zIndex: 1 }}>
+                  <tr>
+                    {["#", "ASIN", "Batch", "Price", "Stock", "Delivery", "Time", "Status"].map(h => (
+                      <th key={h} style={{ padding: "8px 10px", color: C.textDim, fontWeight: 600, textAlign: "left", textTransform: "uppercase", letterSpacing: "0.05em", fontSize: 11, whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map((r, i) => {
+                    const sc = r.status === "ok" ? C.accent : r.status === "no-price" ? C.amber : C.red;
+                    const sl = r.status === "ok" ? "Found" : r.status === "no-price" ? "No Price" : "Error";
+                    return (
+                      <tr key={r.asin + i} style={{ borderTop: `1px solid ${C.border}` }}>
+                        <td style={{ padding: "7px 10px", color: C.textDim }}>{results.length - i}</td>
+                        <td style={{ padding: "7px 10px" }}>
+                          <a href={`https://www.amazon.co.uk/dp/${r.asin}`} target="_blank" rel="noreferrer"
+                            style={{ color: C.blue, textDecoration: "none", fontWeight: 600, fontSize: 11 }}>{r.asin}</a>
+                        </td>
+                        <td style={{ padding: "7px 10px", color: C.textDim }}>{r.batchNum ?? "—"}</td>
+                        <td style={{ padding: "7px 10px", color: r.price ? C.accent : C.textDim, fontWeight: r.price ? 700 : 400 }}>{r.price ? `£${r.price}` : "—"}</td>
+                        <td style={{ padding: "7px 10px", color: r.inStock ? C.accent : C.textDim }}>{r.inStock ? "In Stock" : r.price ? "Out" : "—"}</td>
+                        <td style={{ padding: "7px 10px", color: C.textDim, fontSize: 11 }}>{r.delivery_date ?? "—"}</td>
+                        <td style={{ padding: "7px 10px", color: C.textDim }}>{r.elapsed != null ? `${(r.elapsed/1000).toFixed(1)}s` : "—"}</td>
+                        <td style={{ padding: "7px 10px" }}>
+                          <span style={{ background: `${sc}20`, color: sc, fontSize: 11, fontWeight: 700, borderRadius: 4, padding: "2px 7px" }}>{sl}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Log */}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}` }}>
+            <p style={{ color: C.text, fontWeight: 700, fontSize: 14, margin: 0 }}>Live Log ({logs.length})</p>
+          </div>
+          <div style={{ flex: 1, overflowY: "auto", maxHeight: 500, padding: "10px 12px", fontFamily: "monospace", fontSize: 11, display: "flex", flexDirection: "column", gap: 2 }}>
+            {logs.length === 0 && <span style={{ color: C.textDim }}>Waiting…</span>}
+            {logs.map((l, i) => (
+              <div key={i} style={{ color: l.level === "error" ? C.red : C.textDim, lineHeight: 1.5 }}>{l.message}</div>
+            ))}
+            <div ref={logsEndRef} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Price Comparison Page ─────────────────────
+function PriceComparisonPage() {
+  const [accounts, setAccounts]       = useState([]);
+  const [accountId, setAccountId]     = useState("");
+  const [asins, setAsins]             = useState([]);
+  const [fileError, setFileError]     = useState(null);
+  const [parsing, setParsing]         = useState(false);
+  const [running, setRunning]         = useState(false);
+  const [done, setDone]               = useState(false);
+  const [results, setResults]         = useState({});   // { [asin]: { python?, keepa?, order } }
+  const [pythonLogs, setPythonLogs]   = useState([]);
+  const [keepaLogs, setKeepaLogs]     = useState([]);
+  const [total, setTotal]             = useState(0);
+  const [pythonDone, setPythonDone]   = useState(false);
+  const [keepaDone, setKeepaoDone]    = useState(false);
+  const abortRef                      = useRef(null);
+  const pyLogsEndRef                  = useRef(null);
+  const kaLogsEndRef                  = useRef(null);
+  const fileInputRef                  = useRef(null);
+
+  useEffect(() => {
+    api("/comparison-accounts").then(setAccounts).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (pyLogsEndRef.current) pyLogsEndRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [pythonLogs]);
+
+  useEffect(() => {
+    if (kaLogsEndRef.current) kaLogsEndRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [keepaLogs]);
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    setFileError(null);
+    setParsing(true);
+    setAsins([]);
+    try {
+      const token = localStorage.getItem("repricer_token");
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch(`${API}/parse-asins-excel`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "Parse failed");
+      setAsins(d.asins);
+    } catch (e) {
+      setFileError(e.message);
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  const startComparison = async () => {
+    if (!accountId || asins.length === 0 || running) return;
+    setRunning(true);
+    setDone(false);
+    setResults({});
+    setPythonLogs([]);
+    setKeepaLogs([]);
+    setTotal(asins.length);
+    setPythonDone(false);
+    setKeepaoDone(false);
+
+    const token = localStorage.getItem("repricer_token");
+    let orderIdx = 0;
+
+    try {
+      const resp = await fetch(`${API}/price-compare/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ accountId: Number(accountId), asins }),
+        signal: (abortRef.current = new AbortController()).signal,
+      });
+
+      if (!resp.ok) {
+        const d = await resp.json().catch(() => ({}));
+        throw new Error(d.error || `HTTP ${resp.status}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done: streamDone, value } = await reader.read();
+        if (streamDone) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop();
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data:")) continue;
+          let ev;
+          try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+          if (ev.type === "python-result") {
+            const o = orderIdx++;
+            setResults(prev => ({ ...prev, [ev.asin]: { ...(prev[ev.asin] || { order: o }), python: ev } }));
+          } else if (ev.type === "keepa-result") {
+            setResults(prev => {
+              const existing = prev[ev.asin] || { order: orderIdx++ };
+              return { ...prev, [ev.asin]: { ...existing, keepa: ev } };
+            });
+          } else if (ev.type === "log") {
+            const entry = { ts: Date.now(), level: ev.level, message: ev.message };
+            if (ev.source === "python") setPythonLogs(p => [...p, entry]);
+            else setKeepaLogs(p => [...p, entry]);
+          } else if (ev.type === "done") {
+            setDone(true);
+            setPythonDone(true);
+            setKeepaoDone(true);
+          }
+        }
+      }
+    } catch (e) {
+      if (e.name !== "AbortError") {
+        setPythonLogs(p => [...p, { ts: Date.now(), level: "error", message: `Stream error: ${e.message}` }]);
+      }
+    } finally {
+      setRunning(false);
+      setDone(true);
+    }
+  };
+
+  const stop = () => {
+    abortRef.current?.abort();
+    setRunning(false);
+  };
+
+  const reset = () => {
+    setAsins([]);
+    setResults({});
+    setPythonLogs([]);
+    setKeepaLogs([]);
+    setDone(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  // Sorted table rows
+  const rows = Object.entries(results)
+    .sort(([, a], [, b]) => (a.order ?? 0) - (b.order ?? 0));
+
+  const pythonCount  = rows.filter(([, r]) => r.python).length;
+  const keepaCount   = rows.filter(([, r]) => r.keepa).length;
+  const bothCount    = rows.filter(([, r]) => r.python && r.keepa).length;
+
+  const priceDiff = (r) => {
+    const pp = parseFloat(r.python?.price);
+    const kp = parseFloat(r.keepa?.price);
+    if (!pp || !kp) return null;
+    return pp - kp;
+  };
+
+  const inputStyle = { width: "100%", background: C.bg, border: `1px solid ${C.border}`,
+    color: C.text, borderRadius: 8, padding: "10px 14px", fontSize: 14 };
+  const labelStyle = { display: "block", color: C.textDim, fontSize: 11,
+    textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 };
+  const logBoxStyle = { fontFamily: "monospace", fontSize: 11, padding: "10px 14px",
+    maxHeight: 220, overflowY: "auto", background: C.bg };
+
+  const LogEntry = ({ e }) => (
+    <div style={{ padding: "2px 0", color: e.level === "error" ? C.red : e.level === "warn" ? C.amber : C.textDim }}>
+      <span style={{ color: C.border, marginRight: 6 }}>{new Date(e.ts).toLocaleTimeString()}</span>
+      <span style={{ marginRight: 6, fontWeight: 600,
+        color: e.level === "error" ? C.red : e.level === "warn" ? C.amber : C.blue }}>
+        [{(e.level || "info").toUpperCase()}]
+      </span>
+      {e.message}
+    </div>
+  );
+
+  const fmtPrice = (p) => p != null && p !== "" ? `£${parseFloat(p).toFixed(2)}` : "—";
+
+  return (
+    <div>
+      {/* ── Setup ── */}
+      <Section title="Setup">
+        <div style={{ padding: "20px 20px 0", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+          {/* Account selector */}
+          <div>
+            <label style={labelStyle}>OnBuy Account</label>
+            {accounts.length === 0
+              ? <p style={{ color: C.amber, fontSize: 13 }}>
+                  No accounts have both Amazon Scraper and Keepa configured.
+                </p>
+              : <select
+                  value={accountId}
+                  onChange={e => setAccountId(e.target.value)}
+                  disabled={running}
+                  style={{ ...inputStyle, cursor: "pointer" }}
+                >
+                  <option value="">— Select account —</option>
+                  {accounts.map(a => (
+                    <option key={a.id} value={a.id}>{a.account_name}</option>
+                  ))}
+                </select>
+            }
+          </div>
+
+          {/* File upload */}
+          <div>
+            <label style={labelStyle}>ASINs File (Excel / CSV)</label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              disabled={running}
+              onChange={e => handleFile(e.target.files[0])}
+              style={{ display: "none" }}
+            />
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <Btn variant="secondary" onClick={() => fileInputRef.current?.click()} disabled={running}>
+                {parsing ? "Parsing…" : "Upload File"}
+              </Btn>
+              {asins.length > 0 && (
+                <span style={{ color: C.accent, fontSize: 13, fontWeight: 600 }}>
+                  {asins.length} ASINs loaded
+                </span>
+              )}
+            </div>
+            {fileError && <p style={{ color: C.red, fontSize: 12, marginTop: 6 }}>{fileError}</p>}
+          </div>
+        </div>
+
+        {/* ASIN preview chips */}
+        {asins.length > 0 && (
+          <div style={{ padding: "12px 20px 0", display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {asins.slice(0, 20).map(a => (
+              <span key={a} style={{ background: C.panel, color: C.textDim, fontSize: 11,
+                fontFamily: "monospace", padding: "3px 8px", borderRadius: 4,
+                border: `1px solid ${C.border}` }}>{a}</span>
+            ))}
+            {asins.length > 20 && (
+              <span style={{ color: C.muted, fontSize: 11, padding: "3px 8px" }}>
+                +{asins.length - 20} more
+              </span>
+            )}
+          </div>
+        )}
+
+        <div style={{ padding: "16px 20px 24px", display: "flex", gap: 12, alignItems: "center" }}>
+          <Btn
+            onClick={startComparison}
+            disabled={running || !accountId || asins.length === 0}
+          >
+            {running ? "Comparing…" : "Start Comparison"}
+          </Btn>
+          {running && (
+            <Btn variant="secondary" onClick={stop}>Stop</Btn>
+          )}
+          {(rows.length > 0 || asins.length > 0) && !running && (
+            <Btn variant="secondary" onClick={reset}>Reset</Btn>
+          )}
+          {running && (
+            <span style={{ color: C.muted, fontSize: 12 }}>
+              Python: {pythonCount}/{total} · Keepa: {keepaCount}/{total}
+            </span>
+          )}
+          {done && rows.length > 0 && (
+            <span style={{ color: C.accent, fontSize: 12, fontWeight: 600 }}>
+              Done — {bothCount}/{total} with both prices
+            </span>
+          )}
+        </div>
+      </Section>
+
+      {/* ── Results Table ── */}
+      {rows.length > 0 && (
+        <Section title={`Results (${rows.length} / ${total})`}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["ASIN", "Title", "Python Price", "Python Stock", "Keepa Price", "Keepa Stock", "Difference", "Delivery"].map(h => (
+                    <th key={h} style={{ color: C.muted, textAlign: "left", padding: "8px 12px",
+                      fontWeight: 500, fontSize: 11, textTransform: "uppercase",
+                      letterSpacing: "0.06em", whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(([asin, r]) => {
+                  const diff = priceDiff(r);
+                  const pp = r.python?.price;
+                  const kp = r.keepa?.price;
+                  return (
+                    <tr key={asin} style={{ borderBottom: `1px solid ${C.border}14` }}>
+                      {/* ASIN */}
+                      <td style={{ padding: "9px 12px" }}>
+                        <a href={`https://www.amazon.co.uk/dp/${asin}`} target="_blank" rel="noreferrer"
+                          style={{ color: C.blue, fontFamily: "monospace", fontSize: 12 }}>
+                          {asin} ↗
+                        </a>
+                      </td>
+
+                      {/* Title */}
+                      <td style={{ padding: "9px 12px", color: C.textDim, maxWidth: 220 }}>
+                        <span style={{ display: "block", overflow: "hidden",
+                          textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12 }}>
+                          {r.python?.title || r.keepa?.title || (r.python?.error || r.keepa?.error ? "—" : "…")}
+                        </span>
+                      </td>
+
+                      {/* Python price */}
+                      <td style={{ padding: "9px 12px", fontFamily: "monospace", fontWeight: 700,
+                        color: r.python?.error ? C.red : pp ? C.accent : C.muted }}>
+                        {r.python
+                          ? r.python.error ? <span title={r.python.error} style={{ fontSize: 11 }}>Error</span> : fmtPrice(pp)
+                          : <span style={{ color: C.border }}>…</span>}
+                      </td>
+
+                      {/* Python in stock */}
+                      <td style={{ padding: "9px 12px",
+                        color: r.python?.inStock ? C.accent : r.python ? C.red : C.border,
+                        fontSize: 12 }}>
+                        {r.python ? (r.python.error ? "—" : r.python.inStock ? "In Stock" : "Out") : "…"}
+                      </td>
+
+                      {/* Keepa price */}
+                      <td style={{ padding: "9px 12px", fontFamily: "monospace", fontWeight: 700,
+                        color: r.keepa?.error ? C.red : kp ? "#a78bfa" : C.muted }}>
+                        {r.keepa
+                          ? r.keepa.error ? <span title={r.keepa.error} style={{ fontSize: 11 }}>Error</span> : fmtPrice(kp)
+                          : <span style={{ color: C.border }}>…</span>}
+                      </td>
+
+                      {/* Keepa in stock */}
+                      <td style={{ padding: "9px 12px",
+                        color: r.keepa?.inStock ? C.accent : r.keepa ? C.red : C.border,
+                        fontSize: 12 }}>
+                        {r.keepa ? (r.keepa.error ? "—" : r.keepa.inStock ? "In Stock" : "Out") : "…"}
+                      </td>
+
+                      {/* Diff */}
+                      <td style={{ padding: "9px 12px", fontFamily: "monospace", fontWeight: 600,
+                        color: diff == null ? C.border : diff > 0 ? C.amber : diff < 0 ? C.red : C.muted }}>
+                        {diff == null ? "—"
+                          : diff === 0 ? "Equal"
+                          : `${diff > 0 ? "+" : ""}£${Math.abs(diff).toFixed(2)}`}
+                      </td>
+
+                      {/* Delivery */}
+                      <td style={{ padding: "9px 12px", color: C.textDim, fontSize: 12 }}>
+                        {r.python?.delivery_price != null
+                          ? r.python.delivery_price === 0 ? "Free" : `£${parseFloat(r.python.delivery_price).toFixed(2)}`
+                          : "—"}
+                        {r.python?.delivery_date ? ` · ${r.python.delivery_date}` : ""}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Section>
+      )}
+
+      {/* ── Live Logs ── */}
+      {(running || pythonLogs.length > 0 || keepaLogs.length > 0) && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+          {/* Python Scraper Logs */}
+          <Section title={`Python Scraper Logs (${pythonLogs.length})${running && !pythonDone ? " — live" : ""}`}>
+            <div style={logBoxStyle}>
+              {pythonLogs.length === 0
+                ? <p style={{ color: C.muted, padding: 4 }}>Waiting…</p>
+                : pythonLogs.map((e, i) => <LogEntry key={i} e={e} />)
+              }
+              <div ref={pyLogsEndRef} />
+            </div>
+          </Section>
+
+          {/* Keepa Logs */}
+          <Section title={`Keepa Logs (${keepaLogs.length})${running && !keepaDone ? " — live" : ""}`}>
+            <div style={logBoxStyle}>
+              {keepaLogs.length === 0
+                ? <p style={{ color: C.muted, padding: 4 }}>Waiting for Keepa to start…</p>
+                : keepaLogs.map((e, i) => <LogEntry key={i} e={e} />)
+              }
+              <div ref={kaLogsEndRef} />
+            </div>
+          </Section>
+        </div>
+      )}
     </div>
   );
 }
@@ -2537,16 +3529,19 @@ export default function App() {
   }, [authToken, pollQueue]);
 
   const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [syncLimitCount, setSyncLimitCount] = useState(50);
+  const [syncLimitActive, setSyncLimitActive] = useState(false);
 
   // ── Gate behind login ───────────────────────
   if (!authToken || !currentUser) {
     return <LoginPage onLogin={login} />;
   }
 
-  const triggerSync = async (onlyUnsynced) => {
+  const triggerSync = async (onlyUnsynced, limitCount = null) => {
     setSyncModalOpen(false);
+    setSyncLimitActive(false);
     setSyncing(true);
-    await api("/sync", { method: "POST", body: JSON.stringify({ onlyUnsynced }) }).catch(console.error);
+    await api("/sync", { method: "POST", body: JSON.stringify({ onlyUnsynced, limitCount }) }).catch(console.error);
     // Poll every second until the queue actually shows busy (jobs enqueued) or
     // 30 s pass without activity — whichever comes first.
     let attempts = 0;
@@ -2578,6 +3573,8 @@ export default function App() {
     { id:"delete-listings",  label:"Delete Listings" },
     { id:"product-hunting",  label:"Product Hunting" },
     { id:"orders",           label:"Orders" },
+    { id:"price-comparison", label:"Price Comparison" },
+    { id:"proxy-tester",    label:"Proxy Tester" },
     { id:"settings",        label:"Settings" },
     { id:"logs",            label:"Live Logs" },
     ...(isAdmin && !isImpersonating ? [{ id:"users", label:"Users" }] : []),
@@ -2757,8 +3754,47 @@ export default function App() {
                 </div>
                 <div className="font-normal text-[12px] mt-1 opacity-70">Only listings with Last Sync = Never</div>
               </button>
+              {/* Sync First N option */}
+              {!syncLimitActive ? (
+                <button
+                  onClick={() => setSyncLimitActive(true)}
+                  className="bg-panel text-foreground border border-separator rounded-lg px-4 py-3 font-semibold text-[14px] text-left hover:bg-panel/80 transition-all duration-150 cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <Hash className="w-4 h-4" />
+                    Sync First N Listings
+                  </div>
+                  <div className="font-normal text-[12px] mt-1 opacity-70">Reprice only the first N listings (oldest synced first)</div>
+                </button>
+              ) : (
+                <div className="bg-panel border border-accent rounded-lg px-4 py-3 flex flex-col gap-2">
+                  <div className="flex items-center gap-2 font-semibold text-[14px] text-foreground">
+                    <Hash className="w-4 h-4 text-accent" />
+                    Sync First N Listings
+                  </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <input
+                      type="number"
+                      min={1}
+                      max={100000}
+                      value={syncLimitCount}
+                      onChange={e => setSyncLimitCount(Math.max(1, parseInt(e.target.value) || 1))}
+                      className="bg-surface border border-separator rounded-md px-3 py-1.5 text-foreground text-[13px] w-28 focus:outline-none focus:border-accent"
+                      autoFocus
+                      onKeyDown={e => e.key === 'Enter' && triggerSync(false, syncLimitCount)}
+                    />
+                    <span className="text-subdued text-[12px]">listings</span>
+                    <button
+                      onClick={() => triggerSync(false, syncLimitCount)}
+                      className="ml-auto bg-accent text-black rounded-md px-3 py-1.5 text-[13px] font-semibold hover:bg-accent/90 cursor-pointer"
+                    >
+                      Start
+                    </button>
+                  </div>
+                </div>
+              )}
               <button
-                onClick={() => setSyncModalOpen(false)}
+                onClick={() => { setSyncModalOpen(false); setSyncLimitActive(false); }}
                 className="text-subdued text-[13px] cursor-pointer hover:text-foreground transition-colors duration-150"
               >
                 Cancel
@@ -2791,6 +3827,7 @@ export default function App() {
             {page === "product-hunting" && "Scrape Keepa bestsellers and import products directly to OnBuy"}
             {page === "orders"          && "View and sync OnBuy orders across all accounts"}
             {page === "sp-api"          && "Fetch Amazon catalog data for any ASIN using SP-API"}
+            {page === "proxy-tester"    && "Test proxy IPs and scraping success rate without updating OnBuy prices"}
             {page === "settings"        && "Configure proxies and global repricer options"}
             {page === "logs"            && "Real-time output from API server and job worker"}
             {page === "users"           && "Manage user accounts and impersonate users"}
@@ -2809,6 +3846,8 @@ export default function App() {
         {page === "delete-listings"  && <DeleteListingsPage />}
         {page === "product-hunting"  && <ProductHuntingPage />}
         {page === "orders"           && <OrdersPage />}
+        {page === "price-comparison" && <PriceComparisonPage />}
+        {page === "proxy-tester"    && <ProxyTesterPage />}
         {page === "sp-api"          && <SpApiPage />}
         {page === "settings"       && <SettingsPage onIntervalChange={setJobInterval} onStartTimeChange={setJobStartTime} isSuperAdmin={isAdmin} appTheme={appTheme} onThemeChange={changeTheme} />}
         {page === "logs"           && <LiveLogsPage />}
@@ -2840,7 +3879,7 @@ export default function App() {
 // ════════════════════════════════════════════
 function AccountsPage() {
   const [accounts, setAccounts] = useState([]);
-  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_puppeteer:false, enable_twister:false, enable_cheerio:false, google_sheet_id:"", google_service_account_json:"", _saFileName:"" };
+  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_python_scraper:false, scraper_proxies:"", google_sheet_id:"", google_service_account_json:"", _saFileName:"" };
   const [form, setForm]         = useState(emptyForm);
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
@@ -3015,32 +4054,35 @@ function AccountsPage() {
               </div>
             </div>
 
-            {/* ── Scraping method toggles (all default off — rely on Keepa) ── */}
+            {/* ── Amazon Scraper (Python scraper, takes priority over Keepa) ── */}
             <div style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 14px", display:"flex", flexDirection:"column", gap:10 }}>
-              <p style={{ color:C.text, fontSize:13, fontWeight:600, margin:0 }}>Amazon scraping methods</p>
-              <p style={{ color:C.muted, fontSize:11, marginTop:0 }}>
-                Enable individual methods to use alongside Keepa. If all are off, only Keepa prices are used.
-              </p>
               <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
                 <div>
-                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Twister API</p>
-                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Fast AJAX endpoint — low overhead, no browser required.</p>
+                  <p style={{ color:C.text, fontSize:13, fontWeight:600, margin:0 }}>Amazon Scraper</p>
+                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>
+                    Uses the Python scraper for real-time Amazon prices. Takes priority over Keepa when enabled. Requires proxies.
+                  </p>
                 </div>
-                <Toggle value={form.enable_twister} onChange={v => setForm(f => ({ ...f, enable_twister:v }))} />
+                <Toggle value={form.enable_python_scraper} onChange={v => {
+                  if (v && !form.scraper_proxies.trim()) {
+                    setErr("Please provide at least one proxy (ip:port:username:password) before enabling Amazon Scraper.");
+                    return;
+                  }
+                  setErr("");
+                  setForm(f => ({ ...f, enable_python_scraper: v }));
+                }} />
               </div>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                <div>
-                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Cheerio (HTML scraping)</p>
-                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Parses Amazon product pages — fallback when Twister returns no price.</p>
-                </div>
-                <Toggle value={form.enable_cheerio} onChange={v => setForm(f => ({ ...f, enable_cheerio:v }))} />
-              </div>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                <div>
-                  <p style={{ color:C.text, fontSize:13, margin:0 }}>Puppeteer (browser fallback)</p>
-                  <p style={{ color:C.muted, fontSize:11, marginTop:2 }}>Full browser session — slowest, used only when Twister + Cheerio both fail.</p>
-                </div>
-                <Toggle value={form.enable_puppeteer} onChange={v => setForm(f => ({ ...f, enable_puppeteer:v }))} />
+              <div>
+                <label style={labelStyle}>Proxies <span style={{ color:C.muted, fontWeight:400, textTransform:"none" }}>(comma-separated, ip:port:username:password)</span></label>
+                <textarea
+                  style={{ ...fieldStyle, minHeight:64, resize:"vertical", fontFamily:"monospace", fontSize:12 }}
+                  placeholder={"1.2.3.4:8080:user:pass, 5.6.7.8:3128:user2:pass2"}
+                  value={form.scraper_proxies}
+                  onChange={e => setForm(f => ({ ...f, scraper_proxies: e.target.value }))}
+                />
+                <p style={{ color:C.muted, fontSize:11, marginTop:4 }}>
+                  Must be in <code>ip:port:username:password</code> format. Required to enable Amazon Scraper.
+                </p>
               </div>
             </div>
 
@@ -3139,15 +4181,10 @@ function AccountsPage() {
                           : <span style={{ background:"#6b728022", color:C.muted, borderRadius:5,
                               padding:"1px 7px", fontSize:11 }}>No Keepa</span>
                         }
-                        {["twister","cheerio","puppeteer"].map(m => {
-                          const on = a[`enable_${m}`] === true;
-                          return (
-                            <span key={m} style={{ background: on ? "#3b82f622" : "#6b728022",
-                              color: on ? C.blue : C.muted, borderRadius:5, padding:"1px 7px", fontSize:11 }}>
-                              {m.charAt(0).toUpperCase()+m.slice(1)} {on ? "on" : "off"}
-                            </span>
-                          );
-                        })}
+                        <span style={{ background: a.enable_python_scraper ? "#3b82f622" : "#6b728022",
+                          color: a.enable_python_scraper ? C.blue : C.muted, borderRadius:5, padding:"1px 7px", fontSize:11 }}>
+                          Amazon Scraper {a.enable_python_scraper ? "on" : "off"}
+                        </span>
                         {a.has_google_sheet
                           ? <span style={{ background:"#22c55e18", color:"#22c55e", borderRadius:5,
                               padding:"1px 7px", fontSize:11, fontWeight:600 }}>
@@ -3177,9 +4214,8 @@ function AccountsPage() {
                         setEditId(a.id);
                         setForm({ account_name:a.account_name, consumer_key:"Loading…", secret_key:"Loading…", site_id:a.site_id,
                           keepa_email:a.keepa_email||"", keepa_password:"",
-                          enable_puppeteer:a.enable_puppeteer===true,
-                          enable_twister:a.enable_twister===true,
-                          enable_cheerio:a.enable_cheerio===true,
+                          enable_python_scraper:a.enable_python_scraper===true,
+                          scraper_proxies:"",
                           google_sheet_id:"", google_service_account_json:"" });
                         try {
                           const full = await api(`/accounts/${a.id}`);
@@ -3187,6 +4223,7 @@ function AccountsPage() {
                             consumer_key: full.consumer_key || "",
                             secret_key:   full.secret_key   || "",
                             keepa_password: full.keepa_password || "",
+                            scraper_proxies: full.scraper_proxies || "",
                             google_sheet_id: full.google_sheet_id || "",
                             google_service_account_json: full.google_service_account
                               ? JSON.stringify(full.google_service_account, null, 2) : "",
@@ -5489,6 +6526,167 @@ function BulkActionsSection({ accounts }) {
   );
 }
 
+function BoostUpdateSection({ accounts }) {
+  const [accountId, setAccountId] = useState("");
+  const [boostValue, setBoostValue] = useState("5");
+  const [scope, setScope]         = useState("all"); // "all" | "specific"
+  const [skuInput, setSkuInput]   = useState("");
+  const [running, setRunning]     = useState(false);
+  const [progress, setProgress]   = useState(null);
+  const [result, setResult]       = useState(null);
+  const [err, setErr]             = useState("");
+
+  async function run() {
+    if (!accountId) { setErr("Please select an OnBuy account"); return; }
+    const boost = parseFloat(boostValue);
+    if (isNaN(boost) || boost < 0 || boost > 100) { setErr("Boost value must be between 0 and 100"); return; }
+
+    let skus = null;
+    if (scope === "specific") {
+      skus = skuInput.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+      if (!skus.length) { setErr("Enter at least one SKU"); return; }
+    }
+
+    setErr(""); setRunning(true); setResult(null);
+    setProgress(scope === "all" ? { phase: "fetching", fetched: 0, total: null } : { phase: "updating", updated: 0, failed: 0, total: skus.length });
+
+    const token = localStorage.getItem("repricer_token");
+    try {
+      const response = await fetch(`${API}/listings/update-boost`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ onbuy_account_id: accountId, boost_value: boost, skus }),
+      });
+      if (response.status === 401) { localStorage.removeItem("repricer_token"); window.location.reload(); return; }
+      if (!response.ok) { const t = await response.text(); throw new Error(t); }
+      await readSseStream(response, evt => {
+        if (evt.error) { setErr(evt.error); return; }
+        if (evt.phase === "done") { setResult(evt); setProgress(null); }
+        else setProgress(evt);
+      });
+    } catch (e) { setErr(e.message); }
+    setRunning(false);
+  }
+
+  const pct = progress?.total
+    ? Math.round(((progress.updated ?? 0) + (progress.failed ?? 0)) / progress.total * 100)
+    : (progress?.phase === "fetching" ? 0 : 0);
+
+  const PURPLE = "#a855f7";
+
+  return (
+    <Section title="Boost Commission Update" style={{ marginTop: 24 }}>
+      <div style={{ padding: "16px 20px" }}>
+
+        {/* Account + boost value row */}
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 16 }}>
+          <div style={{ flex: "1 1 220px" }}>
+            <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>OnBuy Account</label>
+            <select value={accountId} onChange={e => { setAccountId(e.target.value); setErr(""); }}
+              style={{ background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+                borderRadius: 8, padding: "8px 12px", fontSize: 13, width: "100%" }}>
+              <option value="">Select account…</option>
+              {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "0 0 160px" }}>
+            <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>Boost % (0–100)</label>
+            <input
+              type="number" min="0" max="100" step="0.1"
+              value={boostValue}
+              onChange={e => { setBoostValue(e.target.value); setErr(""); }}
+              style={{ background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+                borderRadius: 8, padding: "8px 12px", fontSize: 13, width: "100%", boxSizing: "border-box" }}
+            />
+          </div>
+        </div>
+
+        {/* Scope toggle */}
+        <div style={{ display: "flex", gap: 0, marginBottom: 14, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden", maxWidth: 320 }}>
+          {[["all", "All Listings"], ["specific", "Specific SKUs"]].map(([val, label]) => (
+            <button key={val} onClick={() => { setScope(val); setErr(""); }}
+              style={{ flex: 1, padding: "7px 12px", fontSize: 12, fontWeight: scope === val ? 700 : 400,
+                background: scope === val ? PURPLE + "22" : "transparent",
+                color: scope === val ? PURPLE : C.muted,
+                border: "none", borderRight: val === "all" ? `1px solid ${C.border}` : "none",
+                cursor: "pointer", transition: "all 0.15s" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* SKU input when specific */}
+        {scope === "specific" && (
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ color: C.muted, fontSize: 12, display: "block", marginBottom: 6 }}>
+              SKUs (one per line or comma-separated)
+            </label>
+            <textarea
+              value={skuInput}
+              onChange={e => { setSkuInput(e.target.value); setErr(""); }}
+              rows={4}
+              placeholder={"B09ABCD1234\nB07XYZ5678"}
+              style={{ width: "100%", background: C.surface, color: C.text,
+                border: `1px solid ${C.border}`, borderRadius: 8, padding: "8px 12px",
+                fontSize: 13, resize: "vertical", boxSizing: "border-box", fontFamily: "monospace" }}
+            />
+            {skuInput.trim() && (
+              <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>
+                {skuInput.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length} SKU(s) entered
+              </div>
+            )}
+          </div>
+        )}
+
+        {err && (
+          <div style={{ background: "#ef444422", border: "1px solid #ef4444", borderRadius: 8,
+            padding: "10px 16px", color: "#ef4444", fontSize: 13, marginBottom: 14 }}>{err}</div>
+        )}
+
+        {/* Run button */}
+        {!running && !result && (
+          <Btn onClick={run}
+            style={{ background: PURPLE, borderColor: PURPLE, color: "#fff" }}>
+            Update Boost Commission
+          </Btn>
+        )}
+
+        {/* Progress */}
+        {running && progress && (
+          <div>
+            <div style={{ color: C.textDim, fontSize: 13, marginBottom: 10 }}>
+              {progress.phase === "fetching"
+                ? `Fetching SKUs… ${(progress.fetched ?? 0).toLocaleString()}${progress.total ? ` / ${Number(progress.total).toLocaleString()}` : ""}`
+                : `Updating boost… ${((progress.updated ?? 0) + (progress.failed ?? 0)).toLocaleString()} / ${(progress.total ?? 0).toLocaleString()}`}
+            </div>
+            <div style={{ background: C.border, borderRadius: 99, height: 8, overflow: "hidden" }}>
+              <div style={{ height: "100%", borderRadius: 99, background: PURPLE,
+                width: `${pct}%`, transition: "width 0.4s ease" }} />
+            </div>
+            <div style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>{pct}%</div>
+          </div>
+        )}
+
+        {/* Result */}
+        {result && (
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
+              <StatCard label="Total"   value={result.total?.toLocaleString()}   color={C.text} />
+              <StatCard label="Updated" value={result.updated?.toLocaleString()} color={PURPLE} />
+              <StatCard label="Failed"  value={result.failed?.toLocaleString()}  color={C.red} />
+            </div>
+            <div style={{ color: C.muted, fontSize: 12, marginBottom: 12 }}>
+              Boost set to <strong style={{ color: PURPLE }}>{boostValue}%</strong> for {result.updated?.toLocaleString()} listing(s).
+            </div>
+            <Btn variant="secondary" small onClick={() => setResult(null)}>Update Again</Btn>
+          </div>
+        )}
+
+      </div>
+    </Section>
+  );
+}
+
 function DeleteListingsPage() {
   const [step, setStep]           = useState(1);
   const [mode, setMode]           = useState("delete"); // "delete" | "oos" | "restock"
@@ -5559,6 +6757,7 @@ function DeleteListingsPage() {
   return (
     <div>
       <BulkActionsSection accounts={accounts} />
+      <BoostUpdateSection accounts={accounts} />
 
       <div style={{ display: "flex", gap: 8, marginBottom: 28, alignItems: "center" }}>
         {STEPS.map((label, i) => (

@@ -9,3 +9,7 @@ frontend/.env
 dist/
 .DS_Store
 .claude/
+__pycache__/
+*.pyc
+*.pyo
+supabase_backup.sql

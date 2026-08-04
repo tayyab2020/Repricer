@@ -1,0 +1,129 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml
+# Usage: docker-compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB:       "${POSTGRES_DB:-repricer}"
+      POSTGRES_USER:     "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-StrongPassword123!}"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Python Amazon Scraper ───────────────────────────────────────────────────
+  python-scraper:
+    build:
+      context: ./python-scraper
+    environment:
+      DELIVERY_POSTCODE:  "${DELIVERY_POSTCODE:-M1 1AE}"
+      ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
+      SCRAPER_WORKERS:    "${SCRAPER_WORKERS:-50}"
+      DELAY_MIN:          "${SCRAPER_DELAY_MIN:-1}"
+      DELAY_MAX:          "${SCRAPER_DELAY_MAX:-3}"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Node.js — API Server ────────────────────────────────────────────────────
+  app:
+    build: .
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      DATABASE_URL:        "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-StrongPassword123!}@postgres:5432/${POSTGRES_DB:-repricer}"
+      REDIS_URL:           "redis://redis:6379"
+      PYTHON_SCRAPER_URL:  "http://python-scraper:8000"
+      JWT_SECRET:          "${JWT_SECRET}"
+      NODE_ENV:            "${NODE_ENV:-production}"
+      PORT:                "4000"
+      DB_SSL:              "false"
+      NODE_OPTIONS:        "--max-old-space-size=2048"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      python-scraper:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  # ── Node.js — Repricer Worker ───────────────────────────────────────────────
+  repricer:
+    build: .
+    command: node repricerJob.js
+    environment:
+      DATABASE_URL:        "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-StrongPassword123!}@postgres:5432/${POSTGRES_DB:-repricer}"
+      REDIS_URL:           "redis://redis:6379"
+      PYTHON_SCRAPER_URL:  "http://python-scraper:8000"
+      NODE_ENV:            "${NODE_ENV:-production}"
+      DB_SSL:              "false"
+      NODE_OPTIONS:        "--max-old-space-size=2048"
+      FAST_WORKERS:        "${FAST_WORKERS:-15}"
+      SLOW_WORKERS:        "${SLOW_WORKERS:-5}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      python-scraper:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  # ── Node.js — Orders Worker ─────────────────────────────────────────────────
+  orders:
+    build: .
+    command: node ordersWorker.js
+    environment:
+      DATABASE_URL:  "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-StrongPassword123!}@postgres:5432/${POSTGRES_DB:-repricer}"
+      REDIS_URL:     "redis://redis:6379"
+      NODE_ENV:      "${NODE_ENV:-production}"
+      DB_SSL:        "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  postgres_data:
+  redis_data:

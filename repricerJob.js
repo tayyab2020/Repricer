@@ -75,7 +75,7 @@ const { Pool } = pg;
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  ssl: (process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false') ? { rejectUnauthorized: false } : false,
 });
 
 // ─────────────────────────────────────────────
@@ -746,6 +746,47 @@ function _incrDailyStats(userId, accountId, priceChanged = false) {
 // Called by both workers after scraping completes
 // ─────────────────────────────────────────────
 
+/**
+ * Parse a delivery date string returned by the Python scraper into a JS Date.
+ * Handles formats like:
+ *   "Friday, 19 August"
+ *   "Friday, 19 August 2026"
+ *   "14-19 August"  (range — returns the EARLIEST date)
+ *   "Thursday, 14 August - Friday, 19 August"  (range — returns earliest)
+ * Returns null when the string can't be parsed.
+ */
+function parseDeliveryDate(str) {
+  if (!str) return null;
+  const MONTHS = {
+    january:0, february:1, march:2, april:3, may:4, june:5,
+    july:6, august:7, september:8, october:9, november:10, december:11,
+  };
+  const lower = str.toLowerCase();
+  let month = null;
+  for (const [name, idx] of Object.entries(MONTHS)) {
+    if (lower.includes(name)) { month = idx; break; }
+  }
+  if (month === null) return null;
+
+  // Extract all numbers from the string; filter to plausible day values (1-31)
+  // and year values (2024-2035) separately.
+  const nums = (str.match(/\d+/g) || []).map(Number);
+  const days  = nums.filter(n => n >= 1 && n <= 31);
+  const years = nums.filter(n => n >= 2024 && n <= 2035);
+
+  const day  = days[days.length - 1];   // latest day in the range (last number that looks like a day)
+  if (!day) return null;
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const year  = years[0] ?? today.getFullYear();
+  const date  = new Date(year, month, day);
+
+  // If the parsed date is in the past and no explicit year was given, assume next year.
+  if (date < today && !years.length) date.setFullYear(today.getFullYear() + 1);
+
+  return date;
+}
+
 async function applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings = {} } = {}) {
   const {
     id,
@@ -788,6 +829,24 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
   // enables check-winning (which only works for SKU-keyed listings).
   const effectiveSku = onbuy_sku || primary_asin || null;
 
+  // ── Delivery-date OOS guard ───────────────────────────────────────────────
+  // If the earliest possible delivery is 10+ days away the item is effectively
+  // unavailable for normal dispatch — treat it as out of stock on OnBuy.
+  let oosReason = null;
+  if (scraped.inStock !== false && scraped.delivery_date) {
+    const delivDate = parseDeliveryDate(scraped.delivery_date);
+    if (delivDate) {
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const daysAway = Math.round((delivDate - today) / 86_400_000);
+      // daysAway <= 0 means same-day or today — never mark OOS regardless of date string.
+      if (daysAway > 10) {
+        ulog(userId, `[Worker] ⚠️  ${label} — delivery "${scraped.delivery_date}" is ${daysAway} day(s) away (>10) — treating as OOS`);
+        scraped = { ...scraped, inStock: false };
+        oosReason = 'late_delivery';
+      }
+    }
+  }
+
   // ── OOS: set OnBuy stock=0 ──
   if (scraped.inStock === false) {
     const wasAlreadyOos = amazon_in_stock === false;
@@ -801,7 +860,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
       ulog(userId, `[Worker] ⏭  ${label} — still OOS, no change`);
     }
     await db.query(
-      `UPDATE product_mappings SET amazon_in_stock = false, last_checked_at = NOW(), last_synced_at = NOW() WHERE id = $1`, [id]
+      `UPDATE product_mappings SET amazon_in_stock = false, oos_reason = $2, last_checked_at = NOW(), last_synced_at = NOW() WHERE id = $1`, [id, oosReason]
     );
     await db.query(
       `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
@@ -820,7 +879,7 @@ async function applyResult(scraped, mapping, token, siteId, { consumerKey, secre
       onbuyUpdater.enqueueStock(token, siteId, effectiveSku, true, 5, { consumerKey, secretKey, userId })
         .catch(err => ulog(userId, `[Worker] ❌ ${label} — stock=5 failed: ${err.message}`));
     }
-    await db.query(`UPDATE product_mappings SET amazon_in_stock = true WHERE id = $1`, [id]);
+    await db.query(`UPDATE product_mappings SET amazon_in_stock = true, oos_reason = NULL WHERE id = $1`, [id]);
   }
 
   // Backfill product name from scraper title when the mapping has none
@@ -950,6 +1009,17 @@ async function processFastJob(job) {
 
 async function _processFastJob(job, mapping, token, siteId, consumerKey, secretKey, userSettings, userId) {
 
+  // Kill-switch: if the user cancelled after this job was enqueued, skip silently.
+  // job.timestamp is BullMQ's enqueue time (ms). cancel clears the flag on next manual sync.
+  if (userId) {
+    try {
+      const cancelledAt = await redis.get(`keepa:cancelled:${userId}`);
+      if (cancelledAt && parseInt(cancelledAt) > (job.timestamp || 0)) {
+        return { success: false, error: 'cancelled' };
+      }
+    } catch {}
+  }
+
   // Resolve listing UID from OPC if we have neither a SKU nor a valid UID.
   // primary_asin is treated as the OnBuy seller SKU when onbuy_sku is not explicitly set
   // (sellers commonly use the ASIN as their OnBuy SKU), so skip OPC resolution in that case.
@@ -982,11 +1052,19 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
     mapping = { ...mapping, onbuy_listing_id: uid, onbuy_opc: opc };
   }
 
-  // ── Keepa price cache check ───────────────────────────────────────────────
+  const { enablePythonScraper = false, scraperProxies = null } = userSettings;
+
+  // ── Python scraper takes priority over Keepa when enabled for this account ──
+  if (enablePythonScraper) {
+    ulog(userId, `[FastWorker] ${mapping.primary_asin} — Python scraper enabled, skipping Keepa cache`);
+    const scraped = await scrapeProductFast(mapping.primary_asin, { proxies: scraperProxies || undefined });
+    return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
+  }
+
+  // ── Keepa price cache check (used only when Python scraper is disabled) ──────
   // Prices are cached per OnBuy account in keepa:prices:{accountId}.
-  // Use the cached price directly and skip all Amazon scraping.
   // Only act on a cached price when it's a positive number — a null entry means
-  // Keepa had no current price (possible OOS), so fall back to live scraping.
+  // Keepa had no current price (possible OOS), so treat as out of stock.
   const keepaCacheKey = mapping.onbuy_account_id
     ? `keepa:prices:${mapping.onbuy_account_id}`
     : null;
@@ -1002,8 +1080,6 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
             mapping, token, siteId, { consumerKey, secretKey, userSettings }
           );
         }
-        // Keepa had no price in any column → item is out of stock on Amazon.
-        // Trust Keepa's OOS signal; do not fall back to live scraping.
         if (cached.inStock === false) {
           ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa: no current price → out of stock`);
           return applyResult(
@@ -1011,57 +1087,16 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
             mapping, token, siteId, { consumerKey, secretKey, userSettings }
           );
         }
-        ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa cache: no price data, falling back to scraper`);
+        ulog(userId, `[FastWorker] ${mapping.primary_asin} — Keepa cache: no price data — skipping`);
       }
     } catch (cacheErr) {
-      ulog(userId, `[FastWorker] Keepa cache read error: ${cacheErr.message} — continuing with scraper`);
+      ulog(userId, `[FastWorker] Keepa cache read error: ${cacheErr.message}`);
     }
   }
 
-  const { enableTwister = false, enableCheerio = false, enablePuppeteer = false } = userSettings;
-
-  // If all three scraping methods are disabled, skip scraping entirely.
-  // The Keepa cache above is the sole price source for this account.
-  if (!enableTwister && !enableCheerio && !enablePuppeteer) {
-    ulog(userId, `[FastWorker] ${mapping.primary_asin} — all scraping methods disabled, no Keepa price — skipping`);
-    return { success: false, error: 'no_scraping_methods' };
-  }
-
-  const scraped = await scrapeProductFast(mapping.primary_asin, { enableTwister, enableCheerio });
-
-  // Escalate to slow queue if Twister + Cheerio both failed (or were skipped).
-  // Skip escalation when puppeteer is disabled for this account — mark as failed instead.
-  // Delay is computed so all remaining fast-queue jobs finish before Puppeteer starts.
-  if (scraped.needsBrowser) {
-    if (!enablePuppeteer) {
-      ulog(userId, `[FastWorker] ${mapping.primary_asin} → needs browser but puppeteer disabled for this account — marking failed`);
-      await db.query(
-        `INSERT INTO sync_logs (product_mapping_id, status, message, created_at)
-         VALUES ($1, 'failed', 'Scrape requires browser (puppeteer disabled for this OnBuy account)', NOW())`,
-        [mapping.id]
-      );
-      _incrDailyStats(mapping.user_id, mapping.onbuy_account_id);
-      return { success: false, error: 'puppeteer_disabled' };
-    }
-
-    const fastCounts = await fastQueue.getJobCounts('waiting', 'active');
-    const queuedFast = fastCounts.waiting;
-    const batches    = Math.ceil(queuedFast / FAST_CONCURRENCY);
-    // 12 s per batch (conservative avg fast-job time) + 10 s buffer
-    const drainMs    = batches * 12000 + 10000;
-    const delay      = Math.max(5000, Math.min(drainMs, 300000)); // 5 s – 5 min cap
-
-    ulog(userId, `[FastWorker] ${mapping.primary_asin} → escalating to slow queue (delay: ${Math.round(delay / 1000)}s, fast remaining: ${queuedFast})`);
-    await slowQueue.add('scrape', { mapping, token, siteId, consumerKey, secretKey, userSettings }, {
-      jobId:             `slow-${mapping.id}`,
-      delay,
-      removeOnComplete:  true,
-      removeOnFail:      true,
-      attempts:          2,
-      backoff:           { type: 'fixed', delay: 15000 },
-    });
-    return { escalated: true };
-  }
+  // Neither Python scraper nor Keepa available — nothing to do.
+  ulog(userId, `[FastWorker] ${mapping.primary_asin} — no scraping method enabled and no Keepa price — skipping`);
+  return { success: false, error: 'no_scraping_methods' };
 
   return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
 }
@@ -1076,6 +1111,16 @@ async function processSlowJob(job) {
   const { mapping, token, siteId, consumerKey, secretKey, userSettings = {} } = job.data;
   const userId = mapping.user_id;
   return jobContext.run({ userId }, async () => {
+    // Kill-switch: same cancel guard as fast worker.
+    if (userId) {
+      try {
+        const cancelledAt = await redis.get(`keepa:cancelled:${userId}`);
+        if (cancelledAt && parseInt(cancelledAt) > (job.timestamp || 0)) {
+          return { success: false, error: 'cancelled' };
+        }
+      } catch {}
+    }
+
     let scraped = await scrapeProductSlow(mapping.primary_asin);
 
     if (scraped.error === 'all_methods_failed') {
@@ -3185,15 +3230,16 @@ redisSub.on('message', (channel, message) => {
     _retryPendingFor.clear();
     _runStartTime = null;
     // Parse message — new format is JSON {userId, onlyUnsynced}; old format was plain userId string
-    let syncUserId = null, onlyUnsynced = false;
+    let syncUserId = null, onlyUnsynced = false, limitCount = null;
     try {
       const parsed = JSON.parse(message);
       syncUserId   = parsed.userId      ?? null;
       onlyUnsynced = parsed.onlyUnsynced ?? false;
+      limitCount   = parsed.limitCount   ?? null;
     } catch {
       syncUserId = message === 'all' ? null : (parseInt(message) || null);
     }
-    runRepricerJob({ userId: syncUserId, onlyUnsynced, log: (...args) => ulog(syncUserId, ...args) })
+    runRepricerJob({ userId: syncUserId, onlyUnsynced, limitCount, log: (...args) => ulog(syncUserId, ...args) })
       .catch(err => wlog('[ManualSync] runRepricerJob error:', err.message));
   }
 });

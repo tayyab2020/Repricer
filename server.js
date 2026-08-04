@@ -12,7 +12,7 @@ import cors from 'cors';
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
-import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus } from './amazonScraper.js';
+import { getProductDetails, getAllSellers, scraperLogs, setProxyApiUrl, getProxyStatus, scrapeProductFast } from './amazonScraper.js';
 import https from 'https';
 import { runRepricerJob, fastQueue, slowQueue, keepaQueue, queuePollerQueue, bulkImportQueue, deleteBrandsQueue, deleteProductsQueue, redis, getTokenForAccount } from './jobProducer.js';
 import IORedis from 'ioredis';
@@ -25,6 +25,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { getLwaAccessToken, fetchAsinCatalog, parseCatalogItem, MARKETPLACES } from './spApiHelper.js';
 import { runProductHunting } from './productHunterScraper.js';
+import { getKeepaPrice } from './keepaScraper.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 try { mkdirSync(join(__dirname, 'logs'), { recursive: true }); } catch {}
@@ -43,7 +44,7 @@ const { Pool } = pg;
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  ssl: (process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false') ? { rejectUnauthorized: false } : false,
 });
 
 // Redis publisher — notifies the worker process when settings change
@@ -267,19 +268,40 @@ app.get('/api/stats', requireAuth, async (req, res) => {
 app.get('/api/mappings', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;
   try {
-    const limit  = Math.min(1000, Math.max(1, parseInt(req.query.limit)  || 100));
-    const page   = Math.max(1,                parseInt(req.query.page)   || 1);
-    const search = (req.query.search || '').trim();
-    const offset = (page - 1) * limit;
+    const limit      = Math.min(1000, Math.max(1, parseInt(req.query.limit)  || 100));
+    const page       = Math.max(1,                parseInt(req.query.page)   || 1);
+    const search     = (req.query.search     || '').trim();
+    const syncFilter = (req.query.syncFilter || '').trim();
+    const offset     = (page - 1) * limit;
 
-    const listWhere  = search
-      ? `WHERE pm.user_id = $3 AND (pm.product_name ILIKE $4 OR pm.primary_asin ILIKE $4 OR pm.onbuy_sku ILIKE $4 OR pm.onbuy_listing_id ILIKE $4)`
-      : `WHERE pm.user_id = $3`;
-    const countWhere = search
-      ? `WHERE user_id = $1 AND (product_name ILIKE $2 OR primary_asin ILIKE $2 OR onbuy_sku ILIKE $2 OR onbuy_listing_id ILIKE $2)`
-      : `WHERE user_id = $1`;
-    const listParams  = search ? [limit, offset, uid, `%${search}%`] : [limit, offset, uid];
-    const countParams = search ? [uid, `%${search}%`] : [uid];
+    const listConds  = ['pm.user_id = $1'];
+    const countConds = ['user_id = $1'];
+    const sharedParams = [uid];
+
+    if (search) {
+      sharedParams.push(`%${search}%`);
+      const i = sharedParams.length;
+      listConds.push(`(pm.product_name ILIKE $${i} OR pm.primary_asin ILIKE $${i} OR pm.onbuy_sku ILIKE $${i} OR pm.onbuy_listing_id ILIKE $${i})`);
+      countConds.push(`(product_name ILIKE $${i} OR primary_asin ILIKE $${i} OR onbuy_sku ILIKE $${i} OR onbuy_listing_id ILIKE $${i})`);
+    }
+
+    if (syncFilter === 'never') {
+      listConds.push('pm.last_synced_at IS NULL');
+      countConds.push('last_synced_at IS NULL');
+    } else if (syncFilter === 'today') {
+      listConds.push('pm.last_synced_at >= CURRENT_DATE');
+      countConds.push('last_synced_at >= CURRENT_DATE');
+    } else if (syncFilter === 'week') {
+      listConds.push(`pm.last_synced_at >= NOW() - INTERVAL '7 days'`);
+      countConds.push(`last_synced_at >= NOW() - INTERVAL '7 days'`);
+    } else if (syncFilter === 'stale') {
+      listConds.push(`(pm.last_synced_at < NOW() - INTERVAL '7 days' OR pm.last_synced_at IS NULL)`);
+      countConds.push(`(last_synced_at < NOW() - INTERVAL '7 days' OR last_synced_at IS NULL)`);
+    }
+
+    const listParams = [...sharedParams, limit, offset];
+    const limitIdx   = listParams.length - 1;
+    const offsetIdx  = listParams.length;
 
     const [{ rows }, countResult] = await Promise.all([
       db.query(`
@@ -288,11 +310,11 @@ app.get('/api/mappings', requireAuth, async (req, res) => {
           (SELECT COUNT(*) FROM supplier_asins sa WHERE sa.product_mapping_id = pm.id) AS supplier_count,
           (SELECT status FROM sync_logs sl WHERE sl.product_mapping_id = pm.id ORDER BY created_at DESC LIMIT 1) AS last_sync_status
         FROM product_mappings pm
-        ${listWhere}
+        WHERE ${listConds.join(' AND ')}
         ORDER BY pm.created_at DESC
-        LIMIT $1 OFFSET $2
+        LIMIT $${limitIdx} OFFSET $${offsetIdx}
       `, listParams),
-      db.query(`SELECT COUNT(*) FROM product_mappings ${countWhere}`, countParams),
+      db.query(`SELECT COUNT(*) FROM product_mappings WHERE ${countConds.join(' AND ')}`, sharedParams),
     ]);
 
     res.json({ rows, total: parseInt(countResult.rows[0].count), page, limit });
@@ -521,10 +543,11 @@ app.post('/api/sync', requireAuth, async (req, res) => {
   try {
     const uid = req.effectiveUserId;
     const onlyUnsynced = req.body?.onlyUnsynced === true;
+    const limitCount   = req.body?.limitCount ? Math.max(1, parseInt(req.body.limitCount)) : null;
     // Clear any post-cancel cooldown so a manual sync always runs immediately
     await redis.del(`keepa:cancelled:${uid}`).catch(() => {});
-    console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid} onlyUnsynced=${onlyUnsynced}`);
-    redisPub.publish('repricer:manual-sync', JSON.stringify({ userId: uid, onlyUnsynced })).catch(() => {});
+    console.log(`[DEBUG /api/sync] ${new Date().toISOString()} — user=${uid} onlyUnsynced=${onlyUnsynced} limitCount=${limitCount ?? 'all'}`);
+    redisPub.publish('repricer:manual-sync', JSON.stringify({ userId: uid, onlyUnsynced, limitCount })).catch(() => {});
     res.json({ message: 'Sync job started successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -624,6 +647,14 @@ app.post('/api/job/cancel', requireAuth, async (req, res) => {
     await redis.del(`repricer:running:${userId}`);
     await redis.set(`keepa:cancelled:${userId}`, Date.now().toString(), 'EX', 7200); // timestamp; worker stops only if cancel is newer than its start time
 
+    // Tell the Python scraper to reject new requests for 60s.
+    // In-flight scrapes already running in threads finish naturally (~10s),
+    // but any new /scrape calls from still-active BullMQ workers are blocked immediately.
+    const pythonUrl = process.env.PYTHON_SCRAPER_URL || 'http://python-scraper:8000';
+    await fetch(`${pythonUrl}/cancel`, { method: 'POST' }).catch(e =>
+      console.warn(`[CancelJob] Python scraper cancel failed: ${e.message}`)
+    );
+
     console.log(`[CancelJob] User ${userId} cancelled ${removed} job(s)`);
     res.json({ ok: true, removed });
   } catch (err) {
@@ -634,6 +665,19 @@ app.post('/api/job/cancel', requireAuth, async (req, res) => {
 // GET /api/scraper-logs — last 200 scraper log entries (in-memory)
 app.get('/api/scraper-logs', requireAuth, (req, res) => {
   res.json(scraperLogs);
+});
+
+// GET /api/python-scraper-logs?since=<epochMs> — proxy to Python scraper log buffer
+const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL ?? 'http://localhost:8000';
+app.get('/api/python-scraper-logs', requireAuth, async (req, res) => {
+  try {
+    const since = req.query.since ?? '0';
+    const resp = await fetch(`${PYTHON_SCRAPER_URL}/logs?since=${encodeURIComponent(since)}`);
+    if (!resp.ok) return res.json([]);
+    res.json(await resp.json());
+  } catch {
+    res.json([]);
+  }
 });
 
 // GET /api/pm2-logs?process=worker|api|all — SSE stream of live log output
@@ -757,12 +801,24 @@ app.get('/api/scraper-logs/file', requireAuth, (req, res) => {
 
 // POST /api/price-check — fetch real-time price for any ASIN
 app.post('/api/price-check', requireAuth, async (req, res) => {
-  const { asin } = req.body;
+  const { asin, accountId } = req.body;
   if (!asin || typeof asin !== 'string' || !/^[A-Z0-9]{10}$/i.test(asin.trim())) {
     return res.status(400).json({ error: 'A valid 10-character ASIN is required' });
   }
+  const cleanAsin = asin.trim().toUpperCase();
   try {
-    const result = await getProductDetails(asin.trim().toUpperCase());
+    if (accountId) {
+      const { rows } = await db.query(
+        `SELECT enable_python_scraper, scraper_proxies FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
+        [accountId, req.effectiveUserId]
+      );
+      const acct = rows[0];
+      if (acct?.enable_python_scraper) {
+        const data = await scrapeProductFast(cleanAsin, { proxies: acct.scraper_proxies || undefined });
+        return res.json({ ...data, url: `https://www.amazon.co.uk/dp/${cleanAsin}?th=1` });
+      }
+    }
+    const result = await getProductDetails(cleanAsin);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -923,6 +979,373 @@ app.get('/api/logs', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PRICE COMPARISON (Amazon Scraper vs Keepa)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/comparison-accounts — accounts that have BOTH python scraper enabled AND keepa credentials
+app.get('/api/comparison-accounts', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, account_name, scraper_proxies
+       FROM onbuy_accounts
+       WHERE user_id = $1
+         AND enable_python_scraper = true
+         AND keepa_email IS NOT NULL AND keepa_email != ''
+         AND keepa_password IS NOT NULL AND keepa_password != ''
+         AND is_active = true
+       ORDER BY account_name`,
+      [req.effectiveUserId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/parse-asins-excel — parse uploaded Excel/CSV and return unique valid ASINs
+app.post('/api/parse-asins-excel', requireAuth, upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+    const asinRe = /^[A-Z0-9]{10}$/i;
+    const seen = new Set();
+    const asins = [];
+
+    // Try to find a column header matching /asin/i; fall back to scanning all cells
+    let asinColIdx = -1;
+    if (rows.length > 0) {
+      const header = rows[0];
+      asinColIdx = header.findIndex(h => /asin/i.test(String(h).trim()));
+    }
+
+    const startRow = asinColIdx >= 0 ? 1 : 0;
+    for (let r = startRow; r < rows.length; r++) {
+      const cells = asinColIdx >= 0 ? [rows[r][asinColIdx]] : rows[r];
+      for (const cell of cells) {
+        const v = String(cell ?? '').trim().toUpperCase();
+        if (asinRe.test(v) && !seen.has(v)) { seen.add(v); asins.push(v); }
+      }
+    }
+
+    if (asins.length === 0) return res.status(400).json({ error: 'No valid ASINs found in file' });
+    res.json({ asins, total: asins.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/price-compare/stream — SSE stream comparing Python scraper vs Keepa for a list of ASINs
+app.post('/api/price-compare/stream', requireAuth, async (req, res) => {
+  const { accountId, asins } = req.body;
+  if (!accountId || !Array.isArray(asins) || asins.length === 0) {
+    return res.status(400).json({ error: 'accountId and non-empty asins array are required' });
+  }
+  const cleanAsins = [...new Set(asins.map(a => String(a).trim().toUpperCase()).filter(a => /^[A-Z0-9]{10}$/.test(a)))];
+  if (cleanAsins.length === 0) return res.status(400).json({ error: 'No valid ASINs provided' });
+
+  try {
+    const { rows } = await db.query(
+      `SELECT keepa_email, keepa_password, scraper_proxies
+       FROM onbuy_accounts
+       WHERE id = $1 AND user_id = $2 AND enable_python_scraper = true
+         AND keepa_email IS NOT NULL AND keepa_password IS NOT NULL`,
+      [accountId, req.effectiveUserId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Account not found or not configured for comparison' });
+    const acct = rows[0];
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    let closed = false;
+    req.on('close', () => { closed = true; });
+
+    const send = (type, data) => {
+      if (!closed) res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+    };
+
+    send('start', { total: cleanAsins.length });
+
+    // Run Python scraper (one ASIN at a time, results stream in) in parallel with
+    // Keepa batch (all ASINs at once, results arrive together at the end)
+    const pythonTask = (async () => {
+      for (const asin of cleanAsins) {
+        if (closed) break;
+        send('log', { source: 'python', level: 'info', message: `Scraping ${asin}…` });
+        try {
+          const r = await scrapeProductFast(asin, { proxies: acct.scraper_proxies || undefined });
+          send('python-result', {
+            asin,
+            price: r.price ?? null,
+            inStock: r.inStock ?? false,
+            title: r.title ?? null,
+            brand: r.brand ?? null,
+            delivery_price: r.delivery_price ?? null,
+            delivery_date: r.delivery_date ?? null,
+          });
+          send('log', { source: 'python', level: 'info',
+            message: `${asin} → ${r.price ? `£${r.price}` : 'no price'} (${r.inStock ? 'in stock' : 'out of stock'})` });
+        } catch (e) {
+          send('python-result', { asin, error: e.message });
+          send('log', { source: 'python', level: 'error', message: `${asin} failed: ${e.message}` });
+        }
+      }
+    })();
+
+    const keepaTask = (async () => {
+      const keepaLog = (msg) => {
+        send('log', { source: 'keepa', level: 'info', message: msg });
+      };
+      try {
+        const results = await getKeepaPrice(cleanAsins, {
+          email: acct.keepa_email,
+          password: acct.keepa_password,
+          log: keepaLog,
+        });
+        for (const [asin, data] of Object.entries(results)) {
+          send('keepa-result', {
+            asin,
+            price: data.price ?? null,
+            inStock: data.inStock ?? false,
+            source: data.source ?? null,
+          });
+        }
+        for (const asin of cleanAsins) {
+          if (!(asin in results)) {
+            send('keepa-result', { asin, price: null, inStock: false, error: 'not found' });
+          }
+        }
+      } catch (e) {
+        send('log', { source: 'keepa', level: 'error', message: `Keepa failed: ${e.message}` });
+        for (const asin of cleanAsins) {
+          send('keepa-result', { asin, price: null, inStock: false, error: e.message });
+        }
+      }
+    })();
+
+    await Promise.allSettled([pythonTask, keepaTask]);
+    send('done', {});
+    res.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+    else res.end();
+  }
+});
+
+// ─────────────────────────────────────────────
+// PROXY TESTER  (scrape-only, no price updates)
+// ─────────────────────────────────────────────
+
+// Body: { accountId?, totalCount, batchSize, delayMs, batchGapMs, concurrency }
+// Streams results per ASIN + batch-start / batch-end / gap-start / done events.
+let _proxyTestAbort = false;
+let _currentProxyTestSessionId = null;
+
+app.post('/api/proxy-test/stop', requireAuth, (req, res) => {
+  _proxyTestAbort = true;
+  res.json({ ok: true });
+});
+
+// GET /api/proxy-test/sessions — list past sessions
+app.get('/api/proxy-test/sessions', requireAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  try {
+    const { rows } = await db.query(
+      `SELECT s.*, a.account_name
+       FROM proxy_test_sessions s
+       LEFT JOIN onbuy_accounts a ON a.id = s.account_id
+       WHERE s.user_id = $1
+       ORDER BY s.started_at DESC LIMIT $2`,
+      [req.effectiveUserId, limit]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/proxy-test/sessions/:id/results — per-ASIN results for a session
+app.get('/api/proxy-test/sessions/:id/results', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT r.* FROM proxy_test_results r
+       JOIN proxy_test_sessions s ON s.id = r.session_id
+       WHERE r.session_id = $1 AND s.user_id = $2
+       ORDER BY r.scraped_at ASC`,
+      [req.params.id, req.effectiveUserId]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/proxy-test/stream', requireAuth, async (req, res) => {
+  const {
+    accountId,
+    totalCount  = 100,
+    batchSize   = 100,
+    delayMs     = 3000,
+    batchGapMs  = 60000,
+    concurrency = 2,
+  } = req.body;
+
+  const safeTotalCount  = Math.min(Math.max(Number(totalCount)  || 100, 1),  5000);
+  const safeBatchSize   = Math.min(Math.max(Number(batchSize)   || 100, 5),  500);
+  const safeDelay       = Math.min(Math.max(Number(delayMs)     || 3000, 0), 30000);
+  const safeBatchGap    = Math.min(Math.max(Number(batchGapMs)  || 60000, 5000), 3600000);
+  const safeConcurrency = Math.min(Math.max(Number(concurrency) || 2, 1), 50);
+  const totalBatches    = Math.ceil(safeTotalCount / safeBatchSize);
+  const sleep           = ms => new Promise(r => setTimeout(r, ms));
+
+  try {
+    // Resolve proxy config
+    let proxies = null;
+    if (accountId) {
+      const { rows } = await db.query(
+        `SELECT scraper_proxies FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
+        [accountId, req.effectiveUserId]
+      );
+      if (rows[0]?.scraper_proxies) proxies = rows[0].scraper_proxies;
+    } else {
+      const { rows } = await db.query(
+        `SELECT scraper_proxies FROM onbuy_accounts
+         WHERE user_id = $1 AND scraper_proxies IS NOT NULL AND scraper_proxies != ''
+         LIMIT 1`,
+        [req.effectiveUserId]
+      );
+      if (rows[0]?.scraper_proxies) proxies = rows[0].scraper_proxies;
+    }
+
+    const whereAccount = accountId ? `AND onbuy_account_id = ${Number(accountId)}` : '';
+
+    // Create session record before opening SSE so errors still return JSON
+    const { rows: [sess] } = await db.query(
+      `INSERT INTO proxy_test_sessions
+         (user_id, account_id, total_count, batch_size, delay_ms, batch_gap_ms, concurrency, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'running') RETURNING id`,
+      [req.effectiveUserId, accountId || null, safeTotalCount, safeBatchSize, safeDelay, safeBatchGap, safeConcurrency]
+    );
+    const sessionId = sess.id;
+    _currentProxyTestSessionId = sessionId;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    _proxyTestAbort = false;
+    let closed = false;
+    req.on('close', async () => {
+      closed = true;
+      // Mark session stopped if browser disconnects before normal completion
+      await db.query(
+        `UPDATE proxy_test_sessions
+         SET status='stopped', ended_at=NOW()
+         WHERE id=$1 AND status='running'`,
+        [sessionId]
+      ).catch(() => {});
+    });
+
+    const send = (type, data) => {
+      if (!closed) res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+    };
+
+    send('start', { totalCount: safeTotalCount, batchSize: safeBatchSize, totalBatches, concurrency: safeConcurrency, sessionId });
+
+    let totalScraped = 0;
+    let successCount = 0, noPriceCount = 0, errorCount = 0;
+
+    for (let batchNum = 1; batchNum <= totalBatches; batchNum++) {
+      if (closed || _proxyTestAbort) break;
+
+      const thisBatchSize = Math.min(safeBatchSize, safeTotalCount - totalScraped);
+
+      // Pick fresh random ASINs for this batch
+      const { rows: mappingRows } = await db.query(
+        `SELECT primary_asin FROM product_mappings
+         WHERE user_id = $1 AND is_active = true AND primary_asin IS NOT NULL ${whereAccount}
+         GROUP BY primary_asin ORDER BY random() LIMIT $2`,
+        [req.effectiveUserId, thisBatchSize]
+      );
+      if (mappingRows.length === 0) break;
+
+      const asinList = mappingRows.map(r => r.primary_asin);
+      send('batch-start', { batchNum, totalBatches, batchSize: asinList.length, totalScraped });
+
+      // Concurrent workers — each grabs the next ASIN from a shared index
+      let idx = 0;
+      const runWorker = async (workerId) => {
+        while (!closed && !_proxyTestAbort) {
+          const i = idx++;
+          if (i >= asinList.length) break;
+          const asin = asinList[i];
+          const t0 = Date.now();
+          send('log', { message: `[B${batchNum} W${workerId}] ${asin}…` });
+          try {
+            const r = await scrapeProductFast(asin, { proxies: proxies || undefined });
+            const elapsed = Date.now() - t0;
+            const resultStatus = r.price != null ? 'ok' : 'no-price';
+            if (resultStatus === 'ok') successCount++; else noPriceCount++;
+            send('result', {
+              asin,
+              batchNum,
+              price:         r.price ?? null,
+              inStock:       r.inStock ?? false,
+              title:         r.title ?? null,
+              delivery_date: r.delivery_date ?? null,
+              elapsed,
+              status:        resultStatus,
+            });
+            db.query(
+              `INSERT INTO proxy_test_results
+                 (session_id, asin, batch_num, price, in_stock, title, delivery_date, elapsed_ms, status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              [sessionId, asin, batchNum, r.price ?? null, r.inStock ?? false,
+               r.title ?? null, r.delivery_date ?? null, elapsed, resultStatus]
+            ).catch(() => {});
+          } catch (e) {
+            errorCount++;
+            send('result', { asin, batchNum, error: e.message, elapsed: Date.now() - t0, status: 'error' });
+            db.query(
+              `INSERT INTO proxy_test_results
+                 (session_id, asin, batch_num, elapsed_ms, status, error)
+               VALUES ($1,$2,$3,$4,'error',$5)`,
+              [sessionId, asin, batchNum, Date.now() - t0, e.message]
+            ).catch(() => {});
+          }
+          if (safeDelay > 0 && !closed && !_proxyTestAbort) await sleep(safeDelay);
+        }
+      };
+
+      await Promise.all(Array.from({ length: safeConcurrency }, (_, i) => runWorker(i + 1)));
+
+      totalScraped += asinList.length;
+      send('batch-end', { batchNum, totalBatches, totalScraped });
+
+      // Gap between batches (except after the last one)
+      if (batchNum < totalBatches && !closed && !_proxyTestAbort) {
+        send('gap-start', { batchNum, nextBatch: batchNum + 1, gapMs: safeBatchGap });
+        await sleep(safeBatchGap);
+      }
+    }
+
+    const finalStatus = (_proxyTestAbort || closed) ? 'stopped' : 'done';
+    send('done', { totalScraped, sessionId, status: finalStatus });
+    await db.query(
+      `UPDATE proxy_test_sessions
+       SET status=$1, total_scraped=$2, success_count=$3, no_price_count=$4, error_count=$5, ended_at=NOW()
+       WHERE id=$6 AND status='running'`,
+      [finalStatus, totalScraped, successCount, noPriceCount, errorCount, sessionId]
+    ).catch(() => {});
+    res.end();
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+    else res.end();
+  }
+});
+
 // ─────────────────────────────────────────────
 // ONBUY ACCOUNTS
 // ─────────────────────────────────────────────
@@ -935,7 +1358,7 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
               LEFT(consumer_key, 6) || '••••••' AS consumer_key_hint,
               keepa_email,
               CASE WHEN keepa_password IS NOT NULL AND keepa_password != '' THEN true ELSE false END AS has_keepa_password,
-              enable_puppeteer, enable_twister, enable_cheerio,
+              enable_python_scraper,
               repricer_enabled, bulk_enabled, orders_enabled,
               google_sheet_id,
               CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet
@@ -951,7 +1374,8 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, account_name, consumer_key, secret_key, site_id, is_active,
-              keepa_email, keepa_password, enable_puppeteer, enable_twister, enable_cheerio,
+              keepa_email, keepa_password,
+              enable_python_scraper, scraper_proxies,
               google_sheet_id, google_service_account
        FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.effectiveUserId]
@@ -964,7 +1388,7 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
 // POST /api/accounts — create account
 app.post('/api/accounts', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id = '2000', keepa_email, keepa_password,
-          enable_puppeteer, enable_twister, enable_cheerio,
+          enable_python_scraper, scraper_proxies,
           google_sheet_id, google_service_account } = req.body;
   if (!account_name || !consumer_key || !secret_key)
     return res.status(400).json({ error: 'account_name, consumer_key and secret_key are required' });
@@ -976,15 +1400,15 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
     }
     const { rows } = await db.query(
       `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id, keepa_email, keepa_password,
-                                   enable_puppeteer, enable_twister, enable_cheerio,
+                                   enable_python_scraper, scraper_proxies,
                                    google_sheet_id, google_service_account)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, account_name, site_id, is_active, created_at, keepa_email,
-                 enable_puppeteer, enable_twister, enable_cheerio, google_sheet_id,
+                 enable_python_scraper, scraper_proxies, google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name, consumer_key, secret_key, site_id, req.effectiveUserId,
        keepa_email || null, keepa_password || null,
-       enable_puppeteer === true, enable_twister === true, enable_cheerio === true,
+       enable_python_scraper === true, scraper_proxies || null,
        google_sheet_id || null, sheetCreds ? JSON.stringify(sheetCreds) : null]
     );
     res.status(201).json(rows[0]);
@@ -994,7 +1418,7 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 // PUT /api/accounts/:id — update account
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
-          enable_puppeteer, enable_twister, enable_cheerio,
+          enable_python_scraper, scraper_proxies,
           repricer_enabled, bulk_enabled, orders_enabled,
           google_sheet_id, google_service_account } = req.body;
   try {
@@ -1017,30 +1441,37 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          is_active              = COALESCE($5, is_active),
          keepa_email            = CASE WHEN $6::text IS NOT NULL THEN NULLIF($6,'') ELSE keepa_email END,
          keepa_password         = CASE WHEN $7::text IS NOT NULL THEN NULLIF($7,'') ELSE keepa_password END,
-         enable_puppeteer       = COALESCE($8,  enable_puppeteer),
-         enable_twister         = COALESCE($9,  enable_twister),
-         enable_cheerio         = COALESCE($10, enable_cheerio),
-         repricer_enabled       = COALESCE($15, repricer_enabled),
-         bulk_enabled           = COALESCE($16, bulk_enabled),
-         orders_enabled         = COALESCE($17, orders_enabled),
-         google_sheet_id        = CASE WHEN $13::text IS NOT NULL THEN NULLIF($13,'') ELSE google_sheet_id END,
-         google_service_account = CASE WHEN $14::text IS NOT NULL THEN $14::jsonb ELSE google_service_account END,
+         enable_python_scraper  = COALESCE($8,  enable_python_scraper),
+         scraper_proxies        = CASE WHEN $9::text IS NOT NULL THEN NULLIF($9,'') ELSE scraper_proxies END,
+         repricer_enabled       = COALESCE($14, repricer_enabled),
+         bulk_enabled           = COALESCE($15, bulk_enabled),
+         orders_enabled         = COALESCE($16, orders_enabled),
+         google_sheet_id        = CASE WHEN $12::text IS NOT NULL THEN NULLIF($12,'') ELSE google_sheet_id END,
+         google_service_account = CASE WHEN $13::text IS NOT NULL THEN $13::jsonb ELSE google_service_account END,
          updated_at             = NOW()
-       WHERE id = $11 AND user_id = $12
+       WHERE id = $10 AND user_id = $11
        RETURNING id, account_name, site_id, is_active, keepa_email,
-                 enable_puppeteer, enable_twister, enable_cheerio,
+                 enable_python_scraper, scraper_proxies,
                  repricer_enabled, bulk_enabled, orders_enabled,
                  google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name || null, consumer_key || null, secret_key || null, site_id || null,
        is_active ?? null, keepa_email ?? null, keepa_password ?? null,
-       enable_puppeteer ?? null, enable_twister ?? null, enable_cheerio ?? null,
+       enable_python_scraper ?? null, scraper_proxies !== undefined ? (scraper_proxies || '') : null,
        req.params.id, req.effectiveUserId,
        google_sheet_id !== undefined ? (google_sheet_id || '') : null,
        sheetCreds !== undefined ? (sheetCreds ?? null) : null,
        repricer_enabled ?? null, bulk_enabled ?? null, orders_enabled ?? null]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    // If proxies were updated, evict the failure/instance cache so the new config is tried immediately
+    if (scraper_proxies !== undefined) {
+      fetch(`${process.env.PYTHON_SCRAPER_URL}/reset-scraper`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxies: rows[0].scraper_proxies || '' }),
+      }).catch(() => {});
+    }
     res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1742,6 +2173,8 @@ async function runMigrations() {
     `ALTER TABLE product_mappings ADD CONSTRAINT product_mappings_markup_type_check CHECK (markup_type IN ('percent', 'fixed', 'roi'))`,
     // track whether Amazon listing is in stock (false = OOS, OnBuy stock set to 0)
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS amazon_in_stock BOOLEAN DEFAULT true`,
+    // reason the listing was marked OOS (e.g. 'late_delivery'); NULL = standard Amazon OOS
+    `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS oos_reason TEXT DEFAULT NULL`,
     // target_price: the desired OnBuy selling price imported from the Excel sheet
     // Used to derive ROI% on the first repricer run when no explicit ROI% was provided
     `ALTER TABLE product_mappings ADD COLUMN IF NOT EXISTS target_price DECIMAL(10,2) DEFAULT NULL`,
@@ -1793,9 +2226,11 @@ async function runMigrations() {
     // Per-account Twister/Cheerio toggles — default off, rely on Keepa by default
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_twister BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_cheerio    BOOLEAN NOT NULL DEFAULT false`,
-    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS repricer_enabled  BOOLEAN NOT NULL DEFAULT true`,
-    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS bulk_enabled      BOOLEAN NOT NULL DEFAULT true`,
-    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled    BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS repricer_enabled      BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS bulk_enabled          BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled        BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_python_scraper BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS scraper_proxies       TEXT`,
     // Index for the repricer job query: ORDER BY last_synced_at per active user avoids a full table scan
     `CREATE INDEX IF NOT EXISTS idx_pm_active_synced ON product_mappings (user_id, last_synced_at ASC NULLS FIRST) WHERE is_active = true`,
     // OnBuy bulk import history tables
@@ -2050,6 +2485,40 @@ async function runMigrations() {
        status       TEXT DEFAULT 'completed',
        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
+    // Proxy tester session history
+    `CREATE TABLE IF NOT EXISTS proxy_test_sessions (
+       id             SERIAL PRIMARY KEY,
+       user_id        INTEGER NOT NULL,
+       account_id     INTEGER,
+       total_count    INTEGER NOT NULL DEFAULT 0,
+       batch_size     INTEGER NOT NULL DEFAULT 100,
+       delay_ms       INTEGER NOT NULL DEFAULT 3000,
+       batch_gap_ms   INTEGER NOT NULL DEFAULT 60000,
+       concurrency    INTEGER NOT NULL DEFAULT 2,
+       total_scraped  INTEGER NOT NULL DEFAULT 0,
+       success_count  INTEGER NOT NULL DEFAULT 0,
+       no_price_count INTEGER NOT NULL DEFAULT 0,
+       error_count    INTEGER NOT NULL DEFAULT 0,
+       status         TEXT    NOT NULL DEFAULT 'running',
+       started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       ended_at       TIMESTAMPTZ
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_pts_user ON proxy_test_sessions(user_id, started_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS proxy_test_results (
+       id            SERIAL PRIMARY KEY,
+       session_id    INTEGER NOT NULL REFERENCES proxy_test_sessions(id) ON DELETE CASCADE,
+       asin          TEXT    NOT NULL,
+       batch_num     INTEGER,
+       price         NUMERIC(10,2),
+       in_stock      BOOLEAN,
+       title         TEXT,
+       delivery_date TEXT,
+       elapsed_ms    INTEGER,
+       status        TEXT    NOT NULL DEFAULT 'ok',
+       error         TEXT,
+       scraped_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_ptr_session ON proxy_test_results(session_id)`,
   ];
   for (const sql of steps) {
     try {
@@ -3641,6 +4110,61 @@ app.post('/api/listings/delete-all', requireAuth, async (req, res) => {
   res.end();
 });
 
+// POST /api/listings/update-boost — set boost_marketing_commission on specific or all listings; streams SSE
+app.post('/api/listings/update-boost', requireAuth, async (req, res) => {
+  const { onbuy_account_id, boost_value, skus } = req.body;
+  if (!onbuy_account_id) return res.status(400).json({ error: 'No account selected' });
+  const boost = parseFloat(boost_value);
+  if (isNaN(boost) || boost < 0 || boost > 100) return res.status(400).json({ error: 'boost_value must be between 0 and 100' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  const send = d => res.write(`data: ${JSON.stringify(d)}\n\n`);
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM onbuy_accounts WHERE id = $1 LIMIT 1`, [onbuy_account_id]);
+    if (!rows[0]) { send({ error: 'Account not found' }); return res.end(); }
+    const token  = await getTokenForAccount(rows[0]);
+    if (!token)  { send({ error: 'Could not obtain auth token' }); return res.end(); }
+    const siteId = parseInt(rows[0].site_id) || 2000;
+
+    let allSkus = Array.isArray(skus) && skus.length ? skus.map(s => String(s).trim()).filter(Boolean) : null;
+
+    if (!allSkus) {
+      send({ phase: 'fetching', fetched: 0, total: null });
+      allSkus = await fetchAllListingSkus(token, siteId, (fetched, total) => {
+        send({ phase: 'fetching', fetched, total });
+      });
+    }
+
+    if (!allSkus.length) { send({ error: 'No listings found for this account' }); return res.end(); }
+
+    let updated = 0, failed = 0;
+    for (let i = 0; i < allSkus.length; i += 1000) {
+      const batch = allSkus.slice(i, i + 1000);
+      const r     = await fetch(`https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`, {
+        method:  'PUT',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ listings: batch.map(sku => ({ sku, boost_marketing_commission: boost })) }),
+      });
+      const data     = await r.json().catch(() => ({}));
+      const batchRes = Array.isArray(data.results) ? data.results : [];
+      const failCnt  = batchRes.filter(item => item.success === false).length;
+      failed  += failCnt;
+      updated += batch.length - failCnt;
+      if (!batchRes.length) updated += batch.length;
+      send({ phase: 'updating', updated, failed, total: allSkus.length });
+    }
+
+    send({ phase: 'done', total: allSkus.length, updated, failed });
+  } catch (e) {
+    send({ error: e.message });
+  }
+  res.end();
+});
+
 // ── Restricted Brands (Super Admin managed) ──────────────────────────────────
 
 // GET /api/restricted-brands/template — download template (super admin only)
@@ -4316,6 +4840,15 @@ app.get('/api/product-hunting/history', requireAuth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ─────────────────────────────────────────────
+// SERVE REACT FRONTEND
+// ─────────────────────────────────────────────
+const frontendDist = join(__dirname, 'frontend', 'dist');
+if (existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  app.get('*', (req, res) => res.sendFile(join(frontendDist, 'index.html')));
+}
 
 // ─────────────────────────────────────────────
 // START SERVER

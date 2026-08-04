@@ -16,7 +16,7 @@ const { Pool } = pg;
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  ssl: (process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false') ? { rejectUnauthorized: false } : false,
   keepAlive: true,                  // TCP keepalives prevent the server from silently dropping idle connections
   connectionTimeoutMillis: 30_000,  // fail fast if the DB is unreachable rather than hanging forever
 });
@@ -299,10 +299,10 @@ async function syncAccountListings(account, db, log) {
   }
 }
 
-export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false } = {}) {
+export async function runRepricerJob({ userId = null, accountId = null, mappingIds = null, log = null, skipKeepa = false, skipCounter = false, fromKeepaFlush = false, onlyUnsynced = false, limitCount = null } = {}) {
   const jlog = log ?? ((...a) => console.log(`[${new Date().toISOString()}]`, ...a));
   jlog('\n' + '═'.repeat(60));
-  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}${accountId ? ` (account ${accountId})` : ''}${mappingIds?.length ? ` — retrying ${mappingIds.length} mapping(s)` : ''}${onlyUnsynced ? ' — unsynced-only' : ''}`);
+  jlog(`[Job] 🚀 Producer started at ${new Date().toISOString()}${userId ? ` (user ${userId})` : ''}${accountId ? ` (account ${accountId})` : ''}${mappingIds?.length ? ` — retrying ${mappingIds.length} mapping(s)` : ''}${onlyUnsynced ? ' — unsynced-only' : ''}${limitCount ? ` — first ${limitCount} listings` : ''}`);
   jlog('═'.repeat(60));
 
   try {
@@ -358,6 +358,10 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
     if (onlyUnsynced) {
       conditions.push('pm.last_synced_at IS NULL');
     }
+    if (limitCount && limitCount > 0) {
+      queryParams.push(parseInt(limitCount));
+    }
+    const limitClause = (limitCount && limitCount > 0) ? `LIMIT $${queryParams.length}` : '';
 
     const { rows: mappings } = await db.query(`
       SELECT pm.id,
@@ -383,14 +387,15 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
              oa.account_name     AS acct_name,
              oa.keepa_email      AS acct_keepa_email,
              oa.keepa_password   AS acct_keepa_password,
-             oa.enable_puppeteer AS acct_enable_puppeteer,
-             oa.enable_twister   AS acct_enable_twister,
-             oa.enable_cheerio   AS acct_enable_cheerio
+             oa.enable_python_scraper AS acct_enable_python_scraper,
+             oa.scraper_proxies       AS acct_scraper_proxies
       FROM product_mappings pm
       LEFT JOIN onbuy_accounts oa
-             ON pm.onbuy_account_id = oa.id AND oa.is_active = true
+             ON pm.onbuy_account_id = oa.id
       WHERE ${conditions.join(' AND ')}
+        AND (pm.onbuy_account_id IS NULL OR (oa.is_active = true AND oa.repricer_enabled = true))
       ORDER BY pm.last_synced_at ASC NULLS FIRST
+      ${limitClause}
     `, queryParams);
 
     if (!mappings.length) {
@@ -584,9 +589,8 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
         defaultRoi:       us.default_roi_percent ? parseFloat(us.default_roi_percent)        : null,
         minRoiPercent:    us.min_roi_percent     ? parseFloat(us.min_roi_percent)            : null,
         proxyApiUrl:      us.webshare_proxy_api  || null,
-        enablePuppeteer:  mapping.acct_enable_puppeteer === true,
-        enableTwister:    mapping.acct_enable_twister   === true,
-        enableCheerio:    mapping.acct_enable_cheerio   === true,
+        enablePythonScraper: mapping.acct_enable_python_scraper === true,
+        scraperProxies:      mapping.acct_scraper_proxies || null,
         forceReprice,
       };
 

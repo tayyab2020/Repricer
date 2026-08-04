@@ -1341,7 +1341,7 @@ async function syncAllAccounts(db) {
   let accounts;
   try {
     const { rows } = await db.query(
-      `SELECT * FROM onbuy_accounts WHERE is_active = true AND orders_enabled = true AND google_sheet_id IS NOT NULL AND google_sheet_id <> '' ORDER BY id`
+      `SELECT * FROM onbuy_accounts WHERE is_active = true AND orders_enabled = true ORDER BY id`
     );
     accounts = rows;
   } catch (e) {
@@ -1360,7 +1360,7 @@ export async function syncAccountsForUser(db, userId) {
   let accounts;
   try {
     const { rows } = await db.query(
-      `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true AND orders_enabled = true AND google_sheet_id IS NOT NULL AND google_sheet_id <> '' ORDER BY id`,
+      `SELECT * FROM onbuy_accounts WHERE user_id = $1 AND is_active = true AND orders_enabled = true ORDER BY id`,
       [userId]
     );
     accounts = rows;
@@ -1379,7 +1379,7 @@ export async function syncAccountsForUser(db, userId) {
 export function startWorker() {
   const db = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    ssl: (process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false') ? { rejectUnauthorized: false } : false,
   });
 
   db.query(`ALTER TABLE onbuy_orders ADD COLUMN IF NOT EXISTS is_dispatched BOOLEAN NOT NULL DEFAULT false`)

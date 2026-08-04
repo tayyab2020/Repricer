@@ -1141,83 +1141,36 @@ export async function getProductDetails(asin, { maxRetries = 3 } = {}) {
 //   scrapeProductSlow  — Puppeteer only
 // ─────────────────────────────────────────────
 
-export async function scrapeProductFast(asin, { enableTwister = true, enableCheerio = true } = {}) {
-  await _fastScrapeLimit.acquire();
-  try {
-    return await _scrapeProductFast(asin, { enableTwister, enableCheerio });
-  } finally {
-    _fastScrapeLimit.release();
-  }
+const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL ?? 'http://localhost:8000';
+
+export async function scrapeProductFast(asin, opts = {}) {
+  const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
+  const body = { asin };
+  if (opts.proxies) body.proxies = opts.proxies;
+  const res = await fetch(`${PYTHON_SCRAPER_URL}/scrape`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(150_000),
+  });
+  if (!res.ok) throw new Error(`Python scraper HTTP ${res.status}`);
+  const data = await res.json();
+  return {
+    asin:           data.asin ?? asin,
+    url,
+    price:          data.price,
+    inStock:        data.inStock,
+    currency:       data.currency ?? 'GBP',
+    title:          data.title,
+    brand:          data.brand,
+    delivery_date:  data.delivery_date,
+    delivery_price: data.delivery_price,
+    method:         'python',
+  };
 }
 
-async function _scrapeProductFast(asin, { enableTwister = true, enableCheerio = true } = {}) {
-  // Jitter inside the semaphore slot so concurrent holders don't all fire at t=0.
-  await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
-
-  const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
-
-  // Step 0: Twister AJAX
-  if (enableTwister) {
-    const twisterResult = await fetchTwisterPrice(asin);
-    if (twisterResult?.price)
-      return { asin, url, price: twisterResult.price, priceSource: 'twister_ajax', inStock: true, method: 'twister_ajax' };
-    if (twisterResult?.responded) {
-      // Twister reached Amazon but found no price — treat as OOS.
-      return { asin, url, price: null, inStock: false, method: 'twister_no_price' };
-    }
-    // twisterResult === null: Twister failed (network/proxy). Fall through to Cheerio.
-  }
-
-  // Step 1: Cheerio HTML
-  if (enableCheerio) {
-    let cheerioResult;
-    try {
-      cheerioResult = await cheerioScrape(url);
-    } catch (err) {
-      log('warn', `Cheerio network error — escalating to Puppeteer: ${err.message}`, { asin });
-      return { asin, url, needsBrowser: true };
-    }
-    if (!cheerioResult.blocked && !cheerioResult.needsBrowser && cheerioResult.price)
-      return { asin, url, ...cheerioResult, method: 'cheerio' };
-    if (cheerioResult.inStock === false)
-      return { asin, url, price: null, inStock: false, method: 'cheerio' };
-  }
-
-  // All enabled fast methods failed (or none were enabled) — signal slow-queue escalation.
-  return { asin, url, needsBrowser: true };
-}
-
-export async function scrapeProductSlow(asin) {
-  const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
-
-  // Rotate through up to 3 random proxies on CAPTCHA instead of giving up immediately.
-  // Each attempt uses a fresh browser + different IP, giving Amazon a new session to evaluate.
-  const pool = await getProxies();
-  const proxiesToTry = pool.length > 0
-    ? [...pool].sort(() => Math.random() - 0.5).slice(0, 3).map(parseProxy)
-    : [];
-
-  for (let i = 0; i < proxiesToTry.length; i++) {
-    const result = await puppeteerScrape(url, { proxy: proxiesToTry[i] });
-    if (!result.blocked && result.price)
-      return { asin, url, ...result, method: 'puppeteer_proxy' };
-    if (result.inStock === false)
-      return { asin, url, price: null, inStock: false, method: 'puppeteer_proxy' };
-    // Only retry with a different proxy if the failure was CAPTCHA/block.
-    // Navigation errors or missing prices don't benefit from an IP swap.
-    if (result.reason !== 'captcha' && result.reason !== 'blocked') break;
-    log('warn', `Puppeteer CAPTCHA on proxy ${i + 1}/3 — rotating to next proxy`, { asin });
-  }
-
-  // Final fallback: VPS direct IP (no proxy)
-  await new Promise(r => setTimeout(r, 3000));
-  const directResult = await puppeteerScrape(url, { proxy: null });
-  if (!directResult.blocked && directResult.price)
-    return { asin, url, ...directResult, method: 'puppeteer_direct' };
-  if (directResult.inStock === false)
-    return { asin, url, price: null, inStock: false, method: 'puppeteer_direct' };
-
-  return { asin, url, price: null, error: 'all_methods_failed' };
+export async function scrapeProductSlow(asin, opts = {}) {
+  return scrapeProductFast(asin, opts);
 }
 
 // ─────────────────────────────────────────────
