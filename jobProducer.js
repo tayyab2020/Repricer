@@ -592,7 +592,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
         proxyApiUrl:      us.webshare_proxy_api  || null,
         enablePythonScraper: mapping.acct_enable_python_scraper === true,
         scraperProxies:      mapping.acct_scraper_proxies || null,
-        scraperIpCount:      mapping.acct_scraper_ip_count ? parseInt(mapping.acct_scraper_ip_count) : null,
+        scraperIpCount:      mapping.acct_scraper_ip_count ? Math.max(1, Math.floor(parseInt(mapping.acct_scraper_ip_count) * 0.8)) : null,
         forceReprice,
       };
 
