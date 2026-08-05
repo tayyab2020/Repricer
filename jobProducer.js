@@ -388,7 +388,8 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
              oa.keepa_email      AS acct_keepa_email,
              oa.keepa_password   AS acct_keepa_password,
              oa.enable_python_scraper AS acct_enable_python_scraper,
-             oa.scraper_proxies       AS acct_scraper_proxies
+             oa.scraper_proxies       AS acct_scraper_proxies,
+             oa.scraper_ip_count     AS acct_scraper_ip_count
       FROM product_mappings pm
       LEFT JOIN onbuy_accounts oa
              ON pm.onbuy_account_id = oa.id
@@ -591,6 +592,7 @@ export async function runRepricerJob({ userId = null, accountId = null, mappingI
         proxyApiUrl:      us.webshare_proxy_api  || null,
         enablePythonScraper: mapping.acct_enable_python_scraper === true,
         scraperProxies:      mapping.acct_scraper_proxies || null,
+        scraperIpCount:      mapping.acct_scraper_ip_count ? parseInt(mapping.acct_scraper_ip_count) : null,
         forceReprice,
       };
 

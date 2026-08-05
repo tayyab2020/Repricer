@@ -1375,7 +1375,7 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
     const { rows } = await db.query(
       `SELECT id, account_name, consumer_key, secret_key, site_id, is_active,
               keepa_email, keepa_password,
-              enable_python_scraper, scraper_proxies,
+              enable_python_scraper, scraper_proxies, scraper_ip_count,
               google_sheet_id, google_service_account
        FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.effectiveUserId]
@@ -1388,7 +1388,7 @@ app.get('/api/accounts/:id', requireAuth, async (req, res) => {
 // POST /api/accounts — create account
 app.post('/api/accounts', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id = '2000', keepa_email, keepa_password,
-          enable_python_scraper, scraper_proxies,
+          enable_python_scraper, scraper_proxies, scraper_ip_count,
           google_sheet_id, google_service_account } = req.body;
   if (!account_name || !consumer_key || !secret_key)
     return res.status(400).json({ error: 'account_name, consumer_key and secret_key are required' });
@@ -1400,15 +1400,16 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
     }
     const { rows } = await db.query(
       `INSERT INTO onbuy_accounts (account_name, consumer_key, secret_key, site_id, user_id, keepa_email, keepa_password,
-                                   enable_python_scraper, scraper_proxies,
+                                   enable_python_scraper, scraper_proxies, scraper_ip_count,
                                    google_sheet_id, google_service_account)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id, account_name, site_id, is_active, created_at, keepa_email,
-                 enable_python_scraper, scraper_proxies, google_sheet_id,
+                 enable_python_scraper, scraper_proxies, scraper_ip_count, google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name, consumer_key, secret_key, site_id, req.effectiveUserId,
        keepa_email || null, keepa_password || null,
        enable_python_scraper === true, scraper_proxies || null,
+       scraper_ip_count ? parseInt(scraper_ip_count) : null,
        google_sheet_id || null, sheetCreds ? JSON.stringify(sheetCreds) : null]
     );
     res.status(201).json(rows[0]);
@@ -1418,7 +1419,7 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 // PUT /api/accounts/:id — update account
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
-          enable_python_scraper, scraper_proxies,
+          enable_python_scraper, scraper_proxies, scraper_ip_count,
           repricer_enabled, bulk_enabled, orders_enabled,
           google_sheet_id, google_service_account } = req.body;
   try {
@@ -1443,6 +1444,7 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          keepa_password         = CASE WHEN $7::text IS NOT NULL THEN NULLIF($7,'') ELSE keepa_password END,
          enable_python_scraper  = COALESCE($8,  enable_python_scraper),
          scraper_proxies        = CASE WHEN $9::text IS NOT NULL THEN NULLIF($9,'') ELSE scraper_proxies END,
+         scraper_ip_count       = COALESCE($17, scraper_ip_count),
          repricer_enabled       = COALESCE($14, repricer_enabled),
          bulk_enabled           = COALESCE($15, bulk_enabled),
          orders_enabled         = COALESCE($16, orders_enabled),
@@ -1451,7 +1453,7 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          updated_at             = NOW()
        WHERE id = $10 AND user_id = $11
        RETURNING id, account_name, site_id, is_active, keepa_email,
-                 enable_python_scraper, scraper_proxies,
+                 enable_python_scraper, scraper_proxies, scraper_ip_count,
                  repricer_enabled, bulk_enabled, orders_enabled,
                  google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
@@ -1461,7 +1463,8 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
        req.params.id, req.effectiveUserId,
        google_sheet_id !== undefined ? (google_sheet_id || '') : null,
        sheetCreds !== undefined ? (sheetCreds ?? null) : null,
-       repricer_enabled ?? null, bulk_enabled ?? null, orders_enabled ?? null]
+       repricer_enabled ?? null, bulk_enabled ?? null, orders_enabled ?? null,
+       scraper_ip_count !== undefined ? (scraper_ip_count ? parseInt(scraper_ip_count) : null) : null]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     // If proxies were updated, evict the failure/instance cache so the new config is tried immediately
@@ -2231,6 +2234,7 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled        BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_python_scraper BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS scraper_proxies       TEXT`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS scraper_ip_count     INTEGER DEFAULT NULL`,
     // Index for the repricer job query: ORDER BY last_synced_at per active user avoids a full table scan
     `CREATE INDEX IF NOT EXISTS idx_pm_active_synced ON product_mappings (user_id, last_synced_at ASC NULLS FIRST) WHERE is_active = true`,
     // OnBuy bulk import history tables

@@ -1146,7 +1146,8 @@ const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL ?? 'http://localhost:8
 export async function scrapeProductFast(asin, opts = {}) {
   const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
   const body = { asin };
-  if (opts.proxies) body.proxies = opts.proxies;
+  if (opts.proxies)  body.proxies  = opts.proxies;
+  if (opts.ipCount)  body.ip_count = opts.ipCount;
   const res = await fetch(`${PYTHON_SCRAPER_URL}/scrape`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

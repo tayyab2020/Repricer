@@ -1052,12 +1052,12 @@ async function _processFastJob(job, mapping, token, siteId, consumerKey, secretK
     mapping = { ...mapping, onbuy_listing_id: uid, onbuy_opc: opc };
   }
 
-  const { enablePythonScraper = false, scraperProxies = null } = userSettings;
+  const { enablePythonScraper = false, scraperProxies = null, scraperIpCount = null } = userSettings;
 
   // ── Python scraper takes priority over Keepa when enabled for this account ──
   if (enablePythonScraper) {
     ulog(userId, `[FastWorker] ${mapping.primary_asin} — Python scraper enabled, skipping Keepa cache`);
-    const scraped = await scrapeProductFast(mapping.primary_asin, { proxies: scraperProxies || undefined });
+    const scraped = await scrapeProductFast(mapping.primary_asin, { proxies: scraperProxies || undefined, ipCount: scraperIpCount || undefined });
     return applyResult(scraped, mapping, token, siteId, { consumerKey, secretKey, userSettings });
   }
 

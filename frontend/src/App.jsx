@@ -3879,7 +3879,7 @@ export default function App() {
 // ════════════════════════════════════════════
 function AccountsPage() {
   const [accounts, setAccounts] = useState([]);
-  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_python_scraper:false, scraper_proxies:"", google_sheet_id:"", google_service_account_json:"", _saFileName:"" };
+  const emptyForm = { account_name:"", consumer_key:"", secret_key:"", site_id:"2000", keepa_email:"", keepa_password:"", enable_python_scraper:false, scraper_proxies:"", scraper_ip_count:"", google_sheet_id:"", google_service_account_json:"", _saFileName:"" };
   const [form, setForm]         = useState(emptyForm);
   const [editId, setEditId]     = useState(null);
   const [testing, setTesting]   = useState({});
@@ -4084,6 +4084,19 @@ function AccountsPage() {
                   Must be in <code>ip:port:username:password</code> format. Required to enable Amazon Scraper.
                 </p>
               </div>
+              <div>
+                <label style={labelStyle}>Number of IPs <span style={{ color:C.muted, fontWeight:400, textTransform:"none" }}>(concurrent scrape limit)</span></label>
+                <input
+                  type="number" min="1" max="500"
+                  style={{ ...fieldStyle, width:120 }}
+                  placeholder="e.g. 10"
+                  value={form.scraper_ip_count}
+                  onChange={e => setForm(f => ({ ...f, scraper_ip_count: e.target.value }))}
+                />
+                <p style={{ color:C.muted, fontSize:11, marginTop:4 }}>
+                  Caps simultaneous Amazon requests to this account's IP pool size. Leave blank to use the global worker limit.
+                </p>
+              </div>
             </div>
 
             {/* ── Google Sheets integration ── */}
@@ -4215,7 +4228,7 @@ function AccountsPage() {
                         setForm({ account_name:a.account_name, consumer_key:"Loading…", secret_key:"Loading…", site_id:a.site_id,
                           keepa_email:a.keepa_email||"", keepa_password:"",
                           enable_python_scraper:a.enable_python_scraper===true,
-                          scraper_proxies:"",
+                          scraper_proxies:"", scraper_ip_count:"",
                           google_sheet_id:"", google_service_account_json:"" });
                         try {
                           const full = await api(`/accounts/${a.id}`);
@@ -4224,6 +4237,7 @@ function AccountsPage() {
                             secret_key:   full.secret_key   || "",
                             keepa_password: full.keepa_password || "",
                             scraper_proxies: full.scraper_proxies || "",
+                            scraper_ip_count: full.scraper_ip_count != null ? String(full.scraper_ip_count) : "",
                             google_sheet_id: full.google_sheet_id || "",
                             google_service_account_json: full.google_service_account
                               ? JSON.stringify(full.google_service_account, null, 2) : "",

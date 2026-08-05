@@ -65,6 +65,11 @@ _scraper_failures: dict[str, tuple[str, float]] = {}
 _PROXY_RETRY_COOLDOWN = 30   # seconds — short cooldown for transient DNS/connection errors
 executor: ThreadPoolExecutor = None
 
+# Per-proxy concurrency semaphores: (ip_count, Semaphore) keyed by proxy md5.
+# Limits concurrent scrapes per proxy config to the account's IP pool size,
+# preventing more simultaneous Amazon requests than there are IPs available.
+_proxy_semaphores: dict[str, tuple[int, asyncio.Semaphore]] = {}
+
 # Cancellation flag — set by POST /cancel; blocks new /scrape requests until expired.
 # In-flight scrapes already running in threads complete naturally but new ones are rejected.
 _cancel_until: float = 0.0
@@ -149,7 +154,8 @@ app = FastAPI(lifespan=lifespan)
 
 class ScrapeRequest(BaseModel):
     asin: str
-    proxies: Optional[str] = None  # comma-separated ip:port:user:pass
+    proxies: Optional[str] = None   # comma-separated ip:port:user:pass
+    ip_count: Optional[int] = None  # max concurrent scrapes for this proxy config
 
 
 @app.get("/health")
@@ -207,29 +213,49 @@ async def scrape(req: ScrapeRequest):
         logger.error(f"Scraper init failed for {req.asin}: {e}")
         raise HTTPException(status_code=503, detail=f"Scraper init failed: {e}")
 
-    logger.info(f"Calling get_product_by_asin({req.asin})…")
-    start = time.time()
-    loop = asyncio.get_event_loop()
+    # Enforce per-proxy concurrency limit when ip_count is provided.
+    # Prevents more simultaneous requests than available IPs in the pool.
+    sem = None
+    if req.ip_count and req.ip_count > 0:
+        proxy_key = hashlib.md5((req.proxies or "").encode()).hexdigest()
+        entry = _proxy_semaphores.get(proxy_key)
+        if entry is None or entry[0] != req.ip_count:
+            _proxy_semaphores[proxy_key] = (req.ip_count, asyncio.Semaphore(req.ip_count))
+        sem = _proxy_semaphores[proxy_key][1]
 
-    # Retry up to 3 times on anti-bot (None result).
-    # We reuse the same scraper instance rather than reiniting — for Decodo rotating
-    # proxies, each new request to the proxy endpoint gets a fresh IP automatically
-    # without needing a new TCP connection at the scraper level. Reiniting was causing
-    # cascading DNS failures that blocked the entire proxy config for minutes.
-    result = None
-    for attempt in range(1, 4):
-        try:
-            result = await loop.run_in_executor(executor, scraper.get_product_by_asin, req.asin)
-        except Exception as e:
-            elapsed = round(time.time() - start, 1)
-            logger.error(f"Scrape exception for {req.asin} after {elapsed}s: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+    _sem_acquired = False
+    if sem:
+        await sem.acquire()
+        _sem_acquired = True
 
-        if result is not None:
-            break
+    try:
+        logger.info(f"Calling get_product_by_asin({req.asin})…")
+        start = time.time()
+        loop = asyncio.get_event_loop()
 
-        if attempt < 3:
-            logger.warning(f"Anti-bot for {req.asin} (attempt {attempt}/3) — retrying with same scraper")
+        # Retry up to 3 times on anti-bot (None result).
+        # We reuse the same scraper instance rather than reiniting — for Decodo rotating
+        # proxies, each new request to the proxy endpoint gets a fresh IP automatically
+        # without needing a new TCP connection at the scraper level. Reiniting was causing
+        # cascading DNS failures that blocked the entire proxy config for minutes.
+        result = None
+        for attempt in range(1, 4):
+            try:
+                result = await loop.run_in_executor(executor, scraper.get_product_by_asin, req.asin)
+            except Exception as e:
+                elapsed = round(time.time() - start, 1)
+                logger.error(f"Scrape exception for {req.asin} after {elapsed}s: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+            if result is not None:
+                break
+
+            if attempt < 3:
+                logger.warning(f"Anti-bot for {req.asin} (attempt {attempt}/3) — retrying with same scraper")
+
+    finally:
+        if _sem_acquired:
+            sem.release()
 
     elapsed = round(time.time() - start, 1)
 
