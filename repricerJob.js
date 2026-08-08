@@ -76,6 +76,7 @@ const { Pool } = pg;
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: (process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false') ? { rejectUnauthorized: false } : false,
+  max: 50,
 });
 
 // ─────────────────────────────────────────────
@@ -3090,7 +3091,10 @@ fastWorker.on('completed', (job, result) => {
 });
 fastWorker.on('failed',    (job) => {
   _fastActive = Math.max(0, _fastActive - 1);
-  _decrementCounter(job);
+  // Only decrement when all retry attempts are exhausted — if the job will be
+  // retried (attemptsMade < attempts), the eventual completed/failed event handles it.
+  const maxAttempts = job?.opts?.attempts ?? 1;
+  if ((job?.attemptsMade ?? 1) >= maxAttempts) _decrementCounter(job);
   _checkAllDone();
 });
 
@@ -3105,7 +3109,8 @@ slowWorker.on('completed', (job) => {
 });
 slowWorker.on('failed',    (job) => {
   _slowActive = Math.max(0, _slowActive - 1);
-  _decrementCounter(job);
+  const maxAttempts = job?.opts?.attempts ?? 1;
+  if ((job?.attemptsMade ?? 1) >= maxAttempts) _decrementCounter(job);
   _checkAllDone();
 });
 

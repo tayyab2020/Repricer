@@ -575,11 +575,24 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
       [...kWaiting, ...kDelayed].filter(j => String(j.data?.userId) === uid);
     const hasQueuedKeepa  = userQueuedJobs.length > 0;
 
-    // state: 'active'  → job is running now (counter > 0 OR active Keepa job)
+    // When the Redis counter drifts to 0 or negative (can happen if a job fails
+    // and is retried — the failed event was incorrectly decrementing before the fix),
+    // fall back to a direct BullMQ active-job scan for this user.
+    let activeFastCount = 0;
+    if (pending <= 0 && !hasActiveKeepa) {
+      const [fastActive, slowActive] = await Promise.all([
+        fastQueue.getActive(),
+        slowQueue.getActive(),
+      ]);
+      activeFastCount = [...fastActive, ...slowActive]
+        .filter(j => String(j.data?.mapping?.user_id) === uid).length;
+    }
+
+    // state: 'active'  → job is running now (counter > 0 OR active Keepa job OR BullMQ fallback)
     //        'queued'  → job is waiting in queue (not yet running)
     //        'idle'    → no job
-    const state = (pending > 0 || hasActiveKeepa) ? 'active'
-                : hasQueuedKeepa                   ? 'queued'
+    const state = (pending > 0 || hasActiveKeepa || activeFastCount > 0) ? 'active'
+                : hasQueuedKeepa                                           ? 'queued'
                 : 'idle';
 
     // For 'queued' state, sum the ASIN counts from the waiting job payloads —
@@ -588,7 +601,7 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
     const total = state === 'queued'
       ? userQueuedJobs.reduce((sum, j) =>
           sum + (j.data?.pendingAsins?.length ?? j.data?.asins?.length ?? 0), 0)
-      : pending;
+      : pending > 0 ? pending : activeFastCount;
 
     res.json({ total, busy: state !== 'idle', state });
   } catch (err) {
