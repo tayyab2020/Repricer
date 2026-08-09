@@ -29,6 +29,14 @@ import { smartExtractPrice } from './priceExtractor.js';
 
 puppeteer.use(StealthPlugin());
 
+// 1×1 transparent PNG — fulfilling image/media requests with this instead of
+// aborting keeps Amazon's JS satisfied (img.complete=true, no onerror) while
+// sending zero real image data through the proxy.
+const PIXEL_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64'
+);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_FILE  = join(__dirname, 'scraper.log');
 const LOGS_DIR  = join(__dirname, 'logs');
@@ -696,10 +704,15 @@ async function puppeteerScrape(url, { forceProxy = true, proxy: explicitProxy = 
       await page.authenticate({ username: proxy.username, password: proxy.password });
     }
 
-    // Block images, fonts, media — reduces fingerprint surface and speeds up page load
+    // Stub images/media with a tiny PNG so Amazon's JS sees HTTP 200 + img.complete=true
+    // (aborting caused net::ERR_FAILED which some anti-bot checks flag). Fonts can be
+    // safely aborted — they're never checked by page scripts.
     await page.setRequestInterception(true);
     page.on('request', req => {
-      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+      const type = req.resourceType();
+      if (type === 'image' || type === 'media') {
+        req.respond({ status: 200, contentType: 'image/png', body: PIXEL_PNG });
+      } else if (type === 'font') {
         req.abort();
       } else {
         req.continue();
@@ -1221,6 +1234,18 @@ export async function getAllSellers(asin, { maxRetries = 3 } = {}) {
         await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB,en;q=0.9' });
         await page.evaluateOnNewDocument(() => {
           Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        });
+
+        await page.setRequestInterception(true);
+        page.on('request', req => {
+          const type = req.resourceType();
+          if (type === 'image' || type === 'media') {
+            req.respond({ status: 200, contentType: 'image/png', body: PIXEL_PNG });
+          } else if (type === 'font') {
+            req.abort();
+          } else {
+            req.continue();
+          }
         });
 
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });

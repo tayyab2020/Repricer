@@ -15,6 +15,24 @@ import os
 import re
 from typing import Optional, Tuple
 
+# 1×1 transparent PNG — used to fulfill image/media requests so Amazon's JS
+# sees HTTP 200 + img.complete=true instead of a network error that bot
+# detection scripts watch for. Near-zero bytes vs. the real image.
+_PIXEL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def _route_block_images(route) -> None:
+    """Playwright route handler: stub images/media, abort fonts, pass everything else."""
+    rt = route.request.resource_type
+    if rt in ("image", "media"):
+        route.fulfill(status=200, content_type="image/png", body=_PIXEL_PNG)
+    elif rt == "font":
+        route.abort()
+    else:
+        route.continue_()
+
 
 def _proxy_dict_to_playwright(proxy_dict: Optional[dict]) -> Optional[dict]:
     """Convert curl_cffi proxy dict to Playwright proxy config."""
@@ -100,6 +118,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
                 context.add_cookies(_pw_cookies)
 
         page = context.new_page()
+        page.route("**/*", _route_block_images)
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
         # Set delivery postcode only when session cookies are NOT provided.
