@@ -26,13 +26,45 @@ _PIXEL_PNG = base64.b64decode(
 
 def _route_block_images(route) -> None:
     """Playwright route handler: stub images/media, abort fonts, pass everything else."""
-    rt = route.request.resource_type
-    if rt in ("image", "media"):
-        route.fulfill(status=200, content_type="image/png", body=_PIXEL_PNG)
-    elif rt == "font":
-        route.abort()
-    else:
-        route.continue_()
+    try:
+        rt = route.request.resource_type
+        if rt in ("image", "media"):
+            route.fulfill(status=200, content_type="image/png", body=_PIXEL_PNG)
+        elif rt == "font":
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:
+        # Silently ignore — route was cancelled because the page navigated away
+        # while this handler was still pending. This is normal during secondary
+        # navigations (offer-listing, ?aod=1, reload) and not an error.
+        pass
+
+
+def _navigate(page, url: str, **kwargs) -> None:
+    """Navigate to url, unrouting first to prevent CancelledError on pending handlers."""
+    try:
+        page.unroute("**/*")
+    except Exception:
+        pass
+    page.goto(url, **kwargs)
+    try:
+        page.route("**/*", _route_block_images)
+    except Exception:
+        pass
+
+
+def _reload(page, **kwargs) -> None:
+    """Reload, unrouting first to prevent CancelledError on pending handlers."""
+    try:
+        page.unroute("**/*")
+    except Exception:
+        pass
+    page.reload(**kwargs)
+    try:
+        page.route("**/*", _route_block_images)
+    except Exception:
+        pass
 
 
 def _run_in_clean_thread(func, *args, timeout: int = 120, **kwargs):
@@ -139,7 +171,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
 
         page = context.new_page()
         page.route("**/*", _route_block_images)
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)  # initial load — route already set
 
         # Set delivery postcode only when session cookies are NOT provided.
         # When cookies are shared the postcode is already embedded in the session
@@ -171,7 +203,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
                     }});
                 }}""")
                 page.wait_for_timeout(400)
-                page.reload(wait_until="domcontentloaded", timeout=20_000)
+                _reload(page, wait_until="domcontentloaded", timeout=20_000)
                 print(f"  [playwright] Delivery postcode set to: {postcode}")
             except Exception as _e:
                 print(f"  [playwright] Postcode set error: {_e}")
@@ -232,7 +264,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
                         f"/ref=dp_olp_unknown_mbc"
                     )
                     print(f"  [playwright] 'See All Buying Options' — navigating to offer-listing page")
-                    page.goto(_offer_url, wait_until="domcontentloaded", timeout=20_000)
+                    _navigate(page, _offer_url, wait_until="domcontentloaded", timeout=20_000)
                     page.wait_for_timeout(3000)
                     try:
                         page.wait_for_selector(
@@ -247,7 +279,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
                     # Fallback: ?aod=1 if ASIN can't be extracted from URL
                     _aod_url = f"{url.split('?')[0].rstrip('/')}?aod=1"
                     print(f"  [playwright] 'See All Buying Options' — navigating to ?aod=1 (fallback)")
-                    page.goto(_aod_url, wait_until="domcontentloaded", timeout=20_000)
+                    _navigate(page, _aod_url, wait_until="domcontentloaded", timeout=20_000)
                     page.wait_for_timeout(3000)
                     try:
                         page.wait_for_selector(
@@ -276,7 +308,7 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
                             f"/gp/offer-listing/{_asin_m2.group(1)}"
                         )
                         print(f"  [playwright] Used buybox — navigating to offer listing page")
-                        page.goto(_offer_listing_url, wait_until="domcontentloaded", timeout=20_000)
+                        _navigate(page, _offer_listing_url, wait_until="domcontentloaded", timeout=20_000)
                         page.wait_for_timeout(3000)
                         try:
                             page.wait_for_selector(
