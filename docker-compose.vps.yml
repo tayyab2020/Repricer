@@ -1,0 +1,56 @@
+# docker-compose.vps.yml - VPS production override
+# Docker postgres starts (satisfies depends_on health check) but is unused.
+# All services connect to the EXISTING local postgres at 172.17.0.1 which has the real data.
+services:
+  app:
+    environment:
+      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      NODE_ENV: "production"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  repricer:
+    environment:
+      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      NODE_ENV: "production"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  orders:
+    environment:
+      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      NODE_ENV: "production"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  python-scraper:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
