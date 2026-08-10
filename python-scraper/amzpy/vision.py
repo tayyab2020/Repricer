@@ -67,7 +67,24 @@ def _reload(page, **kwargs) -> None:
         pass
 
 
-def _run_in_clean_thread(func, *args, timeout: int = 120, **kwargs):
+# Hard cap on concurrent Playwright browser instances. If all slots are taken
+# (e.g. during a surge), new requests skip Playwright rather than piling up and
+# leaking Chromium processes. Keeps peak memory predictable.
+_PLAYWRIGHT_SEMAPHORE = threading.Semaphore(12)
+
+
+def _kill_orphaned_chromium() -> None:
+    """Kill all chromium child processes — called after a thread timeout to
+    prevent zombie Chromium accumulation. Aggressive but necessary: a timed-out
+    thread cannot be force-stopped in Python, so its Chromium lingers until killed."""
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-9", "-f", "chromium"], capture_output=True)
+    except Exception:
+        pass
+
+
+def _run_in_clean_thread(func, *args, timeout: int = 50, **kwargs):
     """
     Run func entirely in a brand-new OS thread that has never touched asyncio.
 
@@ -75,25 +92,36 @@ def _run_in_clean_thread(func, *args, timeout: int = 120, **kwargs):
     uvicorn event loop leaks this into ThreadPoolExecutor workers so
     asyncio.set_event_loop(None) doesn't help — it clears _local._loop but not
     _running_loop. A brand-new threading.Thread has a clean C-level state.
+
+    On timeout the thread is abandoned (Python cannot force-kill threads), but
+    _kill_orphaned_chromium() is called to reap its Chromium process — otherwise
+    zombie browsers accumulate until the container OOMs.
     """
-    result_box = [None]
-    exc_box = [None]
-
-    def _target():
-        try:
-            result_box[0] = func(*args, **kwargs)
-        except Exception as e:
-            exc_box[0] = e
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        print(f"[playwright] thread timeout after {timeout}s — abandoning")
+    if not _PLAYWRIGHT_SEMAPHORE.acquire(blocking=False):
+        print("[playwright] concurrency limit reached — skipping Playwright fallback")
         return None
-    if exc_box[0] is not None:
-        raise exc_box[0]
-    return result_box[0]
+    try:
+        result_box = [None]
+        exc_box = [None]
+
+        def _target():
+            try:
+                result_box[0] = func(*args, **kwargs)
+            except Exception as e:
+                exc_box[0] = e
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            print(f"[playwright] thread timeout after {timeout}s — killing orphaned chromium")
+            _kill_orphaned_chromium()
+            return None
+        if exc_box[0] is not None:
+            raise exc_box[0]
+        return result_box[0]
+    finally:
+        _PLAYWRIGHT_SEMAPHORE.release()
 
 
 def _proxy_dict_to_playwright(proxy_dict: Optional[dict]) -> Optional[dict]:
