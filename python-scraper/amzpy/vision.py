@@ -13,6 +13,7 @@ This is used as a fallback when HTML parsing cannot find the price.
 import base64
 import os
 import re
+import threading
 from typing import Optional, Tuple
 
 # 1×1 transparent PNG — used to fulfill image/media requests so Amazon's JS
@@ -32,6 +33,35 @@ def _route_block_images(route) -> None:
         route.abort()
     else:
         route.continue_()
+
+
+def _run_in_clean_thread(func, *args, timeout: int = 120, **kwargs):
+    """
+    Run func entirely in a brand-new OS thread that has never touched asyncio.
+
+    Playwright's sync API checks asyncio._get_running_loop() (C-level). FastAPI's
+    uvicorn event loop leaks this into ThreadPoolExecutor workers so
+    asyncio.set_event_loop(None) doesn't help — it clears _local._loop but not
+    _running_loop. A brand-new threading.Thread has a clean C-level state.
+    """
+    result_box = [None]
+    exc_box = [None]
+
+    def _target():
+        try:
+            result_box[0] = func(*args, **kwargs)
+        except Exception as e:
+            exc_box[0] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f"[playwright] thread timeout after {timeout}s — abandoning")
+        return None
+    if exc_box[0] is not None:
+        raise exc_box[0]
+    return result_box[0]
 
 
 def _proxy_dict_to_playwright(proxy_dict: Optional[dict]) -> Optional[dict]:
@@ -78,16 +108,6 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
     _cookie_domain = f".amazon.{_domain_m.group(1)}" if _domain_m else ".amazon.co.uk"
 
     try:
-        # sync_playwright uses asyncio internally and will refuse to start if it
-        # detects a running event loop in the thread (FastAPI's uvicorn loop leaks
-        # into ThreadPoolExecutor workers). Clearing the loop reference here lets
-        # sync_playwright create its own without conflict.
-        import asyncio as _asyncio
-        try:
-            _asyncio.set_event_loop(None)
-        except Exception:
-            pass
-
         p = sync_playwright().start()
         browser = p.chromium.launch(
             headless=True,
@@ -276,6 +296,22 @@ def _launch_playwright_page(url: str, proxy_dict: Optional[dict] = None,
         return None
 
 
+def _render_and_get_html_inner(url, proxy_dict, postcode, session_cookies):
+    result = _launch_playwright_page(url, proxy_dict, postcode=postcode,
+                                     session_cookies=session_cookies)
+    if not result:
+        return None
+    page, browser, p = result
+    try:
+        return page.content()
+    except Exception as e:
+        print(f"  [playwright] Error getting page content: {e}")
+        return None
+    finally:
+        browser.close()
+        p.stop()
+
+
 def render_and_get_html(url: str, proxy_dict: Optional[dict] = None,
                         postcode: Optional[str] = None,
                         session_cookies: Optional[dict] = None) -> Optional[str]:
@@ -287,32 +323,10 @@ def render_and_get_html(url: str, proxy_dict: Optional[dict] = None,
     cannot find the price in the static HTML.
     """
     print(f"  [playwright] Rendering page: {url}")
-    result = _launch_playwright_page(url, proxy_dict, postcode=postcode,
-                                     session_cookies=session_cookies)
-    if not result:
-        return None
-    page, browser, p = result
-    try:
-        html = page.content()
-        return html
-    except Exception as e:
-        print(f"  [playwright] Error getting page content: {e}")
-        return None
-    finally:
-        browser.close()
-        p.stop()
+    return _run_in_clean_thread(_render_and_get_html_inner, url, proxy_dict, postcode, session_cookies)
 
 
-def extract_price_from_dom(url: str, proxy_dict: Optional[dict] = None,
-                           postcode: Optional[str] = None,
-                           session_cookies: Optional[dict] = None) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    """
-    Render the page with Playwright, activate the appropriate buying option, then
-    read price and delivery date directly from the live DOM.
-
-    Returns (price_float, currency_symbol, delivery_date) or (None, None, None).
-    """
-    print(f"  [playwright] Extracting price from live DOM: {url}")
+def _extract_price_from_dom_inner(url, proxy_dict, postcode, session_cookies):
     result = _launch_playwright_page(url, proxy_dict, postcode=postcode,
                                      session_cookies=session_cookies)
     if not result:
@@ -484,24 +498,43 @@ def extract_price_from_dom(url: str, proxy_dict: Optional[dict] = None,
         p.stop()
 
 
-def screenshot_product_page(url: str, proxy_dict: Optional[dict] = None) -> Optional[bytes]:
+def extract_price_from_dom(url: str, proxy_dict: Optional[dict] = None,
+                           postcode: Optional[str] = None,
+                           session_cookies: Optional[dict] = None) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     """
-    Render the Amazon product page with headless Chromium and return a PNG screenshot.
-    Used by extract_price_via_vision for Claude Vision API calls.
+    Render the page with Playwright, activate the appropriate buying option, then
+    read price and delivery date directly from the live DOM.
+
+    Returns (price_float, currency_symbol, delivery_date) or (None, None, None).
     """
+    print(f"  [playwright] Extracting price from live DOM: {url}")
+    result = _run_in_clean_thread(
+        _extract_price_from_dom_inner, url, proxy_dict, postcode, session_cookies
+    )
+    return result if result is not None else (None, None, None)
+
+
+def _screenshot_product_page_inner(url, proxy_dict):
     result = _launch_playwright_page(url, proxy_dict)
     if not result:
         return None
     page, browser, p = result
     try:
-        screenshot = page.screenshot(full_page=False)
-        return screenshot
+        return page.screenshot(full_page=False)
     except Exception as e:
         print(f"  [playwright] Screenshot error: {e}")
         return None
     finally:
         browser.close()
         p.stop()
+
+
+def screenshot_product_page(url: str, proxy_dict: Optional[dict] = None) -> Optional[bytes]:
+    """
+    Render the Amazon product page with headless Chromium and return a PNG screenshot.
+    Used by extract_price_via_vision for Claude Vision API calls.
+    """
+    return _run_in_clean_thread(_screenshot_product_page_inner, url, proxy_dict)
 
 
 def extract_price_via_vision(
