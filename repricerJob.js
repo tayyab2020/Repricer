@@ -92,8 +92,11 @@ const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', 
   maxRetriesPerRequest: null,
 });
 
-const FAST_CONCURRENCY = parseInt(process.env.FAST_WORKERS ?? '20');
-const SLOW_CONCURRENCY = parseInt(process.env.SLOW_WORKERS ?? '5');
+// Computed dynamically from DB in the bootstrap block below.
+// Env var FAST_WORKERS is only used as a fallback if the DB query fails.
+let FAST_CONCURRENCY = parseInt(process.env.FAST_WORKERS || '20');
+const SLOW_CONCURRENCY = 5;    // always 5 — slow queue is Puppeteer fallback
+// Keepa worker concurrency is hardcoded to 3 at the keepaWorker definition below.
 
 // Keepa Pro quota: 100% = 36 000 products, refills at 5%/hr = 1 800 products/hr
 const KEEPA_QUOTA_FULL  = 36_000;
@@ -1159,6 +1162,41 @@ try {
   wlog('[RepricerJob] Could not bootstrap settings:', e.message);
 }
 
+// ── Dynamic FAST_CONCURRENCY from Python-enabled accounts ────────────────────
+// Python scraper: FAST_CONCURRENCY = sum of FLOOR(ip_count × 0.8) across all
+// active Python-enabled accounts. The 0.8 cap reserves 20% of IPs for retries.
+// Keepa-only (no Python accounts): falls back to 20 concurrent workers.
+// After computing, the Python scraper's thread pool is resized to match so it
+// never queues requests from the BullMQ workers.
+try {
+  const { rows: ipRows } = await db.query(`
+    SELECT COALESCE(SUM(GREATEST(1, FLOOR(scraper_ip_count * 0.8))), 0)::int AS python_slots
+    FROM onbuy_accounts
+    WHERE is_active = true AND enable_python_scraper = true AND scraper_ip_count > 0
+  `);
+  const pythonSlots = ipRows[0]?.python_slots ?? 0;
+  if (pythonSlots > 0) {
+    FAST_CONCURRENCY = pythonSlots;
+    wlog(`[RepricerJob] Python scraper mode — FAST_WORKERS = ${FAST_CONCURRENCY} (dynamic from IP counts)`);
+    const pyUrl = process.env.PYTHON_SCRAPER_URL ?? 'http://python-scraper:8000';
+    try {
+      const pyRes = await fetch(`${pyUrl}/set-workers`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ workers: FAST_CONCURRENCY }),
+        signal:  AbortSignal.timeout(5_000),
+      });
+      wlog(`[RepricerJob] Python scraper thread pool → ${FAST_CONCURRENCY} workers (HTTP ${pyRes.status})`);
+    } catch (pyErr) {
+      wlog(`[RepricerJob] Could not resize Python scraper thread pool: ${pyErr.message}`);
+    }
+  } else {
+    wlog(`[RepricerJob] Keepa mode — FAST_WORKERS = ${FAST_CONCURRENCY}`);
+  }
+} catch (e) {
+  wlog('[RepricerJob] Could not compute dynamic FAST_WORKERS:', e.message);
+}
+
 // ─────────────────────────────────────────────
 // KEEPA WORKER
 // Runs one job at a time (concurrency = 1).
@@ -1430,7 +1468,7 @@ async function processKeepaJob(job) {
 
 const keepaWorker = new Worker('keepa-scrape', processKeepaJob, {
   connection:  redis,
-  concurrency: parseInt(process.env.KEEPA_CONCURRENCY) || 3,
+  concurrency: 3,
 });
 
 keepaWorker.on('active', (job) => {

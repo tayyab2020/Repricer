@@ -172,6 +172,26 @@ async def cancel_scraping():
     return {"ok": True}
 
 
+class SetWorkersRequest(BaseModel):
+    workers: int
+
+
+@app.post("/set-workers")
+async def set_workers(req: SetWorkersRequest):
+    """Resize the ThreadPoolExecutor. Called by repricerJob at startup after computing
+    FAST_CONCURRENCY from Python-enabled accounts' IP counts. In-flight scrapes on
+    the old executor finish naturally (shutdown wait=False)."""
+    global executor
+    if req.workers < 1:
+        raise HTTPException(status_code=400, detail="workers must be >= 1")
+    new_executor = ThreadPoolExecutor(max_workers=req.workers)
+    old_executor, executor = executor, new_executor
+    if old_executor:
+        old_executor.shutdown(wait=False)
+    logger.info(f"ThreadPoolExecutor resized to {req.workers} workers")
+    return {"workers": req.workers}
+
+
 class ResetRequest(BaseModel):
     proxies: Optional[str] = None
 
