@@ -70,7 +70,7 @@ def _reload(page, **kwargs) -> None:
 # Hard cap on concurrent Playwright browser instances. If all slots are taken
 # (e.g. during a surge), new requests skip Playwright rather than piling up and
 # leaking Chromium processes. Keeps peak memory predictable.
-_PLAYWRIGHT_SEMAPHORE = threading.Semaphore(12)
+_PLAYWRIGHT_SEMAPHORE = threading.Semaphore(18)
 
 
 def _kill_orphaned_chromium() -> None:
