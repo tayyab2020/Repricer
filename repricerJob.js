@@ -1191,6 +1191,7 @@ try {
       wlog(`[RepricerJob] Could not resize Python scraper thread pool: ${pyErr.message}`);
     }
   } else {
+    FAST_CONCURRENCY = 20;
     wlog(`[RepricerJob] Keepa mode — FAST_WORKERS = ${FAST_CONCURRENCY}`);
   }
 } catch (e) {
