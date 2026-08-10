@@ -17,6 +17,10 @@ services:
     environment:
       DATABASE_URL: "postgresql://repricer:h111j333!@172.18.0.1:5432/repricer_db"
       NODE_ENV: "production"
+      # FAST_WORKERS = sum of (ip_count × 0.8) for all Python-enabled accounts.
+      # Current: Antique Haven (100 IPs → 80) + Smartpick (10 IPs → 8) = 88 → 90 with headroom.
+      # If Lahrians Store (100 IPs) is also enabled, raise to 170.
+      FAST_WORKERS: "90"
     logging:
       driver: "json-file"
       options:
@@ -38,6 +42,10 @@ services:
         max-file: "5"
 
   python-scraper:
+    environment:
+      # SCRAPER_WORKERS = Python ThreadPoolExecutor size.
+      # Must be ≥ FAST_WORKERS so the thread pool never queues Node.js requests.
+      SCRAPER_WORKERS: "100"
     logging:
       driver: "json-file"
       options:
