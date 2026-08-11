@@ -1165,7 +1165,7 @@ export async function scrapeProductFast(asin, opts = {}) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(35_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(`Python scraper HTTP ${res.status}`);
   const data = await res.json();

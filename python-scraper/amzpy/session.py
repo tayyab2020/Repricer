@@ -116,7 +116,7 @@ class AmzSession:
                 self.base_url,
                 headers=headers,
                 proxies=init_proxy,
-                timeout=10,
+                timeout=5,
                 stream=True,
             )
             try:
@@ -280,7 +280,7 @@ class AmzSession:
                     "Referer": self.base_url,
                 },
                 proxies=proxy,
-                timeout=10,  # shorter than REQUEST_TIMEOUT; init must fit in asyncio window
+                timeout=5,  # shorter than REQUEST_TIMEOUT; init must fit in asyncio window
             )
             if resp and resp.status_code == 200:
                 print(f"Delivery postcode set to: {postcode}")

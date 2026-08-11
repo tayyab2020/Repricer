@@ -210,16 +210,26 @@ class SetWorkersRequest(BaseModel):
     workers: int
 
 
+_current_workers: int = 0
+
+
 @app.post("/set-workers")
 async def set_workers(req: SetWorkersRequest):
     """Resize the ThreadPoolExecutor. Called by repricerJob at startup after computing
     FAST_CONCURRENCY from Python-enabled accounts' IP counts. In-flight scrapes on
-    the old executor finish naturally (shutdown wait=False)."""
-    global executor
+    the old executor finish naturally (shutdown wait=False).
+
+    If the requested size matches the current size, the existing executor is reused
+    so thread-local scrapers remain warm across back-to-back repricing jobs."""
+    global executor, _current_workers
     if req.workers < 1:
         raise HTTPException(status_code=400, detail="workers must be >= 1")
+    if req.workers == _current_workers:
+        logger.info(f"ThreadPoolExecutor already at {req.workers} workers — reusing warm threads")
+        return {"workers": req.workers}
     new_executor = ThreadPoolExecutor(max_workers=req.workers)
     old_executor, executor = executor, new_executor
+    _current_workers = req.workers
     if old_executor:
         old_executor.shutdown(wait=False)
     logger.info(f"ThreadPoolExecutor resized to {req.workers} workers")
@@ -294,7 +304,7 @@ async def scrape(req: ScrapeRequest):
                 # least new requests are no longer blocked behind it.
                 result = await asyncio.wait_for(
                     loop.run_in_executor(executor, _scrape_in_thread, req.asin, req.proxies),
-                    timeout=25,
+                    timeout=45,
                 )
             except asyncio.TimeoutError:
                 elapsed = round(time.time() - start, 1)
