@@ -2439,20 +2439,30 @@ function LoginPage({ onLogin }) {
 
 // ── Users Page (admin panel) ──────────────────
 function UsersPage({ currentUser }) {
-  const [users,    setUsers]    = useState([]);
-  const [loading,  setLoading]  = useState(false);
-  const [showForm, setShowForm] = useState(false);
-  const [editUser, setEditUser] = useState(null);
-  const [form,     setForm]     = useState({ username: "", email: "", password: "", role: "user" });
-  const [err,      setErr]      = useState("");
-  const [msg,      setMsg]      = useState("");
-  const [resetting, setResetting] = useState(null);
-  const [resetPwd, setResetPwd]   = useState("");
+  const [users,      setUsers]      = useState([]);
+  const [loading,    setLoading]    = useState(false);
+  const [showForm,   setShowForm]   = useState(false);
+  const [editUser,   setEditUser]   = useState(null);
+  const [form,       setForm]       = useState({ username: "", email: "", password: "", role: "user" });
+  const [err,        setErr]        = useState("");
+  const [msg,        setMsg]        = useState("");
+  const [resetting,  setResetting]  = useState(null);
+  const [resetPwd,   setResetPwd]   = useState("");
+  const [jobStatuses, setJobStatuses] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
     try { setUsers(await api("/admin/users")); } catch (e) { setErr(e.message); }
     setLoading(false);
+  }, []);
+
+  // Poll job statuses every 5 seconds
+  useEffect(() => {
+    const fetchStatuses = () =>
+      api("/admin/job-statuses").then(setJobStatuses).catch(() => {});
+    fetchStatuses();
+    const t = setInterval(fetchStatuses, 5000);
+    return () => clearInterval(t);
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -2549,7 +2559,7 @@ function UsersPage({ currentUser }) {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
               <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-                {["Username", "Email", "Role", "Mappings", "Accounts", "Status", "Created", "Actions"].map(h => (
+                {["Username", "Email", "Role", "Mappings", "Accounts", "Repricing", "Status", "Created", "Actions"].map(h => (
                   <th key={h} style={{ color: C.muted, textAlign: "left", padding: "8px 12px",
                     fontWeight: 500, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
                 ))}
@@ -2574,6 +2584,30 @@ function UsersPage({ currentUser }) {
                   </td>
                   <td style={{ padding: "10px 12px", color: C.textDim }}>{u.mapping_count}</td>
                   <td style={{ padding: "10px 12px", color: C.textDim }}>{u.account_count}</td>
+                  <td style={{ padding: "10px 12px" }}>
+                    {(() => {
+                      const js = jobStatuses[String(u.id)];
+                      if (!js) return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
+                      if (js.state === "active") return (
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                          background: "#00d4aa18", border: `1px solid ${C.accent}44`,
+                          borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.accent }}>
+                          <span style={{ width: 6, height: 6, borderRadius: "50%",
+                            background: C.accent, display: "inline-block",
+                            animation: "pulse 1.2s ease-in-out infinite" }} />
+                          {js.remaining > 0 ? `${js.remaining.toLocaleString()} left` : "Running"}
+                        </span>
+                      );
+                      if (js.state === "queued") return (
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                          background: "#f59e0b18", border: `1px solid ${C.amber}44`,
+                          borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.amber }}>
+                          ⏳ {js.remaining > 0 ? `${js.remaining.toLocaleString()} queued` : "Queued"}
+                        </span>
+                      );
+                      return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
+                    })()}
+                  </td>
                   <td style={{ padding: "10px 12px" }}>
                     <span style={{
                       color: u.is_active ? C.accent : C.red,

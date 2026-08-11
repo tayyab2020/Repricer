@@ -161,6 +161,53 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/admin/job-statuses — repricing job state for every user (admin only)
+app.get('/api/admin/job-statuses', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const statuses = {};
+
+    // 1. Redis counters: repricer:running:{userId} > 0 means actively processing
+    const keys = await redis.keys('repricer:running:*');
+    if (keys.length) {
+      const values = await redis.mget(keys);
+      keys.forEach((key, i) => {
+        const uid = key.replace('repricer:running:', '');
+        const count = parseInt(values[i] || '0');
+        if (count > 0) statuses[uid] = { state: 'active', remaining: count };
+      });
+    }
+
+    // 2. Keepa queue: active jobs are running, waiting/delayed are queued
+    const [kActive, kWaiting, kDelayed] = await Promise.all([
+      keepaQueue.getActive(),
+      keepaQueue.getWaiting(),
+      keepaQueue.getDelayed(),
+    ]);
+    kActive.forEach(j => {
+      const uid = String(j.data?.userId ?? '');
+      if (uid) statuses[uid] = { state: 'active', remaining: statuses[uid]?.remaining ?? 0 };
+    });
+    [...kWaiting, ...kDelayed].forEach(j => {
+      const uid = String(j.data?.userId ?? '');
+      if (uid && !statuses[uid]) {
+        statuses[uid] = { state: 'queued', remaining: j.data?.pendingAsins?.length ?? j.data?.asins?.length ?? 0 };
+      }
+    });
+
+    // 3. Fast/slow queues: catch jobs not yet reflected in the Redis counter
+    const [fastActive, slowActive] = await Promise.all([
+      fastQueue.getActive(),
+      slowQueue.getActive(),
+    ]);
+    [...fastActive, ...slowActive].forEach(j => {
+      const uid = String(j.data?.mapping?.user_id ?? '');
+      if (uid && !statuses[uid]) statuses[uid] = { state: 'active', remaining: 0 };
+    });
+
+    res.json(statuses);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   const { username, email, password, role = 'user' } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
