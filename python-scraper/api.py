@@ -134,6 +134,14 @@ def _get_scraper(proxies_raw: Optional[str]) -> AmazonScraper:
     return _thread_local.scrapers[key]
 
 
+def _scrape_in_thread(asin: str, proxies_raw: Optional[str]) -> Optional[dict]:
+    """Runs inside a ThreadPoolExecutor thread.
+    _get_scraper uses thread-local storage so each thread gets its own
+    AmazonScraper with its own curl_cffi Session — nothing shared across threads."""
+    scraper = _get_scraper(proxies_raw)
+    return scraper.get_product_by_asin(asin)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global executor, _delay_min, _delay_max, _default_proxies_raw
@@ -231,12 +239,6 @@ async def scrape(req: ScrapeRequest):
     proxy_label = "proxies" if req.proxies else "no proxies"
     logger.info(f"Scrape requested — ASIN={req.asin} ({proxy_label})")
 
-    try:
-        scraper = _get_scraper(req.proxies)
-    except Exception as e:
-        logger.error(f"Scraper init failed for {req.asin}: {e}")
-        raise HTTPException(status_code=503, detail=f"Scraper init failed: {e}")
-
     # Enforce per-proxy concurrency limit when ip_count is provided.
     # Prevents more simultaneous requests than available IPs in the pool.
     sem = None
@@ -270,7 +272,7 @@ async def scrape(req: ScrapeRequest):
                 # itself continues until curl_cffi's REQUEST_TIMEOUT fires (20s), but at
                 # least new requests are no longer blocked behind it.
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(executor, scraper.get_product_by_asin, req.asin),
+                    loop.run_in_executor(executor, _scrape_in_thread, req.asin, req.proxies),
                     timeout=25,
                 )
             except asyncio.TimeoutError:
@@ -286,7 +288,7 @@ async def scrape(req: ScrapeRequest):
                 break
 
             if attempt < 3:
-                logger.warning(f"Anti-bot for {req.asin} (attempt {attempt}/3) — retrying with same scraper")
+                logger.warning(f"Anti-bot for {req.asin} (attempt {attempt}/3) — retrying")
 
     finally:
         if _sem_acquired:
