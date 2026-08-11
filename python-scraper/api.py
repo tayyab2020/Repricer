@@ -209,9 +209,8 @@ async def reset_scraper(req: ResetRequest):
     if key in _scraper_failures:
         del _scraper_failures[key]
         evicted.append("failure")
-    if key in _scraper_cache:
-        del _scraper_cache[key]
-        evicted.append("instance")
+    # Per-thread scrapers live in threading.local() — we can't evict them directly,
+    # but clearing the failure entry lets threads re-init on their next request.
     logger.info(f"reset-scraper: evicted {evicted or ['nothing']} for proxy config key={key[:8]}…")
     return {"evicted": evicted}
 
@@ -266,7 +265,18 @@ async def scrape(req: ScrapeRequest):
         result = None
         for attempt in range(1, 4):
             try:
-                result = await loop.run_in_executor(executor, scraper.get_product_by_asin, req.asin)
+                # asyncio.wait_for frees this coroutine's slot after 25s even if the
+                # underlying thread is stuck on a hung proxy TCP connection. The thread
+                # itself continues until curl_cffi's REQUEST_TIMEOUT fires (20s), but at
+                # least new requests are no longer blocked behind it.
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(executor, scraper.get_product_by_asin, req.asin),
+                    timeout=25,
+                )
+            except asyncio.TimeoutError:
+                elapsed = round(time.time() - start, 1)
+                logger.warning(f"Thread timeout for {req.asin} after {elapsed}s — proxy connection hung")
+                raise HTTPException(status_code=503, detail="scrape timeout — proxy connection hung")
             except Exception as e:
                 elapsed = round(time.time() - start, 1)
                 logger.error(f"Scrape exception for {req.asin} after {elapsed}s: {e}")
