@@ -153,9 +153,12 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT u.id, u.username, u.email, u.role, u.is_active, u.created_at,
-             (SELECT COUNT(*) FROM product_mappings WHERE user_id = u.id)::int AS mapping_count,
-             (SELECT COUNT(*) FROM onbuy_accounts   WHERE user_id = u.id)::int AS account_count
-      FROM users u ORDER BY u.created_at DESC
+             COALESCE(m.cnt, 0)::int AS mapping_count,
+             COALESCE(a.cnt, 0)::int AS account_count
+      FROM users u
+      LEFT JOIN (SELECT user_id, COUNT(*) AS cnt FROM product_mappings GROUP BY user_id) m ON m.user_id = u.id
+      LEFT JOIN (SELECT user_id, COUNT(*) AS cnt FROM onbuy_accounts   GROUP BY user_id) a ON a.user_id = u.id
+      ORDER BY u.created_at DESC
     `);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }

@@ -2450,8 +2450,8 @@ function UsersPage({ currentUser }) {
   const [resetPwd,   setResetPwd]   = useState("");
   const [jobStatuses, setJobStatuses] = useState({});
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try { setUsers(await api("/admin/users")); } catch (e) { setErr(e.message); }
     setLoading(false);
   }, []);
@@ -2495,7 +2495,7 @@ function UsersPage({ currentUser }) {
         setMsg("User created.");
       }
       setShowForm(false);
-      load();
+      load(true);
     } catch (e) { setErr(e.message); }
   };
 
@@ -2504,13 +2504,13 @@ function UsersPage({ currentUser }) {
       method: "PUT",
       body: JSON.stringify({ is_active: !u.is_active }),
     }).catch(e => setErr(e.message));
-    load();
+    load(true);
   };
 
   const del = async (u) => {
     if (!confirm(`Delete user "${u.username}"? All their data will be removed.`)) return;
     await api(`/admin/users/${u.id}`, { method: "DELETE" }).catch(e => setErr(e.message));
-    load();
+    load(true);
   };
 
   const impersonate = async (u) => {
@@ -2548,111 +2548,129 @@ function UsersPage({ currentUser }) {
           padding: "10px 14px", color: C.accent, fontSize: 13, marginBottom: 16 }}>{msg}</div>
       )}
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+        marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
         <h2 style={{ color: C.text, margin: 0 }}>User Management</h2>
-        <Btn onClick={openCreate}>+ Create User</Btn>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {loading && users.length > 0 && (
+            <span style={{ color: C.muted, fontSize: 12 }}>Refreshing…</span>
+          )}
+          <Btn onClick={openCreate}>+ Create User</Btn>
+        </div>
       </div>
 
-      <Section>
-        {loading && <p style={{ color: C.muted, padding: 24, textAlign: "center" }}>Loading…</p>}
-        {!loading && (
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-            <thead>
-              <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-                {["Username", "Email", "Role", "Mappings", "Accounts", "Repricing", "Status", "Created", "Actions"].map(h => (
-                  <th key={h} style={{ color: C.muted, textAlign: "left", padding: "8px 12px",
-                    fontWeight: 500, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {users.map(u => (
-                <tr key={u.id} style={{ borderBottom: `1px solid ${C.border}20` }}>
-                  <td style={{ padding: "10px 12px", color: C.text, fontWeight: 600 }}>
-                    {u.username}
-                    {u.id === currentUser?.userId && (
-                      <span style={{ color: C.muted, fontSize: 10, marginLeft: 6 }}>(you)</span>
-                    )}
-                  </td>
-                  <td style={{ padding: "10px 12px", color: C.muted }}>{u.email || "—"}</td>
-                  <td style={{ padding: "10px 12px" }}>
-                    <span style={{
-                      background: u.role === "super_admin" ? "#f59e0b22" : "#3b82f622",
-                      color: u.role === "super_admin" ? C.amber : C.blue,
-                      borderRadius: 6, padding: "2px 8px", fontSize: 11, fontWeight: 600,
-                    }}>{u.role === "super_admin" ? "Admin" : "User"}</span>
-                  </td>
-                  <td style={{ padding: "10px 12px", color: C.textDim }}>{u.mapping_count}</td>
-                  <td style={{ padding: "10px 12px", color: C.textDim }}>{u.account_count}</td>
-                  <td style={{ padding: "10px 12px" }}>
-                    {(() => {
-                      const js = jobStatuses[String(u.id)];
-                      if (!js) return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
-                      if (js.state === "active") return (
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
-                          background: "#00d4aa18", border: `1px solid ${C.accent}44`,
-                          borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.accent }}>
-                          <span style={{ width: 6, height: 6, borderRadius: "50%",
-                            background: C.accent, display: "inline-block",
-                            animation: "pulse 1.2s ease-in-out infinite" }} />
-                          {js.remaining > 0 ? `${js.remaining.toLocaleString()} left` : "Running"}
-                        </span>
-                      );
-                      if (js.state === "queued") return (
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
-                          background: "#f59e0b18", border: `1px solid ${C.amber}44`,
-                          borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.amber }}>
-                          ⏳ {js.remaining > 0 ? `${js.remaining.toLocaleString()} queued` : "Queued"}
-                        </span>
-                      );
-                      return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
-                    })()}
-                  </td>
-                  <td style={{ padding: "10px 12px" }}>
-                    <span style={{
-                      color: u.is_active ? C.accent : C.red,
-                      fontSize: 12, fontWeight: 600,
-                    }}>{u.is_active ? "Active" : "Inactive"}</span>
-                  </td>
-                  <td style={{ padding: "10px 12px", color: C.muted, fontSize: 12 }}>
-                    {new Date(u.created_at).toLocaleDateString("en-GB")}
-                  </td>
-                  <td style={{ padding: "10px 12px" }}>
-                    {resetting === u.id ? (
-                      <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                        <input
-                          autoFocus type="password" placeholder="New password"
-                          value={resetPwd} onChange={e => setResetPwd(e.target.value)}
-                          onKeyDown={e => { if (e.key === "Enter") saveResetPwd(u.id); if (e.key === "Escape") setResetting(null); }}
-                          style={{ background: C.bg, border: `1px solid ${C.accent}`, borderRadius: 6,
-                            color: C.text, padding: "4px 8px", fontSize: 12, width: 120 }}
-                        />
-                        <button onClick={() => saveResetPwd(u.id)} style={{
-                          background: C.accent, border: "none", borderRadius: 4, color: "#000",
-                          padding: "4px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>✓</button>
-                        <button onClick={() => setResetting(null)} style={{
-                          background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 14 }}>✕</button>
-                      </div>
-                    ) : (
-                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                        <Btn small variant="secondary" onClick={() => openEdit(u)}>Edit</Btn>
-                        <Btn small variant="secondary" onClick={() => { setResetting(u.id); setResetPwd(""); }}>Reset Pwd</Btn>
-                        <Btn small variant="secondary" onClick={() => toggleActive(u)}>
-                          {u.is_active ? "Disable" : "Enable"}
-                        </Btn>
-                        {u.id !== currentUser?.userId && u.role !== "super_admin" && (
-                          <Btn small variant="ghost" onClick={() => impersonate(u)}>Impersonate</Btn>
-                        )}
-                        {u.id !== currentUser?.userId && (
-                          <Btn small variant="danger" onClick={() => del(u)}>Del</Btn>
-                        )}
-                      </div>
-                    )}
-                  </td>
+      <Section style={{ padding: 0 }}>
+        {loading && users.length === 0 && (
+          <p style={{ color: C.muted, padding: 24, textAlign: "center", margin: 0 }}>Loading…</p>
+        )}
+        {users.length > 0 && (
+          <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 820 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["Username", "Email", "Role", "Mappings", "Accounts", "Repricing", "Status", "Created", "Actions"].map(h => (
+                    <th key={h} style={{ color: C.muted, textAlign: "left", padding: "10px 12px",
+                      fontWeight: 500, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em",
+                      whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {users.map(u => (
+                  <tr key={u.id} style={{ borderBottom: `1px solid ${C.border}20` }}>
+                    <td style={{ padding: "10px 12px", color: C.text, fontWeight: 600, whiteSpace: "nowrap" }}>
+                      {u.username}
+                      {u.id === currentUser?.userId && (
+                        <span style={{ color: C.muted, fontSize: 10, marginLeft: 6 }}>(you)</span>
+                      )}
+                    </td>
+                    <td style={{ padding: "10px 12px", color: C.muted, maxWidth: 160,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {u.email || "—"}
+                    </td>
+                    <td style={{ padding: "10px 12px", whiteSpace: "nowrap" }}>
+                      <span style={{
+                        background: u.role === "super_admin" ? "#f59e0b22" : "#3b82f622",
+                        color: u.role === "super_admin" ? C.amber : C.blue,
+                        borderRadius: 6, padding: "2px 8px", fontSize: 11, fontWeight: 600,
+                      }}>{u.role === "super_admin" ? "Admin" : "User"}</span>
+                    </td>
+                    <td style={{ padding: "10px 12px", color: C.textDim, whiteSpace: "nowrap" }}>
+                      {u.mapping_count.toLocaleString()}
+                    </td>
+                    <td style={{ padding: "10px 12px", color: C.textDim, whiteSpace: "nowrap" }}>
+                      {u.account_count}
+                    </td>
+                    <td style={{ padding: "10px 12px", whiteSpace: "nowrap" }}>
+                      {(() => {
+                        const js = jobStatuses[String(u.id)];
+                        if (!js) return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
+                        if (js.state === "active") return (
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                            background: "#00d4aa18", border: `1px solid ${C.accent}44`,
+                            borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.accent }}>
+                            <span style={{ width: 6, height: 6, borderRadius: "50%",
+                              background: C.accent, display: "inline-block",
+                              animation: "pulse 1.2s ease-in-out infinite" }} />
+                            {js.remaining > 0 ? `${js.remaining.toLocaleString()} left` : "Running"}
+                          </span>
+                        );
+                        if (js.state === "queued") return (
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                            background: "#f59e0b18", border: `1px solid ${C.amber}44`,
+                            borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 600, color: C.amber }}>
+                            ⏳ {js.remaining > 0 ? `${js.remaining.toLocaleString()} queued` : "Queued"}
+                          </span>
+                        );
+                        return <span style={{ color: C.muted, fontSize: 12 }}>—</span>;
+                      })()}
+                    </td>
+                    <td style={{ padding: "10px 12px", whiteSpace: "nowrap" }}>
+                      <span style={{
+                        color: u.is_active ? C.accent : C.red,
+                        fontSize: 12, fontWeight: 600,
+                      }}>{u.is_active ? "Active" : "Inactive"}</span>
+                    </td>
+                    <td style={{ padding: "10px 12px", color: C.muted, fontSize: 12, whiteSpace: "nowrap" }}>
+                      {new Date(u.created_at).toLocaleDateString("en-GB")}
+                    </td>
+                    <td style={{ padding: "10px 12px" }}>
+                      {resetting === u.id ? (
+                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                          <input
+                            autoFocus type="password" placeholder="New password"
+                            value={resetPwd} onChange={e => setResetPwd(e.target.value)}
+                            onKeyDown={e => { if (e.key === "Enter") saveResetPwd(u.id); if (e.key === "Escape") setResetting(null); }}
+                            style={{ background: C.bg, border: `1px solid ${C.accent}`, borderRadius: 6,
+                              color: C.text, padding: "4px 8px", fontSize: 12, width: 120 }}
+                          />
+                          <button onClick={() => saveResetPwd(u.id)} style={{
+                            background: C.accent, border: "none", borderRadius: 4, color: "#000",
+                            padding: "4px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>✓</button>
+                          <button onClick={() => setResetting(null)} style={{
+                            background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 14 }}>✕</button>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "nowrap" }}>
+                          <Btn small variant="secondary" onClick={() => openEdit(u)}>Edit</Btn>
+                          <Btn small variant="secondary" onClick={() => { setResetting(u.id); setResetPwd(""); }}>Reset Pwd</Btn>
+                          <Btn small variant="secondary" onClick={() => toggleActive(u)}>
+                            {u.is_active ? "Disable" : "Enable"}
+                          </Btn>
+                          {u.id !== currentUser?.userId && u.role !== "super_admin" && (
+                            <Btn small variant="ghost" onClick={() => impersonate(u)}>Impersonate</Btn>
+                          )}
+                          {u.id !== currentUser?.userId && (
+                            <Btn small variant="danger" onClick={() => del(u)}>Del</Btn>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Section>
 
