@@ -1469,7 +1469,7 @@ async function processKeepaJob(job) {
 
 const keepaWorker = new Worker('keepa-scrape', processKeepaJob, {
   connection:  redis,
-  concurrency: 3,
+  concurrency: 1,
 });
 
 keepaWorker.on('active', (job) => {
