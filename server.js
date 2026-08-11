@@ -627,15 +627,19 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
 
     // When the Redis counter drifts to 0 or negative (can happen if a job fails
     // and is retried — the failed event was incorrectly decrementing before the fix),
-    // fall back to a direct BullMQ active-job scan for this user.
+    // fall back to BullMQ job counts. getJobCounts() uses Redis LLEN/ZCARD — very fast,
+    // no job objects loaded. Not user-scoped but accurate when one job runs at a time.
     let activeFastCount = 0;
+    let remainingFromBullMQ = 0;
     if (pending <= 0 && !hasActiveKeepa) {
-      const [fastActive, slowActive] = await Promise.all([
-        fastQueue.getActive(),
-        slowQueue.getActive(),
+      const [fastCounts, slowCounts] = await Promise.all([
+        fastQueue.getJobCounts('active', 'waiting', 'delayed'),
+        slowQueue.getJobCounts('active', 'waiting', 'delayed'),
       ]);
-      activeFastCount = [...fastActive, ...slowActive]
-        .filter(j => String(j.data?.mapping?.user_id) === uid).length;
+      activeFastCount = (fastCounts.active ?? 0) + (slowCounts.active ?? 0);
+      remainingFromBullMQ = activeFastCount
+        + (fastCounts.waiting ?? 0) + (fastCounts.delayed ?? 0)
+        + (slowCounts.waiting ?? 0) + (slowCounts.delayed ?? 0);
     }
 
     // state: 'active'  → job is running now (counter > 0 OR active Keepa job OR BullMQ fallback)
@@ -645,13 +649,12 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
                 : hasQueuedKeepa                                           ? 'queued'
                 : 'idle';
 
-    // For 'queued' state, sum the ASIN counts from the waiting job payloads —
-    // mirrors the display logic in keepaWorker.on('active') and the Redis counter
-    // that the active state uses, so the number is consistent.
+    // For 'queued' state, sum the ASIN counts from the waiting job payloads.
+    // For 'active' state, prefer the Redis ASIN counter; fall back to BullMQ job count.
     const total = state === 'queued'
       ? userQueuedJobs.reduce((sum, j) =>
           sum + (j.data?.pendingAsins?.length ?? j.data?.asins?.length ?? 0), 0)
-      : pending > 0 ? pending : activeFastCount;
+      : pending > 0 ? pending : remainingFromBullMQ;
 
     res.json({ total, busy: state !== 'idle', state });
   } catch (err) {

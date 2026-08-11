@@ -3743,9 +3743,9 @@ export default function App() {
           {/* Schedule info */}
           <p className={`text-[10px] text-center ${queueState !== 'idle' ? "text-amber" : "text-subdued"}`}>
             {queueState === 'active'
-              ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} in queue`
+              ? `${queueCounts?.total ?? "?"} ASINs remaining`
               : queueState === 'queued'
-                ? `${queueCounts?.total ?? "?"} job${queueCounts?.total !== 1 ? "s" : ""} waiting in queue`
+                ? `${queueCounts?.total ?? "?"} ASINs waiting in queue`
                 : jobInterval === null
                   ? "Schedule not set"
                   : jobInterval === 0
