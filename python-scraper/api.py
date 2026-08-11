@@ -9,6 +9,7 @@ import logging
 import os
 import asyncio
 import time
+import threading
 from datetime import date as _date
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -54,12 +55,15 @@ def _parse_proxy(raw: str) -> dict:
     return {"http": url, "https": url}
 
 
-_delay_min: float = 1.0
-_delay_max: float = 3.0
+_delay_min: float = 0.0
+_delay_max: float = 0.3
 _default_proxies_raw: str = ""
 
-# Cached scraper instances keyed by md5(proxies_raw)
-_scraper_cache: dict[str, AmazonScraper] = {}
+# Thread-local storage for per-thread scraper instances.
+# Each ThreadPoolExecutor thread gets its own AmazonScraper with its own
+# curl_cffi Session — eliminates the thread-safety issues from sharing one session.
+_thread_local = threading.local()
+
 # Cooldown: tracks (error_message, retry_after_epoch) for proxy configs that failed init
 _scraper_failures: dict[str, tuple[str, float]] = {}
 _PROXY_RETRY_COOLDOWN = 30   # seconds — short cooldown for transient DNS/connection errors
@@ -90,11 +94,14 @@ def _make_scraper(proxies_raw: str = "") -> AmazonScraper:
 
 
 def _get_scraper(proxies_raw: Optional[str]) -> AmazonScraper:
-    """Return a cached scraper for the given proxy config.
+    """Return a per-thread scraper for the given proxy config.
+
+    Each ThreadPoolExecutor thread gets its own AmazonScraper instance stored in
+    thread-local storage. This eliminates curl_cffi Session contention when many
+    threads call session.get() concurrently on the same shared object.
 
     If a proxy config previously failed to initialise, raises immediately
-    (without retrying) for _PROXY_RETRY_COOLDOWN seconds so dead proxies
-    don't block every request with a 21-second connection timeout.
+    (without retrying) for _PROXY_RETRY_COOLDOWN seconds.
     """
     key = hashlib.md5((proxies_raw or "").encode()).hexdigest()
 
@@ -108,22 +115,23 @@ def _get_scraper(proxies_raw: Optional[str]) -> AmazonScraper:
                 f"retrying in {int(remaining)}s"
             )
         else:
-            # Cooldown expired — clear failure and try again
             del _scraper_failures[key]
 
-    if key not in _scraper_cache:
+    if not hasattr(_thread_local, "scrapers"):
+        _thread_local.scrapers = {}
+
+    if key not in _thread_local.scrapers:
         try:
-            _scraper_cache[key] = _make_scraper(proxies_raw or _default_proxies_raw)
+            _thread_local.scrapers[key] = _make_scraper(proxies_raw or _default_proxies_raw)
         except Exception as e:
-            # Cache the failure so subsequent requests fail instantly
             _scraper_failures[key] = (str(e)[:120], time.time() + _PROXY_RETRY_COOLDOWN)
             logger.error(
-                f"Scraper init failed for proxy config (will not retry for "
-                f"{_PROXY_RETRY_COOLDOWN}s): {e}"
+                f"Scraper init failed for proxy config on thread {threading.get_ident()} "
+                f"(will not retry for {_PROXY_RETRY_COOLDOWN}s): {e}"
             )
             raise
 
-    return _scraper_cache[key]
+    return _thread_local.scrapers[key]
 
 
 @asynccontextmanager
@@ -133,16 +141,13 @@ async def lifespan(app: FastAPI):
     workers = int(os.getenv("SCRAPER_WORKERS", "3"))
     executor = ThreadPoolExecutor(max_workers=workers)
 
-    _delay_min = float(os.getenv("DELAY_MIN", "1"))
-    _delay_max = float(os.getenv("DELAY_MAX", "3"))
+    _delay_min = float(os.getenv("DELAY_MIN", "0"))
+    _delay_max = float(os.getenv("DELAY_MAX", "0.3"))
     _default_proxies_raw = os.getenv("PROXIES", "")
 
-    # Pre-warm the default scraper, but don't crash if Amazon is temporarily unreachable.
-    try:
-        _get_scraper(None)
-        print(f"Python scraper ready — {workers} worker(s)")
-    except Exception as e:
-        print(f"[Warning] Scraper pre-warm failed ({e}); will retry on first request.")
+    # With per-thread scrapers, pre-warming only warms the calling thread.
+    # Threads in the executor pool will init their own scraper on first use.
+    print(f"Python scraper ready — {workers} worker(s), delay ({_delay_min}–{_delay_max}s)")
 
     yield
 

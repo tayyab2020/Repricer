@@ -207,7 +207,7 @@ class AmazonScraper:
         )
         print(f"  [aod] Fetching AOD endpoint for ASIN: {asin}")
         try:
-            _time.sleep(_random.uniform(1.5, 3.0))
+            _time.sleep(_random.uniform(0, 0.2))
             proxy = self.session._next_proxy()
             resp = self.session.session.get(
                 aod_url,
