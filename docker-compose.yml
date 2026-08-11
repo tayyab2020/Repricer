@@ -40,12 +40,14 @@ services:
   python-scraper:
     build:
       context: ./python-scraper
+    init: true
     environment:
       DELIVERY_POSTCODE:  "${DELIVERY_POSTCODE:-M1 1AE}"
       ANTHROPIC_API_KEY:  "${ANTHROPIC_API_KEY:-}"
       SCRAPER_WORKERS:    "${SCRAPER_WORKERS:-50}"
       DELAY_MIN:          "${SCRAPER_DELAY_MIN:-1}"
       DELAY_MAX:          "${SCRAPER_DELAY_MAX:-3}"
+      PLAYWRIGHT_ENABLED: "${PLAYWRIGHT_ENABLED:-false}"
     dns:
       - 8.8.8.8
       - 8.8.4.4

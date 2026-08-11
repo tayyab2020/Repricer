@@ -97,6 +97,8 @@ def _run_in_clean_thread(func, *args, timeout: int = 50, **kwargs):
     _kill_orphaned_chromium() is called to reap its Chromium process — otherwise
     zombie browsers accumulate until the container OOMs.
     """
+    if os.environ.get("PLAYWRIGHT_ENABLED", "false").lower() != "true":
+        return None
     if not _PLAYWRIGHT_SEMAPHORE.acquire(blocking=False):
         print("[playwright] concurrency limit reached — skipping Playwright fallback")
         return None
