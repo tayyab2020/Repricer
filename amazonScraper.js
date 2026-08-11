@@ -1156,17 +1156,34 @@ export async function getProductDetails(asin, { maxRetries = 3 } = {}) {
 
 const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL ?? 'http://localhost:8000';
 
+const _pythonNullResult = (asin, url) => ({
+  asin, url, price: null, inStock: false,
+  currency: 'GBP', title: null, brand: null,
+  delivery_date: null, delivery_price: null, method: 'python',
+});
+
 export async function scrapeProductFast(asin, opts = {}) {
   const url = `https://www.amazon.co.uk/dp/${asin}?th=1&currency=GBP`;
   const body = { asin };
   if (opts.proxies)  body.proxies  = opts.proxies;
   if (opts.ipCount)  body.ip_count = opts.ipCount;
-  const res = await fetch(`${PYTHON_SCRAPER_URL}/scrape`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60_000),
-  });
+  let res;
+  try {
+    res = await fetch(`${PYTHON_SCRAPER_URL}/scrape`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (err) {
+    // Node.js 60s AbortSignal fired before python-scraper responded.
+    // Return null price so BullMQ marks job done instead of retrying indefinitely.
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') return _pythonNullResult(asin, url);
+    throw err;
+  }
+  // 503 = asyncio.wait_for(45s) fired inside python-scraper (proxy hang).
+  // Treat as null price — job done, not a retriable failure.
+  if (res.status === 503) return _pythonNullResult(asin, url);
   if (!res.ok) throw new Error(`Python scraper HTTP ${res.status}`);
   const data = await res.json();
   return {
