@@ -295,31 +295,23 @@ async def scrape(req: ScrapeRequest):
         # proxies, each new request to the proxy endpoint gets a fresh IP automatically
         # without needing a new TCP connection at the scraper level. Reiniting was causing
         # cascading DNS failures that blocked the entire proxy config for minutes.
-        result = None
-        for attempt in range(1, 4):
-            try:
-                # asyncio.wait_for frees this coroutine's slot after 25s even if the
-                # underlying thread is stuck on a hung proxy TCP connection. The thread
-                # itself continues until curl_cffi's REQUEST_TIMEOUT fires (20s), but at
-                # least new requests are no longer blocked behind it.
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(executor, _scrape_in_thread, req.asin, req.proxies),
-                    timeout=45,
-                )
-            except asyncio.TimeoutError:
-                elapsed = round(time.time() - start, 1)
-                logger.warning(f"Thread timeout for {req.asin} after {elapsed}s — proxy connection hung")
-                raise HTTPException(status_code=503, detail="scrape timeout — proxy connection hung")
-            except Exception as e:
-                elapsed = round(time.time() - start, 1)
-                logger.error(f"Scrape exception for {req.asin} after {elapsed}s: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-
-            if result is not None:
-                break
-
-            if attempt < 3:
-                logger.warning(f"Anti-bot for {req.asin} (attempt {attempt}/3) — retrying")
+        # Single asyncio-guarded call. REQUEST_TIMEOUT=12s × 3 inner retries = 36s max,
+        # which fits inside asyncio(45s) and Node.js AbortSignal(60s).
+        # Outer-retry was removed: 3 outer × 36s = 108s > 60s abort, causing BullMQ
+        # to cycle jobs endlessly without draining the queue.
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(executor, _scrape_in_thread, req.asin, req.proxies),
+                timeout=45,
+            )
+        except asyncio.TimeoutError:
+            elapsed = round(time.time() - start, 1)
+            logger.warning(f"Thread timeout for {req.asin} after {elapsed}s — proxy connection hung")
+            raise HTTPException(status_code=503, detail="scrape timeout — proxy connection hung")
+        except Exception as e:
+            elapsed = round(time.time() - start, 1)
+            logger.error(f"Scrape exception for {req.asin} after {elapsed}s: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         if _sem_acquired:

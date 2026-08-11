@@ -22,14 +22,17 @@ from fake_useragent import UserAgent
 # Default configuration (can be overridden by user)
 DEFAULT_CONFIG = {
     'MAX_RETRIES': 3,
-    'REQUEST_TIMEOUT': 20,  # asyncio.wait_for in api.py is the 25s safety net; curl fires first
-    'DELAY_BETWEEN_REQUESTS': (0, 0.3),   # rotating ISP proxy = fresh IP per request, no delay needed
+    # asyncio.wait_for in api.py is 45s safety net.
+    # 3 inner attempts × 12s = 36s < 45s — asyncio never fires, no spurious 503s.
+    'REQUEST_TIMEOUT': 12,
+    'DELAY_BETWEEN_REQUESTS': (0, 0.0),   # rotating ISP proxy = fresh IP per request, zero delay
     'DEFAULT_IMPERSONATE': 'chrome120'  # part of curl_cffi's impersonation
 }
 
 # Default header template
 DEFAULT_HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',  # ensures compressed responses (~80KB vs ~400KB)
     'Accept-Language': 'en-US,en;q=0.9',
     'Upgrade-Insecure-Requests': '1',
     'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
