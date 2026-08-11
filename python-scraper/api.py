@@ -153,8 +153,29 @@ async def lifespan(app: FastAPI):
     _delay_max = float(os.getenv("DELAY_MAX", "0.3"))
     _default_proxies_raw = os.getenv("PROXIES", "")
 
-    # With per-thread scrapers, pre-warming only warms the calling thread.
-    # Threads in the executor pool will init their own scraper on first use.
+    loop = asyncio.get_event_loop()
+
+    # Pre-initialize one AmazonScraper per executor thread. Each init makes 2 HTTP
+    # requests (base URL + postcode) which can total up to 40s if the proxy is slow.
+    # Without pre-warming, the first scrape on each thread triggers init inside the
+    # asyncio.wait_for(25s) window → timeout before the actual scrape runs.
+    # Pre-warming runs all inits in parallel so startup takes max(init_time) not sum.
+    if _default_proxies_raw:
+        print(f"Pre-warming {workers} scraper threads (running init requests in parallel)…")
+        init_futures = [
+            loop.run_in_executor(executor, _get_scraper, _default_proxies_raw)
+            for _ in range(workers)
+        ]
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*init_futures, return_exceptions=True),
+                timeout=60,
+            )
+            ok = sum(1 for r in results if not isinstance(r, Exception))
+            print(f"Pre-warm done: {ok}/{workers} threads ready")
+        except asyncio.TimeoutError:
+            print("Pre-warm timed out after 60s — some threads will init on first use")
+
     print(f"Python scraper ready — {workers} worker(s), delay ({_delay_min}–{_delay_max}s)")
 
     yield
