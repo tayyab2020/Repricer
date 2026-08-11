@@ -108,11 +108,24 @@ class AmzSession:
             self.proxies_list = []
         self.proxy_index = 0
 
-        # Get and Set Cookies from the base URL using first proxy (if any)
+        # Get cookies from Amazon homepage (headers arrive quickly; body can be huge).
+        # stream=True lets us close the connection after headers without downloading the body.
         init_proxy = self.proxies_list[0] if self.proxies_list else None
-        self.session.get(self.base_url, headers=headers, proxies=init_proxy)
+        try:
+            resp = self.session.get(
+                self.base_url,
+                headers=headers,
+                proxies=init_proxy,
+                timeout=10,
+                stream=True,
+            )
+            try:
+                resp.close()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"AmzSession init request failed (continuing without cookies): {e}")
 
-        # Print session initialization info
         print(f"AmzSession initialized for amazon.{country_code}")
         print(f"Impersonating: {self.session.impersonate}")
         print(f"User-Agent: {headers['User-Agent'][:50]}...")
@@ -267,7 +280,7 @@ class AmzSession:
                     "Referer": self.base_url,
                 },
                 proxies=proxy,
-                timeout=self.config["REQUEST_TIMEOUT"],
+                timeout=10,  # shorter than REQUEST_TIMEOUT; init must fit in asyncio window
             )
             if resp and resp.status_code == 200:
                 print(f"Delivery postcode set to: {postcode}")
