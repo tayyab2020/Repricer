@@ -1157,7 +1157,7 @@ export async function getProductDetails(asin, { maxRetries = 3 } = {}) {
 const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL ?? 'http://localhost:8000';
 
 const _pythonNullResult = (asin, url) => ({
-  asin, url, price: null, inStock: false,
+  asin, url, price: null, inStock: null,
   currency: 'GBP', title: null, brand: null,
   delivery_date: null, delivery_price: null, method: 'python',
 });
