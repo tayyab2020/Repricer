@@ -379,10 +379,13 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
 // ─────────────────────────────────────────────────────────────
 // Login  (skips if the session is already active)
 //
-// Keepa changed their nav DOM — #panelUserRegisterLogin no longer
-// exists. Strategy: try several trigger selectors, then fall back
-// to navigating directly to keepa.com/#!login if none are found.
-// Form fields (#username, #password, #submitLogin) are stable.
+// Keepa DOM (current):
+//   Trigger : button[data-login]          ("LOG IN / REGISTER" in nav)
+//   Overlay : #loginOverlay               (hidden via CSS class "hidden")
+//   Username: #username
+//   Password: #password
+//   Submit  : #submitLogin                (type="submit")
+//   Error   : #loginError
 // ─────────────────────────────────────────────────────────────
 async function _login(page, email, password, log) {
   log('[Keepa] Checking login status…');
@@ -396,64 +399,48 @@ async function _login(page, email, password, log) {
 
   if (await _isLoggedIn(page)) { log('[Keepa] Already logged in'); return; }
 
-  // ── Open the login form ───────────────────────────────────────────────────
-  log('[Keepa] Opening login form…');
+  // ── Open the login modal ──────────────────────────────────────────────────
+  log('[Keepa] Clicking login trigger…');
 
-  // Try clicking whichever login trigger selector currently exists in the DOM
   const triggered = await page.evaluate(() => {
+    // Current selector: button[data-login] ("LOG IN / REGISTER")
+    // Fallbacks for any future rename
     const candidates = [
+      'button[data-login]',
       '#panelUserRegisterLogin',
-      '[href*="#!login"]',
       '[data-action="login"]',
       '[class*="loginBtn"]',
-      '[class*="login-btn"]',
     ];
     for (const sel of candidates) {
       const el = document.querySelector(sel);
       if (el) { el.click(); return sel; }
     }
     // Text-based fallback
-    const btn = [...document.querySelectorAll('a, button, span, li')]
-      .find(e => /^(log in|login|sign in)$/i.test(e.textContent.trim()) && e.offsetParent !== null);
+    const btn = [...document.querySelectorAll('button, a, span')]
+      .find(e => /^(log in(\s*\/\s*register)?|login|sign in)$/i.test(e.textContent.trim()) && e.offsetParent !== null);
     if (btn) { btn.click(); return 'text:' + btn.textContent.trim(); }
     return null;
   });
 
-  if (triggered) {
-    log(`[Keepa] Login trigger clicked (${triggered})`);
-    await _sleep(1500);
-  } else {
-    // No trigger button found — navigate directly to the login route
+  if (!triggered) {
     log('[Keepa] No login trigger found — navigating to keepa.com/#!login…');
     await page.goto('https://keepa.com/#!login', { waitUntil: 'networkidle2', timeout: 20_000 });
     await _sleep(2000);
+  } else {
+    log(`[Keepa] Login trigger clicked (${triggered})`);
+    await _sleep(1500);
   }
 
-  // Ensure the login overlay is visible; force-show it if not
-  let overlayVisible = await page.evaluate(() => {
+  // Overlay hides via CSS class "hidden" — remove it if still present
+  await page.evaluate(() => {
     const ov = document.querySelector('#loginOverlay');
-    return ov ? ov.offsetParent !== null : false;
+    if (ov) { ov.classList.remove('hidden'); }
   });
+  await _sleep(300);
 
-  if (!overlayVisible) {
-    log('[Keepa] Overlay not visible yet — force-showing…');
-    await page.evaluate(() => {
-      const ov = document.querySelector('#loginOverlay');
-      if (ov) { ov.classList.remove('hidden'); ov.style.display = 'block'; }
-    });
-    await _sleep(500);
-    overlayVisible = await page.evaluate(() => {
-      const ov = document.querySelector('#loginOverlay');
-      return ov ? ov.offsetParent !== null : false;
-    });
-  }
-
-  // Wait for the username field regardless of overlay state
-  try {
-    await page.waitForSelector('#username', { timeout: 8_000 });
-  } catch {
-    if (!overlayVisible) throw new Error('Login form (#username) not found — Keepa UI may have changed again');
-  }
+  // Wait for the username field to be accessible
+  await page.waitForSelector('#username', { timeout: 8_000 })
+    .catch(() => { throw new Error('Login form (#username) not found — Keepa UI may have changed again'); });
   log('[Keepa] Login form ready');
 
   // ── Fill credentials ──────────────────────────────────────────────────────
@@ -474,12 +461,12 @@ async function _login(page, email, password, log) {
   log('[Keepa] Submitting login form…');
   await page.click('#submitLogin');
 
+  // Wait for any logged-in indicator to appear
   await page.waitForFunction(
     () => {
-      const trigger = document.querySelector('#panelUserRegisterLogin');
-      const menu    = document.querySelector('#panelUserMenu');
-      if (trigger && trigger.style.display === 'none') return true;
-      if (menu    && menu.style.display    !== 'none') return true;
+      // login button disappears when logged in
+      const loginBtn = document.querySelector('button[data-login]');
+      if (!loginBtn) return true;
       const t = (document.body?.textContent || '').toLowerCase();
       return t.includes('log out') || t.includes('logout') ||
              t.includes('sign out') || t.includes('quota:');
@@ -501,12 +488,10 @@ async function _login(page, email, password, log) {
 
 async function _isLoggedIn(page) {
   return page.evaluate(() => {
-    // Old Keepa selectors (may still exist)
-    const trigger = document.querySelector('#panelUserRegisterLogin');
-    const menu    = document.querySelector('#panelUserMenu');
-    if (trigger && trigger.style.display === 'none') return true;
-    if (menu    && menu.style.display    !== 'none') return true;
-    // Text-based detection (covers renamed elements and new UI)
+    // When logged in, button[data-login] ("LOG IN / REGISTER") is absent or hidden
+    const loginBtn = document.querySelector('button[data-login]');
+    if (!loginBtn) return true;  // element gone = logged in
+    // Text-based detection
     const t = (document.body?.textContent || '').toLowerCase();
     return t.includes('log out') || t.includes('logout') ||
            t.includes('sign out') || t.includes('quota:');
