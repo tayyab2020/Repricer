@@ -237,11 +237,13 @@ async function _dismissExportDialog(page) {
 async function _scrapeOnPage(page, dlDir, asins, log) {
   // ── 1. Inject ASINs into the input field ─────────────────────────────────
   log(`[Keepa] Injecting ${asins.length} ASINs into Product Viewer…`);
-  await page.waitForSelector('#importInputAsin', { timeout: 15_000 });
+  // Keepa renamed the textarea from #importInputAsin to #importInputList
+  await page.waitForSelector('#importInputList, #importInputAsin', { timeout: 15_000 });
+  const ASIN_FIELD = await page.$('#importInputList') ? '#importInputList' : '#importInputAsin';
 
   // Native value-setter so any JS binding on the field fires correctly
-  await page.evaluate((asinText) => {
-    const el = document.querySelector('#importInputAsin');
+  await page.evaluate((asinText, sel) => {
+    const el = document.querySelector(sel);
     if (!el) return;
     const proto = el.tagName === 'TEXTAREA'
       ? window.HTMLTextAreaElement.prototype
@@ -250,11 +252,11 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
     if (setter) setter.call(el, asinText); else el.value = asinText;
     el.dispatchEvent(new Event('input',  { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
-  }, asins.join(' '));
+  }, asins.join(' '), ASIN_FIELD);
   await _sleep(400);
 
   // File upload fallback if direct injection leaves the field empty
-  const fieldAfterInject = await page.$eval('#importInputAsin', el => el.value.trim().slice(0, 20)).catch(() => '');
+  const fieldAfterInject = await page.$eval(ASIN_FIELD, el => el.value.trim().slice(0, 20)).catch(() => '');
   if (!fieldAfterInject) {
     log('[Keepa] Direct inject did not populate field — trying file upload fallback…');
     const asinFile = path.join(dlDir, 'asins.txt');
@@ -263,13 +265,13 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
     if (fileInput) {
       await fileInput.uploadFile(asinFile);
       await page.waitForFunction(
-        () => (document.querySelector('#importInputAsin')?.value?.trim().length ?? 0) > 0,
-        { timeout: 8_000 }
+        (sel) => (document.querySelector(sel)?.value?.trim().length ?? 0) > 0,
+        { timeout: 8_000 }, ASIN_FIELD
       ).catch(() => log('[Keepa] File upload did not populate field either — proceeding anyway'));
     }
   }
 
-  const { registeredPreview, registeredCount } = await page.$eval('#importInputAsin', el => {
+  const { registeredPreview, registeredCount } = await page.$eval(ASIN_FIELD, el => {
     const val = el.value.trim();
     return {
       registeredPreview: val.slice(0, 120),
@@ -377,13 +379,10 @@ async function _scrapeOnPage(page, dlDir, asins, log) {
 // ─────────────────────────────────────────────────────────────
 // Login  (skips if the session is already active)
 //
-// Keepa DOM (confirmed from page snapshot):
-//   Trigger : #panelUserRegisterLogin  (span, always visible in nav)
-//   Overlay : #loginOverlay            (div, display:none until trigger clicked)
-//   Username: #username                (type="text", name="username")
-//   Password: #password                (type="password", name="password")
-//   Submit  : #submitLogin             (type="submit")
-//   Logged-in indicator: #panelUserMenu visible / #panelUserRegisterLogin hidden
+// Keepa changed their nav DOM — #panelUserRegisterLogin no longer
+// exists. Strategy: try several trigger selectors, then fall back
+// to navigating directly to keepa.com/#!login if none are found.
+// Form fields (#username, #password, #submitLogin) are stable.
 // ─────────────────────────────────────────────────────────────
 async function _login(page, email, password, log) {
   log('[Keepa] Checking login status…');
@@ -397,17 +396,40 @@ async function _login(page, email, password, log) {
 
   if (await _isLoggedIn(page)) { log('[Keepa] Already logged in'); return; }
 
-  // ── Open the login overlay ────────────────────────────────────────────────
-  log('[Keepa] Clicking login trigger (#panelUserRegisterLogin)…');
-  await page.waitForSelector('#panelUserRegisterLogin', { timeout: 10_000 });
+  // ── Open the login form ───────────────────────────────────────────────────
+  log('[Keepa] Opening login form…');
 
-  await page.click('#panelUserRegisterLogin');
-  await page.evaluate(() => {
-    document.querySelector('#panelUserRegisterLogin')
-      ?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  // Try clicking whichever login trigger selector currently exists in the DOM
+  const triggered = await page.evaluate(() => {
+    const candidates = [
+      '#panelUserRegisterLogin',
+      '[href*="#!login"]',
+      '[data-action="login"]',
+      '[class*="loginBtn"]',
+      '[class*="login-btn"]',
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el) { el.click(); return sel; }
+    }
+    // Text-based fallback
+    const btn = [...document.querySelectorAll('a, button, span, li')]
+      .find(e => /^(log in|login|sign in)$/i.test(e.textContent.trim()) && e.offsetParent !== null);
+    if (btn) { btn.click(); return 'text:' + btn.textContent.trim(); }
+    return null;
   });
-  await _sleep(1500);
 
+  if (triggered) {
+    log(`[Keepa] Login trigger clicked (${triggered})`);
+    await _sleep(1500);
+  } else {
+    // No trigger button found — navigate directly to the login route
+    log('[Keepa] No login trigger found — navigating to keepa.com/#!login…');
+    await page.goto('https://keepa.com/#!login', { waitUntil: 'networkidle2', timeout: 20_000 });
+    await _sleep(2000);
+  }
+
+  // Ensure the login overlay is visible; force-show it if not
   let overlayVisible = await page.evaluate(() => {
     const ov = document.querySelector('#loginOverlay');
     return ov ? ov.offsetParent !== null : false;
@@ -426,8 +448,13 @@ async function _login(page, email, password, log) {
     });
   }
 
-  if (!overlayVisible) throw new Error('Login overlay (#loginOverlay) could not be shown');
-  log('[Keepa] Login overlay open');
+  // Wait for the username field regardless of overlay state
+  try {
+    await page.waitForSelector('#username', { timeout: 8_000 });
+  } catch {
+    if (!overlayVisible) throw new Error('Login form (#username) not found — Keepa UI may have changed again');
+  }
+  log('[Keepa] Login form ready');
 
   // ── Fill credentials ──────────────────────────────────────────────────────
   await page.evaluate((em, pw) => {
@@ -454,7 +481,8 @@ async function _login(page, email, password, log) {
       if (trigger && trigger.style.display === 'none') return true;
       if (menu    && menu.style.display    !== 'none') return true;
       const t = (document.body?.textContent || '').toLowerCase();
-      return t.includes('log out') || t.includes('logout');
+      return t.includes('log out') || t.includes('logout') ||
+             t.includes('sign out') || t.includes('quota:');
     },
     { timeout: 25_000 }
   ).catch(() => log('[Keepa] Login confirmation not detected — proceeding anyway'));
@@ -473,12 +501,15 @@ async function _login(page, email, password, log) {
 
 async function _isLoggedIn(page) {
   return page.evaluate(() => {
+    // Old Keepa selectors (may still exist)
     const trigger = document.querySelector('#panelUserRegisterLogin');
     const menu    = document.querySelector('#panelUserMenu');
     if (trigger && trigger.style.display === 'none') return true;
     if (menu    && menu.style.display    !== 'none') return true;
+    // Text-based detection (covers renamed elements and new UI)
     const t = (document.body?.textContent || '').toLowerCase();
-    return t.includes('log out') || t.includes('logout');
+    return t.includes('log out') || t.includes('logout') ||
+           t.includes('sign out') || t.includes('quota:');
   });
 }
 
