@@ -56,6 +56,7 @@ redisPub.connect().catch(() => {}); // best-effort; log streaming still works wi
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 // Runtime-mutable defaults loaded from DB settings at startup
 const _globalSettings = { feeRate: 0.15, defaultRoi: 20 };
