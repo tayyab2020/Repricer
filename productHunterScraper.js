@@ -18,6 +18,7 @@
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
+import { checkListing } from './complianceData.js';
 import path from 'path';
 import os from 'os';
 puppeteer.use(StealthPlugin());
@@ -172,8 +173,23 @@ export async function runProductHunting(
     const rows = _mapKeepaToOnBuy(csvPath, maxListings, log);
     log(`[Hunt] Mapped ${rows.length} product row(s) ✓`);
 
+    // ── 10. Compliance filter ────────────────────────────────────────────
+    const compliant = [];
+    let filteredCount = 0;
+    for (const row of rows) {
+      const { violation, reason } = checkListing({ name: row.name, brand: row.brand, title: row.name });
+      if (violation) {
+        log(`[Compliance] ⚠ Filtered "${(row.name || '').slice(0, 60)}" — ${reason}`);
+        filteredCount++;
+      } else {
+        compliant.push(row);
+      }
+    }
+    if (filteredCount > 0) {
+      log(`[Compliance] Filtered ${filteredCount} prohibited/protected product(s) — ${compliant.length} remain`);
+    }
 
-    return rows;
+    return compliant;
 
   } finally {
     await browser.close().catch(() => {});

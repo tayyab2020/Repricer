@@ -25,9 +25,18 @@ dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Redis pub client for streaming logs to the API server (set in startWorker)
+let redisPub = null;
+
+// Per-user scheduled cron tasks
+const _userComplianceCrons = new Map();
+
+// Track which users currently have a running job
+const _runningUsers = new Set();
+
 // ── Logger ─────────────────────────────────────────────────────────────────
 
-function makeLogger(accountName) {
+function makeLogger(accountName, userId = null) {
   const logDir = path.join(__dirname, 'logs', 'compliance_logs');
   fs.mkdirSync(logDir, { recursive: true });
   const date     = new Date().toISOString().slice(0, 10);
@@ -37,7 +46,41 @@ function makeLogger(accountName) {
     const line = `[${new Date().toISOString()}] ${msg}`;
     console.log(line);
     fs.appendFileSync(logFile, line + '\n');
+    if (redisPub && userId) {
+      redisPub.publish(`compliance:log:${userId}`, JSON.stringify({ msg: line })).catch(() => {});
+    }
   };
+}
+
+// ── Per-user schedule loader ───────────────────────────────────────────────
+
+async function refreshComplianceSchedules(db) {
+  try {
+    const { rows } = await db.query(`
+      SELECT u.id AS user_id,
+             COALESCE(s.value, '02:00') AS schedule_time
+        FROM users u
+        LEFT JOIN settings s ON s.user_id = u.id AND s.key = 'compliance_schedule_time'
+    `);
+
+    for (const task of _userComplianceCrons.values()) task.stop();
+    _userComplianceCrons.clear();
+
+    for (const row of rows) {
+      const [h = 2, m = 0] = (row.schedule_time || '02:00').split(':').map(Number);
+      const expr = `${m} ${h} * * *`;
+      const task = cron.schedule(expr, () => {
+        console.log(`[Compliance] ⏰ Scheduled patrol for user ${row.user_id} at ${row.schedule_time}`);
+        runComplianceJob(db, { userId: row.user_id }).catch(e =>
+          console.error(`[Compliance] Scheduled error for user ${row.user_id}:`, e.message)
+        );
+      });
+      _userComplianceCrons.set(row.user_id, task);
+    }
+    console.log(`[Compliance] Schedules refreshed for ${rows.length} user(s)`);
+  } catch (err) {
+    console.error('[Compliance] refreshComplianceSchedules error:', err.message);
+  }
 }
 
 // ── OnBuy API helpers ──────────────────────────────────────────────────────
@@ -110,8 +153,8 @@ async function setStockZero(token, siteId, skus, log) {
 
 // ── Core patrol logic ──────────────────────────────────────────────────────
 
-async function patrolAccount(db, account) {
-  const log = makeLogger(account.account_name);
+async function patrolAccount(db, account, userId = null) {
+  const log = makeLogger(account.account_name, userId);
   log(`[Compliance] ── Starting patrol for "${account.account_name}" ──`);
 
   const token = await getTokenForAccount(account, { log });
@@ -168,7 +211,22 @@ async function patrolAccount(db, account) {
 }
 
 export async function runComplianceJob(db, { userId = null, log = console.log } = {}) {
-  log(`[Compliance] ══ Job started${userId ? ` for user ${userId}` : ' (all users)'} ══`);
+  if (userId && _runningUsers.has(userId)) {
+    log(`[Compliance] Job already running for user ${userId} — skipping`);
+    return;
+  }
+  if (userId) _runningUsers.add(userId);
+
+  // Notify server that job is running
+  if (redisPub && userId) {
+    redisPub.publish('compliance:status', JSON.stringify({ userId, running: true })).catch(() => {});
+  }
+
+  const rootLog = userId
+    ? makeLogger('_global', userId)
+    : console.log;
+
+  rootLog(`[Compliance] ══ Job started${userId ? ` for user ${userId}` : ' (all users)'} ══`);
 
   const where = userId
     ? 'WHERE a.is_active = true AND a.compliance_enabled = true AND a.user_id = $1'
@@ -183,25 +241,41 @@ export async function runComplianceJob(db, { userId = null, log = console.log } 
     );
     accounts = res.rows;
   } catch (err) {
-    log(`[Compliance] DB query failed: ${err.message}`);
+    rootLog(`[Compliance] DB query failed: ${err.message}`);
+    if (userId) {
+      _runningUsers.delete(userId);
+      if (redisPub) {
+        redisPub.publish('compliance:status', JSON.stringify({ userId, running: false })).catch(() => {});
+        redisPub.publish(`compliance:log:${userId}`, JSON.stringify({ done: true })).catch(() => {});
+      }
+    }
     return;
   }
 
-  log(`[Compliance] ${accounts.length} account(s) to patrol`);
+  rootLog(`[Compliance] ${accounts.length} account(s) to patrol`);
   let totalChecked = 0, totalViolations = 0, totalRemoved = 0;
 
   for (const account of accounts) {
+    const effectiveUserId = userId ?? account.user_id;
     try {
-      const result = await patrolAccount(db, account);
+      const result = await patrolAccount(db, account, effectiveUserId);
       totalChecked    += result.checked;
       totalViolations += result.violations;
       totalRemoved    += result.removed;
     } catch (err) {
-      log(`[Compliance] Unhandled error for "${account.account_name}": ${err.message}`);
+      rootLog(`[Compliance] Unhandled error for "${account.account_name}": ${err.message}`);
     }
   }
 
-  log(`[Compliance] ══ Job complete — checked=${totalChecked} violations=${totalViolations} removed=${totalRemoved} ══`);
+  rootLog(`[Compliance] ══ Job complete — checked=${totalChecked} violations=${totalViolations} removed=${totalRemoved} ══`);
+
+  if (userId) {
+    _runningUsers.delete(userId);
+    if (redisPub) {
+      redisPub.publish('compliance:status', JSON.stringify({ userId, running: false })).catch(() => {});
+      redisPub.publish(`compliance:log:${userId}`, JSON.stringify({ done: true })).catch(() => {});
+    }
+  }
 }
 
 // ── Worker bootstrap ───────────────────────────────────────────────────────
@@ -220,36 +294,49 @@ export function startWorker() {
 
   db.query(`
     CREATE TABLE IF NOT EXISTS compliance_violations (
-      id            SERIAL PRIMARY KEY,
-      account_id    INTEGER NOT NULL,
-      sku           TEXT,
-      title         TEXT,
+      id             SERIAL PRIMARY KEY,
+      account_id     INTEGER NOT NULL,
+      sku            TEXT,
+      title          TEXT,
       violation_type TEXT,
-      reason        TEXT,
-      actioned_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+      reason         TEXT,
+      actioned_at    TIMESTAMP NOT NULL DEFAULT NOW(),
       UNIQUE (account_id, sku)
     )
   `).catch(() => {});
 
-  // Redis pub/sub: manual trigger via publish('compliance:run', userId)
+  // Redis publisher — streams logs and status to API server
+  redisPub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+    maxRetriesPerRequest: null,
+    lazyConnect: true,
+  });
+  redisPub.connect().catch(() => {});
+
+  // Redis subscriber — manual trigger + settings-updated reload
   const redisSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
     maxRetriesPerRequest: null,
   });
-  redisSub.subscribe('compliance:run').catch(() => {});
+  redisSub.subscribe('compliance:run', 'compliance:settings-updated').catch(() => {});
   redisSub.on('message', (channel, message) => {
-    if (channel !== 'compliance:run') return;
-    const userId = parseInt(message) || null;
-    console.log(`[Compliance] Manual run triggered${userId ? ` for user ${userId}` : ''}`);
-    runComplianceJob(db, { userId }).catch(e =>
-      console.error('[Compliance] Manual run error:', e)
-    );
+    if (channel === 'compliance:run') {
+      const userId = parseInt(message) || null;
+      console.log(`[Compliance] Manual run triggered${userId ? ` for user ${userId}` : ''}`);
+      runComplianceJob(db, { userId }).catch(e =>
+        console.error('[Compliance] Manual run error:', e.message)
+      );
+    } else if (channel === 'compliance:settings-updated') {
+      refreshComplianceSchedules(db).catch(() => {});
+    }
   });
 
-  // Daily at 02:00 — runs across all active accounts
-  console.log('[Compliance] Started — patrolling daily at 02:00');
-  cron.schedule('0 2 * * *', () => {
-    console.log('[Compliance] ⏰ Scheduled daily patrol starting…');
-    runComplianceJob(db).catch(e => console.error('[Compliance] Scheduled run error:', e));
+  // Load per-user schedules (replaces the old fixed 02:00 cron)
+  console.log('[Compliance] Started — loading per-user schedules…');
+  refreshComplianceSchedules(db).catch(() => {
+    // Fallback: daily at 02:00 for all users if schedule load fails
+    cron.schedule('0 2 * * *', () => {
+      console.log('[Compliance] ⏰ Fallback daily patrol starting…');
+      runComplianceJob(db).catch(e => console.error('[Compliance] Fallback error:', e.message));
+    });
   });
 }
 

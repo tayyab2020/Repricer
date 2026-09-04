@@ -7,7 +7,7 @@ import {
   LayoutDashboard, Link2, TrendingUp, Store, Upload,
   Package, Trash2, ClipboardList, Settings, Terminal,
   Users, Zap, RefreshCw, X, LogOut, Search, ChevronRight, ChevronDown,
-  GitCompare, ShieldCheck, Hash,
+  GitCompare, ShieldCheck, Hash, ShieldAlert, AlertTriangle, Clock, Play, Eye, EyeOff,
 } from "lucide-react";
 
 // ── Nav icon map ─────────────────────────────
@@ -22,6 +22,7 @@ const NAV_ICONS = {
   "orders":             ClipboardList,
   "product-hunting":    Search,
   "price-comparison":   GitCompare,
+  "compliance":         ShieldAlert,
   "proxy-tester":       ShieldCheck,
   "settings":           Settings,
   "logs":               Terminal,
@@ -461,10 +462,22 @@ function DashboardPage({ stats }) {
   return (
     <div>
       {/* ── KPI Cards ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 16 }}>
         <StatCard label="Active Listings"     value={stats?.activeListings}      color={C.accent} icon={Package} />
         <StatCard label="Syncs (24h)"         value={stats?.syncedLast24h}       color={C.blue}   icon={RefreshCw} />
         <StatCard label="Price Changes (24h)" value={stats?.priceChangesLast24h} color={C.amber}  icon={TrendingUp} />
+      </div>
+
+      {/* ── Compliance KPI Cards ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+        <StatCard label="Compliance Violations (Total)" value={stats?.complianceViolationsTotal ?? 0} color={C.red}   icon={ShieldAlert} />
+        <StatCard label="Actioned (7d)"                 value={stats?.complianceLast7d ?? 0}          color={C.amber} icon={AlertTriangle} />
+        <StatCard
+          label="Last Patrol"
+          value={stats?.complianceLastRun ? ago(stats.complianceLastRun) : "Never"}
+          color={C.muted}
+          icon={Clock}
+        />
       </div>
 
       {/* ── Charts Row: Pie + Line ── */}
@@ -2737,6 +2750,247 @@ const INTERVAL_OPTIONS = [
   { value: "720", label: "Every 12 hours" },
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Compliance Page
+// ─────────────────────────────────────────────────────────────────────────────
+function CompliancePage() {
+  const [violations, setViolations] = useState([]);
+  const [total,      setTotal]      = useState(0);
+  const [page,       setPage]       = useState(1);
+  const [loading,    setLoading]    = useState(false);
+  const [filterType, setFilterType] = useState("");
+  const [filterAcct, setFilterAcct] = useState("");
+  const [search,     setSearch]     = useState("");
+  const [accounts,   setAccounts]   = useState([]);
+  const [deleting,   setDeleting]   = useState(null);
+  const [summary,    setSummary]    = useState({});
+  const LIMIT = 50;
+
+  const loadViolations = useCallback((pg = 1) => {
+    setLoading(true);
+    const p = new URLSearchParams({ page: pg, limit: LIMIT });
+    if (filterType) p.set("type",       filterType);
+    if (filterAcct) p.set("account_id", filterAcct);
+    if (search)     p.set("search",     search);
+    api(`/compliance/violations?${p}`)
+      .then(d => { setViolations(d.rows || []); setTotal(d.total || 0); setPage(pg); })
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, [filterType, filterAcct, search]);
+
+  useEffect(() => {
+    api("/accounts").then(d => setAccounts(Array.isArray(d) ? d : d.rows || [])).catch(() => {});
+  }, []);
+
+  useEffect(() => { loadViolations(1); }, [loadViolations]);
+
+  // Compute per-type counts from loaded violations for summary badges
+  useEffect(() => {
+    const counts = {};
+    violations.forEach(v => { counts[v.violation_type] = (counts[v.violation_type] || 0) + 1; });
+    setSummary(counts);
+  }, [violations]);
+
+  async function removeViolation(id) {
+    setDeleting(id);
+    try {
+      await api(`/compliance/violations/${id}`, { method: "DELETE" });
+      loadViolations(page);
+    } catch (e) { console.error(e); }
+    finally { setDeleting(null); }
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / LIMIT));
+
+  const TYPE_COLORS = {
+    brand:      C.amber,
+    prohibited: C.red,
+  };
+
+  const tbl = {
+    width: "100%", borderCollapse: "collapse", fontSize: 12,
+  };
+  const th = {
+    background: C.bg, color: C.muted, fontWeight: 600, fontSize: 11,
+    letterSpacing: "0.06em", textTransform: "uppercase",
+    padding: "8px 12px", textAlign: "left", borderBottom: `1px solid ${C.border}`,
+  };
+  const td = {
+    padding: "10px 12px", borderBottom: `1px solid ${C.border}`,
+    color: C.textDim, verticalAlign: "middle",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* ── Summary badges ── */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <div style={{
+          background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+          padding: "12px 20px", display: "flex", flexDirection: "column", gap: 4, minWidth: 140,
+        }}>
+          <p style={{ color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", margin: 0 }}>Total Violations</p>
+          <p style={{ color: C.red, fontSize: 28, fontWeight: 700, margin: 0 }}>{total}</p>
+        </div>
+        {Object.entries(summary).map(([type, count]) => (
+          <div key={type} style={{
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+            padding: "12px 20px", display: "flex", flexDirection: "column", gap: 4, minWidth: 140,
+          }}>
+            <p style={{ color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", margin: 0 }}>{type}</p>
+            <p style={{ color: TYPE_COLORS[type] || C.amber, fontSize: 28, fontWeight: 700, margin: 0 }}>{count}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Filters ── */}
+      <div style={{
+        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
+        padding: "14px 18px", display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end",
+      }}>
+        <div>
+          <p style={{ color: C.muted, fontSize: 11, marginBottom: 4 }}>Search</p>
+          <input
+            style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+              padding: "7px 12px", color: C.text, fontSize: 12, width: 220 }}
+            placeholder="Product title or SKU…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && loadViolations(1)}
+          />
+        </div>
+        <div>
+          <p style={{ color: C.muted, fontSize: 11, marginBottom: 4 }}>Violation Type</p>
+          <select
+            style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+              padding: "7px 12px", color: C.text, fontSize: 12 }}
+            value={filterType}
+            onChange={e => setFilterType(e.target.value)}
+          >
+            <option value="">All types</option>
+            <option value="brand">Brand (Protected)</option>
+            <option value="prohibited">Prohibited Product</option>
+          </select>
+        </div>
+        <div>
+          <p style={{ color: C.muted, fontSize: 11, marginBottom: 4 }}>Account</p>
+          <select
+            style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 7,
+              padding: "7px 12px", color: C.text, fontSize: 12 }}
+            value={filterAcct}
+            onChange={e => setFilterAcct(e.target.value)}
+          >
+            <option value="">All accounts</option>
+            {accounts.map(a => (
+              <option key={a.id} value={a.id}>{a.account_name}</option>
+            ))}
+          </select>
+        </div>
+        <Btn onClick={() => loadViolations(1)} disabled={loading} style={{ alignSelf: "flex-end" }}>
+          {loading ? "Loading…" : "Apply Filters"}
+        </Btn>
+        <Btn variant="secondary" onClick={() => {
+          setFilterType(""); setFilterAcct(""); setSearch("");
+        }} style={{ alignSelf: "flex-end" }}>
+          Clear
+        </Btn>
+      </div>
+
+      {/* ── Violations Table ── */}
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+        {loading ? (
+          <div style={{ padding: 40, textAlign: "center", color: C.muted }}>Loading…</div>
+        ) : violations.length === 0 ? (
+          <div style={{ padding: 40, textAlign: "center", color: C.muted }}>
+            <ShieldCheck style={{ width: 36, height: 36, margin: "0 auto 12px", color: C.accent }} />
+            <p style={{ margin: 0, fontSize: 14 }}>No violations found</p>
+            <p style={{ margin: "6px 0 0", fontSize: 12 }}>All your listings are compliant with OnBuy policies.</p>
+          </div>
+        ) : (
+          <>
+            <div style={{ overflowX: "auto" }}>
+              <table style={tbl}>
+                <thead>
+                  <tr>
+                    <th style={th}>Product</th>
+                    <th style={th}>SKU</th>
+                    <th style={th}>Account</th>
+                    <th style={th}>Type</th>
+                    <th style={th}>Reason</th>
+                    <th style={th}>Actioned</th>
+                    <th style={th}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {violations.map(v => (
+                    <tr key={v.id} style={{ background: "transparent" }}>
+                      <td style={{ ...td, maxWidth: 260 }}>
+                        <p style={{ margin: 0, color: C.text, fontWeight: 500,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {v.title || "(unknown)"}
+                        </p>
+                      </td>
+                      <td style={{ ...td, fontFamily: "monospace", color: C.muted }}>{v.sku || "—"}</td>
+                      <td style={td}>{v.account_name}</td>
+                      <td style={td}>
+                        <span style={{
+                          display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 11,
+                          fontWeight: 600, textTransform: "uppercase",
+                          background: v.violation_type === "brand" ? `${C.amber}22` : `${C.red}22`,
+                          color: v.violation_type === "brand" ? C.amber : C.red,
+                        }}>
+                          {v.violation_type || "—"}
+                        </span>
+                      </td>
+                      <td style={{ ...td, maxWidth: 340 }}>
+                        <p style={{ margin: 0, lineHeight: 1.4,
+                          overflow: "hidden", display: "-webkit-box",
+                          WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                          {v.reason}
+                        </p>
+                      </td>
+                      <td style={{ ...td, whiteSpace: "nowrap" }}>{ago(v.actioned_at)}</td>
+                      <td style={td}>
+                        <button
+                          onClick={() => removeViolation(v.id)}
+                          disabled={deleting === v.id}
+                          title="Remove from violations list"
+                          style={{
+                            background: "transparent", border: `1px solid ${C.border}`,
+                            borderRadius: 6, padding: "4px 10px", color: C.muted,
+                            fontSize: 11, cursor: "pointer",
+                            opacity: deleting === v.id ? 0.5 : 1,
+                          }}
+                        >
+                          {deleting === v.id ? "…" : "Dismiss"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div style={{
+                display: "flex", justifyContent: "center", alignItems: "center",
+                gap: 8, padding: "14px 16px", borderTop: `1px solid ${C.border}`,
+              }}>
+                <Btn variant="secondary" small disabled={page <= 1}
+                  onClick={() => loadViolations(page - 1)}>← Prev</Btn>
+                <span style={{ color: C.muted, fontSize: 12 }}>Page {page} / {totalPages} ({total} total)</span>
+                <Btn variant="secondary" small disabled={page >= totalPages}
+                  onClick={() => loadViolations(page + 1)}>Next →</Btn>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTheme = "semi-dark", onThemeChange }) {
   const [proxyUrl,      setProxyUrl]      = useState("");
   const [feePercent,    setFeePercent]    = useState("15");
@@ -2758,21 +3012,31 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
   const [rbUploading,   setRbUploading]   = useState(false);
   const [rbMsg,         setRbMsg]         = useState(null);
   const [rbDeleting,    setRbDeleting]    = useState(false);
-  const [rpCount,       setRpCount]       = useState(null);
-  const [rpUploading,   setRpUploading]   = useState(false);
-  const [rpMsg,         setRpMsg]         = useState(null);
-  const [rpDeleting,    setRpDeleting]    = useState(false);
+  const [rpCount,          setRpCount]          = useState(null);
+  const [rpUploading,      setRpUploading]      = useState(false);
+  const [rpMsg,            setRpMsg]            = useState(null);
+  const [rpDeleting,       setRpDeleting]       = useState(false);
+  const [complianceTime,   setComplianceTime]   = useState("02:00");
+  const [complianceRunning,setComplianceRunning]= useState(false);
+  const [complianceLogs,   setComplianceLogs]   = useState([]);
+  const [complianceLogOpen,setComplianceLogOpen]= useState(false);
+  const complianceEsRef                         = useRef(null);
+  const complianceLogsRef                       = useRef(null);
 
   useEffect(() => {
     api("/settings").then(s => {
-      setProxyUrl(s.webshare_proxy_api      || "");
-      setFeePercent(s.onbuy_fee_percent     || "15");
-      setDefaultRoi(s.default_roi_percent   || "20");
-      setMinRoi(s.min_roi_percent           || "0");
-      setInterval(s.job_interval_minutes    || "30");
-      setStartTime(s.job_start_time         || "00:00");
+      setProxyUrl(s.webshare_proxy_api        || "");
+      setFeePercent(s.onbuy_fee_percent       || "15");
+      setDefaultRoi(s.default_roi_percent     || "20");
+      setMinRoi(s.min_roi_percent             || "0");
+      setInterval(s.job_interval_minutes      || "30");
+      setStartTime(s.job_start_time           || "00:00");
+      setComplianceTime(s.compliance_schedule_time || "02:00");
       setStatus(s._proxy_status);
     }).catch(console.error);
+
+    // Check if compliance job is already running
+    api("/compliance/status").then(d => setComplianceRunning(d.running)).catch(() => {});
     api("/settings/categories/count").then(d => { setCatCount(d.count); setCatBySite(d.by_site ?? []); }).catch(() => { setCatCount(0); setCatBySite([]); });
     api("/restricted-brands").then(d => setRbCount(d.count)).catch(() => setRbCount(0));
     api("/restricted-products").then(d => setRpCount(d.count)).catch(() => setRpCount(0));
@@ -2821,19 +3085,66 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
     } catch {}
   }
 
+  const runCompliance = async () => {
+    if (complianceRunning) return;
+    setComplianceRunning(true);
+    setComplianceLogs([]);
+    setComplianceLogOpen(true);
+    try {
+      await api("/compliance/run", { method: "POST" });
+      // Open SSE stream to receive live logs
+      const token = localStorage.getItem("repricer_token");
+      if (complianceEsRef.current) complianceEsRef.current.close();
+      const es = new EventSource(`${API}/compliance/logs?token=${encodeURIComponent(token)}`);
+      complianceEsRef.current = es;
+      es.onmessage = e => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.done) {
+            es.close();
+            complianceEsRef.current = null;
+            setComplianceRunning(false);
+          } else if (data.msg) {
+            setComplianceLogs(prev => {
+              const next = [...prev, data.msg];
+              // Auto-scroll log box
+              setTimeout(() => {
+                if (complianceLogsRef.current) {
+                  complianceLogsRef.current.scrollTop = complianceLogsRef.current.scrollHeight;
+                }
+              }, 20);
+              return next;
+            });
+          }
+        } catch {}
+      };
+      es.onerror = () => {
+        es.close();
+        complianceEsRef.current = null;
+        setComplianceRunning(false);
+      };
+    } catch (e) {
+      setComplianceRunning(false);
+    }
+  };
+
+  // Cleanup SSE on unmount
+  useEffect(() => () => { if (complianceEsRef.current) complianceEsRef.current.close(); }, []);
+
   const save = async () => {
     setSaving(true); setMsg(null);
     try {
       const s = await api("/settings", {
         method: "PUT",
         body: JSON.stringify({
-          webshare_proxy_api:   proxyUrl,
-          onbuy_fee_percent:    feePercent,
-          default_roi_percent:  defaultRoi,
-          min_roi_percent:      minRoi,
-          job_interval_minutes: interval,
-          job_start_time:       startTime,
-          app_theme:            appTheme,
+          webshare_proxy_api:     proxyUrl,
+          onbuy_fee_percent:      feePercent,
+          default_roi_percent:    defaultRoi,
+          min_roi_percent:        minRoi,
+          job_interval_minutes:   interval,
+          job_start_time:         startTime,
+          compliance_schedule_time: complianceTime,
+          app_theme:              appTheme,
         }),
       });
       setStatus(s._proxy_status);
@@ -3019,6 +3330,109 @@ function SettingsPage({ onIntervalChange, onStartTimeChange, isSuperAdmin, appTh
                 )}
               </>
             )}
+          </div>
+        </div>
+      </Section>
+
+      {/* Compliance Patrol Schedule */}
+      <Section title="Compliance Patrol Schedule">
+        <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+            <div>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 6 }}>
+                Daily Patrol Time <span style={{ color: C.muted }}>(24-hour)</span>
+              </p>
+              <input
+                style={inp}
+                type="time"
+                value={complianceTime}
+                onChange={e => setComplianceTime(e.target.value)}
+              />
+              <p style={{ color: C.muted, fontSize: 11, marginTop: 6 }}>
+                Compliance patrol runs once daily at this time, checking all active accounts
+              </p>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <p style={{ color: C.textDim, fontSize: 12, marginBottom: 2 }}>Manual Run</p>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <button
+                  onClick={runCompliance}
+                  disabled={complianceRunning}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    background: complianceRunning ? C.border : C.accent,
+                    color: complianceRunning ? C.muted : "#000",
+                    border: "none", borderRadius: 8, padding: "8px 16px",
+                    fontSize: 13, fontWeight: 600, cursor: complianceRunning ? "not-allowed" : "pointer",
+                    transition: "background .15s",
+                  }}
+                >
+                  {complianceRunning
+                    ? <><span style={{ display: "inline-block", width: 12, height: 12, border: `2px solid ${C.muted}`, borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} /> Running…</>
+                    : <><Play style={{ width: 13, height: 13 }} /> Run Now</>
+                  }
+                </button>
+                {complianceLogs.length > 0 && (
+                  <button
+                    onClick={() => setComplianceLogOpen(v => !v)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 5,
+                      background: "transparent", border: `1px solid ${C.border}`,
+                      borderRadius: 8, padding: "7px 14px", color: C.textDim,
+                      fontSize: 12, cursor: "pointer",
+                    }}
+                  >
+                    {complianceLogOpen ? <><EyeOff style={{ width: 12, height: 12 }} /> Hide Logs</> : <><Eye style={{ width: 12, height: 12 }} /> Show Logs</>}
+                  </button>
+                )}
+              </div>
+              <p style={{ color: C.muted, fontSize: 11 }}>
+                Triggers immediately for your accounts — stock is set to 0 on violations
+              </p>
+            </div>
+          </div>
+
+          {/* Live log panel */}
+          {complianceLogOpen && (
+            <div
+              ref={complianceLogsRef}
+              style={{
+                background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+                padding: "10px 14px", fontFamily: "monospace", fontSize: 11,
+                maxHeight: 280, overflowY: "auto", lineHeight: 1.6,
+              }}
+            >
+              {complianceLogs.length === 0 ? (
+                <span style={{ color: C.muted }}>Waiting for logs…</span>
+              ) : (
+                complianceLogs.map((line, i) => {
+                  const isViolation = line.includes('[VIOLATION]');
+                  const isDone      = line.includes('Job complete');
+                  return (
+                    <div key={i} style={{
+                      color: isViolation ? C.red : isDone ? C.accent : C.textDim,
+                      marginBottom: 1,
+                    }}>
+                      {line}
+                    </div>
+                  );
+                })
+              )}
+              {complianceRunning && (
+                <div style={{ color: C.muted, marginTop: 4 }}>
+                  <span style={{ display: "inline-block", width: 8, height: 8, background: C.accent, borderRadius: "50%", marginRight: 6, animation: "spin 1s linear infinite" }} />
+                  Running…
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+            padding: "10px 14px", fontSize: 12, color: C.textDim, lineHeight: 1.6 }}>
+            <span style={{ color: C.amber }}>Schedule: </span>
+            Once daily at <span style={{ color: C.accent }}>{complianceTime === "02:00" ? "02:00 (default)" : complianceTime}</span>
+            <span style={{ color: C.muted }}> — scans all active accounts with compliance enabled</span>
           </div>
         </div>
       </Section>
@@ -3624,6 +4038,7 @@ export default function App() {
     { id:"onbuy-bulk",       label:"OnBuy Bulk Listings" },
     { id:"delete-listings",  label:"Delete Listings" },
     { id:"product-hunting",  label:"Product Hunting" },
+    { id:"compliance",       label:"Compliance" },
     { id:"orders",           label:"Orders" },
     { id:"price-comparison", label:"Price Comparison" },
     { id:"proxy-tester",    label:"Proxy Tester" },
@@ -3877,6 +4292,7 @@ export default function App() {
             {page === "sku-change"      && "Bulk update OnBuy listing SKUs from an Excel spreadsheet"}
             {page === "delete-listings"  && "Delete OnBuy listings in bulk by uploading a Seller SKU spreadsheet"}
             {page === "product-hunting" && "Scrape Keepa bestsellers and import products directly to OnBuy"}
+            {page === "compliance"      && "View all compliance violations — products removed for breaching OnBuy's policies"}
             {page === "orders"          && "View and sync OnBuy orders across all accounts"}
             {page === "sp-api"          && "Fetch Amazon catalog data for any ASIN using SP-API"}
             {page === "proxy-tester"    && "Test proxy IPs and scraping success rate without updating OnBuy prices"}
@@ -3897,6 +4313,7 @@ export default function App() {
         {page === "sku-change"       && <SkuChangePage />}
         {page === "delete-listings"  && <DeleteListingsPage />}
         {page === "product-hunting"  && <ProductHuntingPage />}
+        {page === "compliance"       && <CompliancePage />}
         {page === "orders"           && <OrdersPage />}
         {page === "price-comparison" && <PriceComparisonPage />}
         {page === "proxy-tester"    && <ProxyTesterPage />}

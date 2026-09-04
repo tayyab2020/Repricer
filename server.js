@@ -297,12 +297,32 @@ app.get('/api/stats', requireAuth, async (req, res) => {
         [uid]
       ),
     ]);
+    // Compliance stats
+    const [complianceTotal, compliance7d, complianceLast] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*) FROM compliance_violations cv
+           JOIN onbuy_accounts a ON a.id = cv.account_id WHERE a.user_id = $1`, [uid]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+      db.query(
+        `SELECT COUNT(*) FROM compliance_violations cv
+           JOIN onbuy_accounts a ON a.id = cv.account_id
+          WHERE a.user_id = $1 AND cv.actioned_at >= NOW() - INTERVAL '7 days'`, [uid]
+      ).catch(() => ({ rows: [{ count: 0 }] })),
+      db.query(
+        `SELECT MAX(cv.actioned_at) AS last_run FROM compliance_violations cv
+           JOIN onbuy_accounts a ON a.id = cv.account_id WHERE a.user_id = $1`, [uid]
+      ).catch(() => ({ rows: [{ last_run: null }] })),
+    ]);
+
     res.json({
-      activeListings:      parseInt(mappings.rows[0].count),
-      syncedLast24h:       parseInt(syncStats.rows[0].synced),
-      priceChangesLast24h: parseInt(syncStats.rows[0].changed),
-      stockInLast24h:      parseInt(stockStats.rows[0].in_stock),
-      stockOutLast24h:     parseInt(stockStats.rows[0].out_of_stock),
+      activeListings:             parseInt(mappings.rows[0].count),
+      syncedLast24h:              parseInt(syncStats.rows[0].synced),
+      priceChangesLast24h:        parseInt(syncStats.rows[0].changed),
+      stockInLast24h:             parseInt(stockStats.rows[0].in_stock),
+      stockOutLast24h:            parseInt(stockStats.rows[0].out_of_stock),
+      complianceViolationsTotal:  parseInt(complianceTotal.rows[0].count),
+      complianceLast7d:           parseInt(compliance7d.rows[0].count),
+      complianceLastRun:          complianceLast.rows[0]?.last_run ?? null,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -662,7 +682,7 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/compliance/run — manually trigger compliance patrol (effective user or all if admin)
+// POST /api/compliance/run — manually trigger compliance patrol
 app.post('/api/compliance/run', requireAuth, async (req, res) => {
   try {
     const userId = req.effectiveUserId;
@@ -673,20 +693,118 @@ app.post('/api/compliance/run', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/compliance/violations — list violations logged for the effective user's accounts
+// GET /api/compliance/status — check if a patrol is currently running for this user
+const _complianceRunning = new Set();
+const _complianceStatusSub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+  maxRetriesPerRequest: null,
+  lazyConnect: true,
+});
+_complianceStatusSub.connect().catch(() => {});
+_complianceStatusSub.subscribe('compliance:status').catch(() => {});
+_complianceStatusSub.on('message', (ch, msg) => {
+  if (ch !== 'compliance:status') return;
+  try {
+    const { userId, running } = JSON.parse(msg);
+    if (running) _complianceRunning.add(userId);
+    else _complianceRunning.delete(userId);
+  } catch {}
+});
+
+app.get('/api/compliance/status', requireAuth, (req, res) => {
+  res.json({ running: _complianceRunning.has(req.effectiveUserId) });
+});
+
+// GET /api/compliance/logs — SSE stream of live log lines from the compliance worker
+app.get('/api/compliance/logs', (req, res) => {
+  // Support ?token= for EventSource (can't set headers)
+  let userId;
+  try {
+    const tkn = req.query.token || (req.headers.authorization || '').replace('Bearer ', '');
+    const payload = jwt.verify(tkn, JWT_SECRET);
+    userId = payload.impersonatedUserId ?? payload.userId;
+  } catch { return res.status(401).end(); }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const channel = `compliance:log:${userId}`;
+  const sub = new IORedis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
+    maxRetriesPerRequest: null,
+    lazyConnect: true,
+  });
+  sub.connect().then(() => sub.subscribe(channel)).catch(() => {});
+  sub.on('message', (ch, payload) => {
+    if (ch !== channel) return;
+    res.write(`data: ${payload}\n\n`);
+  });
+
+  req.on('close', () => {
+    sub.unsubscribe(channel).catch(() => {});
+    sub.quit().catch(() => {});
+  });
+});
+
+// GET /api/compliance/violations — paginated + filterable violations list
 app.get('/api/compliance/violations', requireAuth, async (req, res) => {
   try {
     const userId = req.effectiveUserId;
-    const { rows } = await db.query(
-      `SELECT cv.*, a.account_name
-         FROM compliance_violations cv
-         JOIN onbuy_accounts a ON a.id = cv.account_id
-        WHERE a.user_id = $1
-        ORDER BY cv.actioned_at DESC
-        LIMIT 500`,
-      [userId]
+    const page    = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit   = Math.min(200, parseInt(req.query.limit) || 50);
+    const offset  = (page - 1) * limit;
+    const type    = req.query.type       || null;
+    const acctId  = parseInt(req.query.account_id) || null;
+    const search  = req.query.search     || null;
+
+    const conditions = ['a.user_id = $1'];
+    const params = [userId];
+    let pi = 2;
+
+    if (type)    { conditions.push(`cv.violation_type = $${pi++}`); params.push(type); }
+    if (acctId)  { conditions.push(`cv.account_id = $${pi++}`);     params.push(acctId); }
+    if (search)  {
+      conditions.push(`(cv.title ILIKE $${pi} OR cv.sku ILIKE $${pi})`);
+      params.push(`%${search}%`); pi++;
+    }
+
+    const where = conditions.join(' AND ');
+    const [dataRes, countRes] = await Promise.all([
+      db.query(
+        `SELECT cv.*, a.account_name
+           FROM compliance_violations cv
+           JOIN onbuy_accounts a ON a.id = cv.account_id
+          WHERE ${where}
+          ORDER BY cv.actioned_at DESC
+          LIMIT $${pi} OFFSET $${pi + 1}`,
+        [...params, limit, offset]
+      ),
+      db.query(
+        `SELECT COUNT(*) FROM compliance_violations cv
+           JOIN onbuy_accounts a ON a.id = cv.account_id
+          WHERE ${where}`,
+        params
+      ),
+    ]);
+
+    res.json({ rows: dataRes.rows, total: parseInt(countRes.rows[0].count), page, limit });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/compliance/violations/:id — remove a violation record
+app.delete('/api/compliance/violations/:id', requireAuth, async (req, res) => {
+  try {
+    const userId = req.effectiveUserId;
+    const { rowCount } = await db.query(
+      `DELETE FROM compliance_violations cv
+         USING onbuy_accounts a
+         WHERE cv.id = $1 AND cv.account_id = a.id AND a.user_id = $2`,
+      [req.params.id, userId]
     );
-    res.json(rows);
+    if (!rowCount) return res.status(404).json({ error: 'Violation not found' });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2708,7 +2826,7 @@ app.get('/api/settings', requireAuth, async (req, res) => {
 });
 
 app.put('/api/settings', requireAuth, async (req, res) => {
-  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time', 'app_theme'];
+  const allowed = ['webshare_proxy_api', 'onbuy_fee_percent', 'default_roi_percent', 'min_roi_percent', 'job_interval_minutes', 'job_start_time', 'compliance_schedule_time', 'app_theme'];
   const uid = req.effectiveUserId;
   try {
     // Read current pricing values before saving so we can detect actual changes
@@ -2755,8 +2873,9 @@ app.put('/api/settings', requireAuth, async (req, res) => {
 
     const { rows } = await db.query('SELECT key, value FROM settings WHERE user_id = $1', [uid]);
     const s = Object.fromEntries(rows.map(r => [r.key, r.value]));
-    // Notify worker process to reload schedules/settings immediately
+    // Notify worker processes to reload schedules/settings immediately
     redisPub.publish('repricer:settings-updated', '1').catch(() => {});
+    redisPub.publish('compliance:settings-updated', '1').catch(() => {});
     res.json({ ...s, _proxy_status: getProxyStatus() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
