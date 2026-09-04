@@ -2446,7 +2446,7 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS repricer_enabled      BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS bulk_enabled          BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled        BOOLEAN NOT NULL DEFAULT true`,
-    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS compliance_enabled    BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS compliance_enabled    BOOLEAN NOT NULL DEFAULT false`,
     `CREATE TABLE IF NOT EXISTS compliance_violations (
        id             SERIAL PRIMARY KEY,
        account_id     INTEGER NOT NULL,

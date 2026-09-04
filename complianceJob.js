@@ -289,7 +289,7 @@ export function startWorker() {
   });
 
   // Ensure required columns and table exist
-  db.query(`ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS compliance_enabled BOOLEAN NOT NULL DEFAULT true`)
+  db.query(`ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS compliance_enabled BOOLEAN NOT NULL DEFAULT false`)
     .catch(() => {});
 
   db.query(`
