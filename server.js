@@ -1573,7 +1573,7 @@ app.get('/api/accounts', requireAuth, async (req, res) => {
               keepa_email,
               CASE WHEN keepa_password IS NOT NULL AND keepa_password != '' THEN true ELSE false END AS has_keepa_password,
               enable_python_scraper,
-              repricer_enabled, bulk_enabled, orders_enabled,
+              repricer_enabled, bulk_enabled, orders_enabled, compliance_enabled,
               google_sheet_id,
               CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet
        FROM onbuy_accounts WHERE user_id = $1 ORDER BY created_at DESC`,
@@ -1634,7 +1634,7 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
 app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   const { account_name, consumer_key, secret_key, site_id, is_active, keepa_email, keepa_password,
           enable_python_scraper, scraper_proxies, scraper_ip_count,
-          repricer_enabled, bulk_enabled, orders_enabled,
+          repricer_enabled, bulk_enabled, orders_enabled, compliance_enabled,
           google_sheet_id, google_service_account } = req.body;
   try {
     let sheetCreds = undefined; // undefined = don't change; null = clear
@@ -1662,13 +1662,14 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
          repricer_enabled       = COALESCE($14, repricer_enabled),
          bulk_enabled           = COALESCE($15, bulk_enabled),
          orders_enabled         = COALESCE($16, orders_enabled),
+         compliance_enabled     = COALESCE($18, compliance_enabled),
          google_sheet_id        = CASE WHEN $12::text IS NOT NULL THEN NULLIF($12,'') ELSE google_sheet_id END,
          google_service_account = CASE WHEN $13::text IS NOT NULL THEN $13::jsonb ELSE google_service_account END,
          updated_at             = NOW()
        WHERE id = $10 AND user_id = $11
        RETURNING id, account_name, site_id, is_active, keepa_email,
                  enable_python_scraper, scraper_proxies, scraper_ip_count,
-                 repricer_enabled, bulk_enabled, orders_enabled,
+                 repricer_enabled, bulk_enabled, orders_enabled, compliance_enabled,
                  google_sheet_id,
                  CASE WHEN google_service_account IS NOT NULL THEN true ELSE false END AS has_google_sheet`,
       [account_name || null, consumer_key || null, secret_key || null, site_id || null,
@@ -1678,7 +1679,8 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
        google_sheet_id !== undefined ? (google_sheet_id || '') : null,
        sheetCreds !== undefined ? (sheetCreds ?? null) : null,
        repricer_enabled ?? null, bulk_enabled ?? null, orders_enabled ?? null,
-       scraper_ip_count !== undefined ? (scraper_ip_count ? parseInt(scraper_ip_count) : null) : null]
+       scraper_ip_count !== undefined ? (scraper_ip_count ? parseInt(scraper_ip_count) : null) : null,
+       compliance_enabled ?? null]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     // If proxies were updated, evict the failure/instance cache so the new config is tried immediately
