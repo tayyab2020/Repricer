@@ -137,6 +137,25 @@ services:
     volumes:
       - ./logs:/app/logs
 
+  # ── Node.js — Compliance Worker ─────────────────────────────────────────────
+  compliance:
+    build: .
+    command: node complianceWorker.js
+    environment:
+      DATABASE_URL:  "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-StrongPassword123!}@postgres:5432/${POSTGRES_DB:-repricer}"
+      REDIS_URL:     "redis://redis:6379"
+      NODE_ENV:      "${NODE_ENV:-production}"
+      DB_SSL:        "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./logs:/app/logs
+
 volumes:
   postgres_data:
   redis_data:

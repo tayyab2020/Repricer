@@ -662,6 +662,36 @@ app.get('/api/queue-status', requireAuth, async (req, res) => {
   }
 });
 
+// POST /api/compliance/run — manually trigger compliance patrol (effective user or all if admin)
+app.post('/api/compliance/run', requireAuth, async (req, res) => {
+  try {
+    const userId = req.effectiveUserId;
+    await redis.publish('compliance:run', String(userId));
+    res.json({ ok: true, message: `Compliance patrol triggered for user ${userId}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/compliance/violations — list violations logged for the effective user's accounts
+app.get('/api/compliance/violations', requireAuth, async (req, res) => {
+  try {
+    const userId = req.effectiveUserId;
+    const { rows } = await db.query(
+      `SELECT cv.*, a.account_name
+         FROM compliance_violations cv
+         JOIN onbuy_accounts a ON a.id = cv.account_id
+        WHERE a.user_id = $1
+        ORDER BY cv.actioned_at DESC
+        LIMIT 500`,
+      [userId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/job/cancel — stop all running/queued repricer jobs for the effective user
 app.post('/api/job/cancel', requireAuth, async (req, res) => {
   try {
@@ -2298,6 +2328,17 @@ async function runMigrations() {
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS repricer_enabled      BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS bulk_enabled          BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS orders_enabled        BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS compliance_enabled    BOOLEAN NOT NULL DEFAULT true`,
+    `CREATE TABLE IF NOT EXISTS compliance_violations (
+       id             SERIAL PRIMARY KEY,
+       account_id     INTEGER NOT NULL,
+       sku            TEXT,
+       title          TEXT,
+       violation_type TEXT,
+       reason         TEXT,
+       actioned_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+       UNIQUE (account_id, sku)
+     )`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS enable_python_scraper BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS scraper_proxies       TEXT`,
     `ALTER TABLE onbuy_accounts ADD COLUMN IF NOT EXISTS scraper_ip_count     INTEGER DEFAULT NULL`,

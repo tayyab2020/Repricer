@@ -4301,10 +4301,11 @@ function AccountsPage() {
                       {/* ── Jobs dropdown ── */}
                       {(() => {
                         const JOB_FLAGS = [
-                          { field: "repricer_enabled", label: "Repricer",  desc: "Repricer job" },
-                          { field: "bulk_enabled",     label: "Bulk",      desc: "Bulk listing import" },
-                          { field: "orders_enabled",   label: "Orders",    desc: "Orders sync" },
-                          { field: "is_active",        label: "Active",    desc: "All other jobs (master switch)" },
+                          { field: "repricer_enabled",   label: "Repricer",    desc: "Repricer job" },
+                          { field: "bulk_enabled",       label: "Bulk",        desc: "Bulk listing import" },
+                          { field: "orders_enabled",     label: "Orders",      desc: "Orders sync" },
+                          { field: "compliance_enabled", label: "Compliance",  desc: "Daily compliance patrol (brand/prohibited check)" },
+                          { field: "is_active",          label: "Active",      desc: "All other jobs (master switch)" },
                         ];
                         const allOn   = JOB_FLAGS.every(({ field }) => a[field] !== false);
                         const anyOff  = JOB_FLAGS.some(({ field }) => a[field] === false);
