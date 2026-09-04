@@ -121,30 +121,44 @@ async function fetchAllListings(token, siteId, log) {
   return all;
 }
 
-async function setStockZero(token, siteId, skus, log) {
+async function deleteListings(token, siteId, skus, log) {
   const CHUNK = 100;
   let removed = 0;
   for (let i = 0; i < skus.length; i += CHUNK) {
     const chunk = skus.slice(i, i + CHUNK);
-    const payload = { listings: chunk.map(sku => ({ sku, stock: 0 })) };
     try {
       const r = await fetch(
         `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`,
         {
-          method: 'PUT',
+          method: 'DELETE',
           headers: { Authorization: token, 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ skus: chunk }),
         }
       );
       if (r.ok) {
         removed += chunk.length;
-        log(`[Remove] Set stock=0 for ${chunk.length} SKU(s) — OK`);
+        log(`[Remove] Deleted ${chunk.length} listing(s) — OK`);
       } else {
+        // Fallback: if DELETE is not supported, zero stock instead
         const txt = await r.text().catch(() => '');
-        log(`[Remove] HTTP ${r.status} for SKU chunk — ${txt.slice(0, 200)}`);
+        log(`[Remove] DELETE HTTP ${r.status} — falling back to stock=0. Response: ${txt.slice(0, 200)}`);
+        const fallback = await fetch(
+          `https://api.onbuy.com/v2/listings/by-sku?site_id=${siteId}`,
+          {
+            method: 'PUT',
+            headers: { Authorization: token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ listings: chunk.map(sku => ({ sku, stock: 0 })) }),
+          }
+        );
+        if (fallback.ok) {
+          removed += chunk.length;
+          log(`[Remove] Fallback stock=0 for ${chunk.length} SKU(s) — OK`);
+        } else {
+          log(`[Remove] Fallback also failed: HTTP ${fallback.status}`);
+        }
       }
     } catch (err) {
-      log(`[Remove] Error setting stock=0: ${err.message}`);
+      log(`[Remove] Error deleting listings: ${err.message}`);
     }
     if (i + CHUNK < skus.length) await new Promise(r => setTimeout(r, 500));
   }
@@ -186,7 +200,7 @@ async function patrolAccount(db, account, userId = null) {
   let removed = 0;
   if (violationSkus.length > 0) {
     log(`[Compliance] Found ${violationSkus.length} violation(s) — setting stock=0…`);
-    removed = await setStockZero(token, siteId, violationSkus, log);
+    removed = await deleteListings(token, siteId, violationSkus, log);
 
     // Persist violations to DB for dashboard visibility
     for (const v of violationLog) {

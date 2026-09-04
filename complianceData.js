@@ -564,26 +564,26 @@ export function checkListing(listing) {
   const title = (listing.name || listing.title || listing.product_name || '').toLowerCase();
   const text  = `${title} ${brand}`;
 
-  // 1. Protected brand check
+  // 1. Protected brand check — exact match on the brand/manufacturer field
   if (brand && PROTECTED_BRANDS.has(brand)) {
     return {
       violation: true,
-      type: 'protected_brand',
-      reason: `Brand "${listing.brand}" is on the OnCommerce Protected Brands list — requires Proof of Authorisation`,
+      type: 'PROTECTED_BRAND',
+      reason: `Brand "${listing.brand || listing.manufacturer}" is on the OnCommerce Protected Brands list — requires Proof of Authorisation`,
     };
   }
 
-  // Also check if protected brand name appears in the title when brand field is blank
-  if (!brand) {
-    for (const protectedBrand of PROTECTED_BRANDS) {
-      const escaped = protectedBrand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (new RegExp(`\\b${escaped}\\b`, 'i').test(title)) {
-        return {
-          violation: true,
-          type: 'protected_brand_in_title',
-          reason: `Protected brand "${protectedBrand}" found in listing title — requires Proof of Authorisation`,
-        };
-      }
+  // Also check if a protected brand name appears at the START of the listing title.
+  // Only anchored-start matching — mid-title hits (e.g. "coach lantern", "amazon scraper")
+  // produce too many false positives as these words double as common nouns.
+  for (const protectedBrand of PROTECTED_BRANDS) {
+    const escaped = protectedBrand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`^${escaped}\\b`, 'i').test(title)) {
+      return {
+        violation: true,
+        type: 'PROTECTED_BRAND_IN_TITLE',
+        reason: `Protected brand "${protectedBrand}" found at start of listing title — requires Proof of Authorisation`,
+      };
     }
   }
 
