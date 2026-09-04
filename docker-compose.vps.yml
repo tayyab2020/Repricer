@@ -44,6 +44,20 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  compliance:
+    environment:
+      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      NODE_ENV: "production"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   python-scraper:
     deploy:
       resources:
