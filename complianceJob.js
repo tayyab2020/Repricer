@@ -167,7 +167,7 @@ async function deleteListings(token, siteId, skus, log) {
 
 // ── Core patrol logic ──────────────────────────────────────────────────────
 
-async function patrolAccount(db, account, userId = null) {
+async function patrolAccount(db, account, userId = null, { dbBrands = [], dbProducts = [] } = {}) {
   const log = makeLogger(account.account_name, userId);
   log(`[Compliance] ── Starting patrol for "${account.account_name}" ──`);
 
@@ -185,14 +185,36 @@ async function patrolAccount(db, account, userId = null) {
   const violationLog   = [];
 
   for (const listing of listings) {
-    const { violation, type, reason } = checkListing(listing);
+    const sku        = listing.sku || listing.seller_sku || listing.uid || null;
+    const titleRaw   = listing.name || listing.title || listing.product_name || '(unknown)';
+    const titleLower = titleRaw.toLowerCase();
+
+    let { violation, type, reason } = checkListing(listing);
+
+    // Also check admin-uploaded restricted brands (substring match, same as Delete Restricted Brands job)
+    if (!violation && dbBrands.length) {
+      const hit = dbBrands.find(b => titleLower.includes(b));
+      if (hit) {
+        violation = true;
+        type      = 'RESTRICTED_BRAND';
+        reason    = `Restricted brand "${hit}" found in listing title`;
+      }
+    }
+
+    // Also check admin-uploaded restricted product keywords (substring match, same as Delete Restricted Products job)
+    if (!violation && dbProducts.length) {
+      const hit = dbProducts.find(pt => titleLower.includes(pt));
+      if (hit) {
+        violation = true;
+        type      = 'RESTRICTED_PRODUCT';
+        reason    = `Restricted product keyword "${hit}" found in listing title`;
+      }
+    }
+
     if (!violation) continue;
 
-    const sku   = listing.sku || listing.seller_sku || listing.uid || null;
-    const title = listing.name || listing.title || listing.product_name || '(unknown)';
-
-    log(`[VIOLATION] ${type.toUpperCase()} | SKU: ${sku} | "${title}" | ${reason}`);
-    violationLog.push({ sku, title, type, reason });
+    log(`[VIOLATION] ${type.toUpperCase()} | SKU: ${sku} | "${titleRaw}" | ${reason}`);
+    violationLog.push({ sku, title: titleRaw, type, reason });
 
     if (sku) violationSkus.push(sku);
   }
@@ -242,6 +264,21 @@ export async function runComplianceJob(db, { userId = null, log = console.log } 
 
   rootLog(`[Compliance] ══ Job started${userId ? ` for user ${userId}` : ' (all users)'} ══`);
 
+  // Load admin-uploaded restricted lists (shared across all accounts)
+  let dbBrands = [], dbProducts = [];
+  try {
+    const { rows: [admin] } = await db.query(`SELECT id FROM users WHERE role = 'super_admin' LIMIT 1`);
+    if (admin) {
+      const { rows: rb } = await db.query(`SELECT brand_name FROM restricted_brands WHERE user_id=$1`, [admin.id]);
+      dbBrands = rb.map(r => r.brand_name.toLowerCase());
+    }
+    const { rows: rp } = await db.query(`SELECT title FROM restricted_products`);
+    dbProducts = rp.map(r => r.title.toLowerCase());
+    rootLog(`[Compliance] DB lists loaded: ${dbBrands.length} restricted brand(s), ${dbProducts.length} restricted product keyword(s)`);
+  } catch (err) {
+    rootLog(`[Compliance] Warning: could not load DB restricted lists — ${err.message}`);
+  }
+
   const where = userId
     ? 'WHERE a.is_active = true AND a.compliance_enabled = true AND a.user_id = $1'
     : 'WHERE a.is_active = true AND a.compliance_enabled = true';
@@ -272,7 +309,7 @@ export async function runComplianceJob(db, { userId = null, log = console.log } 
   for (const account of accounts) {
     const effectiveUserId = userId ?? account.user_id;
     try {
-      const result = await patrolAccount(db, account, effectiveUserId);
+      const result = await patrolAccount(db, account, effectiveUserId, { dbBrands, dbProducts });
       totalChecked    += result.checked;
       totalViolations += result.violations;
       totalRemoved    += result.removed;
