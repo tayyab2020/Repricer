@@ -2813,7 +2813,7 @@ function CompliancePage() {
 
   const TYPE_LABELS = {
     PROTECTED_BRAND:          "Protected Brand",
-    PROTECTED_BRAND_IN_TITLE: "Protected Brand (Title)",
+    PROTECTED_BRAND_IN_TITLE: "Protected Brand",
     RESTRICTED_BRAND:         "Restricted Brand",
     RESTRICTED_PRODUCT:       "Restricted Product",
     prohibited_product:       "Prohibited Product",
@@ -2883,8 +2883,7 @@ function CompliancePage() {
             onChange={e => setFilterType(e.target.value)}
           >
             <option value="">All types</option>
-            <option value="PROTECTED_BRAND_IN_TITLE">Protected Brand (Title)</option>
-            <option value="PROTECTED_BRAND">Protected Brand (Field)</option>
+            <option value="PROTECTED_BRAND_IN_TITLE">Protected Brand</option>
             <option value="RESTRICTED_BRAND">Restricted Brand</option>
             <option value="RESTRICTED_PRODUCT">Restricted Product</option>
             <option value="prohibited_product">Prohibited Product</option>
