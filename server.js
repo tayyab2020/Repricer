@@ -794,6 +794,22 @@ app.get('/api/compliance/violations', requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/compliance/summary — per-type violation counts for the current user
+app.get('/api/compliance/summary', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT cv.violation_type, COUNT(*)::int AS count
+         FROM compliance_violations cv
+         JOIN onbuy_accounts a ON a.id = cv.account_id
+        WHERE a.user_id = $1
+        GROUP BY cv.violation_type
+        ORDER BY count DESC`,
+      [req.effectiveUserId]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // DELETE /api/compliance/violations/:id — remove a violation record
 app.delete('/api/compliance/violations/:id', requireAuth, async (req, res) => {
   try {

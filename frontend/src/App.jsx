@@ -2763,7 +2763,7 @@ function CompliancePage() {
   const [search,     setSearch]     = useState("");
   const [accounts,   setAccounts]   = useState([]);
   const [deleting,   setDeleting]   = useState(null);
-  const [summary,    setSummary]    = useState({});
+  const [summary,    setSummary]    = useState([]);
   const LIMIT = 50;
 
   const loadViolations = useCallback((pg = 1) => {
@@ -2778,24 +2778,23 @@ function CompliancePage() {
       .finally(() => setLoading(false));
   }, [filterType, filterAcct, search]);
 
-  useEffect(() => {
-    api("/accounts").then(d => setAccounts(Array.isArray(d) ? d : d.rows || [])).catch(() => {});
+  const loadSummary = useCallback(() => {
+    api("/compliance/summary").then(d => setSummary(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
 
-  useEffect(() => { loadViolations(1); }, [loadViolations]);
-
-  // Compute per-type counts from loaded violations for summary badges
   useEffect(() => {
-    const counts = {};
-    violations.forEach(v => { counts[v.violation_type] = (counts[v.violation_type] || 0) + 1; });
-    setSummary(counts);
-  }, [violations]);
+    api("/accounts").then(d => setAccounts(Array.isArray(d) ? d : d.rows || [])).catch(() => {});
+    loadSummary();
+  }, [loadSummary]);
+
+  useEffect(() => { loadViolations(1); }, [loadViolations]);
 
   async function removeViolation(id) {
     setDeleting(id);
     try {
       await api(`/compliance/violations/${id}`, { method: "DELETE" });
       loadViolations(page);
+      loadSummary();
     } catch (e) { console.error(e); }
     finally { setDeleting(null); }
   }
@@ -2803,9 +2802,24 @@ function CompliancePage() {
   const totalPages = Math.max(1, Math.ceil(total / LIMIT));
 
   const TYPE_COLORS = {
-    brand:      C.amber,
-    prohibited: C.red,
+    PROTECTED_BRAND:         C.amber,
+    PROTECTED_BRAND_IN_TITLE: C.amber,
+    RESTRICTED_BRAND:        "#f97316",
+    RESTRICTED_PRODUCT:      "#a855f7",
+    prohibited_product:      C.red,
+    PROHIBITED_PRODUCT:      C.red,
   };
+  const typeColor = t => TYPE_COLORS[t] || C.amber;
+
+  const TYPE_LABELS = {
+    PROTECTED_BRAND:          "Protected Brand",
+    PROTECTED_BRAND_IN_TITLE: "Protected Brand (Title)",
+    RESTRICTED_BRAND:         "Restricted Brand",
+    RESTRICTED_PRODUCT:       "Restricted Product",
+    prohibited_product:       "Prohibited Product",
+    PROHIBITED_PRODUCT:       "Prohibited Product",
+  };
+  const typeLabel = t => TYPE_LABELS[t] || t;
 
   const tbl = {
     width: "100%", borderCollapse: "collapse", fontSize: 12,
@@ -2830,15 +2844,16 @@ function CompliancePage() {
           padding: "12px 20px", display: "flex", flexDirection: "column", gap: 4, minWidth: 140,
         }}>
           <p style={{ color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", margin: 0 }}>Total Violations</p>
-          <p style={{ color: C.red, fontSize: 28, fontWeight: 700, margin: 0 }}>{total}</p>
+          <p style={{ color: C.red, fontSize: 28, fontWeight: 700, margin: 0 }}>{summary.reduce((s, r) => s + r.count, 0) || total}</p>
         </div>
-        {Object.entries(summary).map(([type, count]) => (
-          <div key={type} style={{
+        {summary.map(({ violation_type, count }) => (
+          <div key={violation_type} style={{
             background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
             padding: "12px 20px", display: "flex", flexDirection: "column", gap: 4, minWidth: 140,
-          }}>
-            <p style={{ color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", margin: 0 }}>{type}</p>
-            <p style={{ color: TYPE_COLORS[type] || C.amber, fontSize: 28, fontWeight: 700, margin: 0 }}>{count}</p>
+            cursor: "pointer",
+          }} onClick={() => { setFilterType(violation_type); loadViolations(1); }}>
+            <p style={{ color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", margin: 0 }}>{typeLabel(violation_type)}</p>
+            <p style={{ color: typeColor(violation_type), fontSize: 28, fontWeight: 700, margin: 0 }}>{count}</p>
           </div>
         ))}
       </div>
@@ -2868,8 +2883,11 @@ function CompliancePage() {
             onChange={e => setFilterType(e.target.value)}
           >
             <option value="">All types</option>
-            <option value="brand">Brand (Protected)</option>
-            <option value="prohibited">Prohibited Product</option>
+            <option value="PROTECTED_BRAND_IN_TITLE">Protected Brand (Title)</option>
+            <option value="PROTECTED_BRAND">Protected Brand (Field)</option>
+            <option value="RESTRICTED_BRAND">Restricted Brand</option>
+            <option value="RESTRICTED_PRODUCT">Restricted Product</option>
+            <option value="prohibited_product">Prohibited Product</option>
           </select>
         </div>
         <div>
@@ -2936,10 +2954,10 @@ function CompliancePage() {
                         <span style={{
                           display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 11,
                           fontWeight: 600, textTransform: "uppercase",
-                          background: v.violation_type === "brand" ? `${C.amber}22` : `${C.red}22`,
-                          color: v.violation_type === "brand" ? C.amber : C.red,
+                          background: `${typeColor(v.violation_type)}22`,
+                          color: typeColor(v.violation_type),
                         }}>
-                          {v.violation_type || "—"}
+                          {typeLabel(v.violation_type) || v.violation_type || "—"}
                         </span>
                       </td>
                       <td style={{ ...td, maxWidth: 340 }}>
