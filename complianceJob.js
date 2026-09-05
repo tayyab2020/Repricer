@@ -191,9 +191,9 @@ async function patrolAccount(db, account, userId = null, { dbBrands = [], dbProd
 
     let { violation, type, reason } = checkListing(listing);
 
-    // Also check admin-uploaded restricted brands (substring match, same as Delete Restricted Brands job)
+    // Also check admin-uploaded restricted brands (anchored to start of title — avoids mid-title false positives)
     if (!violation && dbBrands.length) {
-      const hit = dbBrands.find(b => titleLower.includes(b));
+      const hit = dbBrands.find(b => new RegExp(`^${b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(titleLower));
       if (hit) {
         violation = true;
         type      = 'RESTRICTED_BRAND';
