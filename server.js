@@ -4934,6 +4934,32 @@ app.get('/api/orders', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/orders/top-products — top 10 products by units sold over last 3 months
+app.get('/api/orders/top-products', requireAuth, async (req, res) => {
+  const uid = req.effectiveUserId;
+  try {
+    const { rows } = await db.query(
+      `SELECT
+         oi.sku,
+         COALESCE(NULLIF(oi.product_name,''), oi.sku) AS product_name,
+         SUM(oi.quantity)::int                         AS total_qty,
+         COUNT(DISTINCT oi.order_id)::int              AS order_count,
+         SUM(oi.total_price)::numeric(10,2)            AS total_revenue,
+         ROUND(SUM(oi.quantity)::numeric / 3, 1)       AS avg_monthly_qty
+       FROM onbuy_order_items oi
+       JOIN onbuy_orders o ON o.order_id = oi.order_id AND o.account_id = oi.account_id
+       WHERE oi.user_id = $1
+         AND o.order_date >= NOW() - INTERVAL '3 months'
+         AND o.status NOT IN ('Cancelled by Seller','Cancelled by Customer')
+       GROUP BY oi.sku, oi.product_name
+       ORDER BY total_qty DESC
+       LIMIT 10`,
+      [uid]
+    );
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/orders/chart — last-7-day order counts grouped by day and status
 app.get('/api/orders/chart', requireAuth, async (req, res) => {
   const uid = req.effectiveUserId;

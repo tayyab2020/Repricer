@@ -358,6 +358,8 @@ function DashboardPage({ stats }) {
   const [logsLoading, setLogsLoading] = useState(false);
   const [orderBarData, setOrderBarData] = useState([]);
   const [orderBarLoaded, setOrderBarLoaded] = useState(false);
+  const [topProducts, setTopProducts] = useState([]);
+  const [topProductsLoaded, setTopProductsLoaded] = useState(false);
 
   const loadLogs = useCallback((pg = 1, status = "") => {
     setLogsLoading(true);
@@ -400,6 +402,14 @@ function DashboardPage({ stats }) {
       })
       .catch(console.error)
       .finally(() => setOrderBarLoaded(true));
+  }, []);
+
+  // Load top 10 products (last 3 months)
+  useEffect(() => {
+    api('/orders/top-products')
+      .then(rows => setTopProducts(rows))
+      .catch(console.error)
+      .finally(() => setTopProductsLoaded(true));
   }, []);
 
   const totalPages = Math.max(1, Math.ceil(logsTotal / LOG_PAGE_SIZE));
@@ -562,6 +572,84 @@ function DashboardPage({ stats }) {
             </BarChart>
           </ResponsiveContainer>
         )}
+      </div>
+
+      {/* ── Top 10 Selling Products (Last 3 Months) ── */}
+      <div style={{ ...chartCard, marginBottom: 24 }}>
+        <p style={chartLabel}>Top 10 Selling Products — Last 3 Months (avg/month)</p>
+        {!topProductsLoaded ? (
+          <p style={emptyChart}>Loading…</p>
+        ) : topProducts.length === 0 ? (
+          <p style={emptyChart}>No order data in the last 3 months.</p>
+        ) : (() => {
+          const maxQty = topProducts[0]?.total_qty || 1;
+          return (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["#", "Product", "SKU", "Orders", "Units Sold", "Avg/Mo", "Revenue", "Volume"].map(h => (
+                    <th key={h} style={{
+                      color: C.muted, textAlign: h === "#" ? "center" : "left",
+                      padding: "8px 10px", fontWeight: 600, fontSize: 11,
+                      textTransform: "uppercase", letterSpacing: "0.06em",
+                      whiteSpace: "nowrap",
+                    }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {topProducts.map((p, i) => (
+                  <tr key={p.sku} style={{
+                    borderBottom: `1px solid ${C.border}`,
+                    transition: "background .15s",
+                  }}
+                    onMouseEnter={e => e.currentTarget.style.background = C.panel}
+                    onMouseLeave={e => e.currentTarget.style.background = ""}
+                  >
+                    <td style={{ padding: "10px 10px", textAlign: "center", width: 32 }}>
+                      <span style={{
+                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                        width: 24, height: 24, borderRadius: "50%", fontSize: 11, fontWeight: 700,
+                        background: i === 0 ? "#f59e0b22" : i === 1 ? "#94a3b822" : i === 2 ? "#cd7c3222" : C.border,
+                        color: i === 0 ? C.amber : i === 1 ? C.muted : i === 2 ? "#cd7c32" : C.muted,
+                      }}>{i + 1}</span>
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.text, maxWidth: 280 }}>
+                      <span title={p.product_name} style={{
+                        display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>{p.product_name}</span>
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.muted, fontFamily: "monospace", fontSize: 12 }}>
+                      {p.sku}
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.text, textAlign: "right" }}>
+                      {p.order_count}
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.accent, fontWeight: 600, textAlign: "right" }}>
+                      {p.total_qty}
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.blue, fontWeight: 600, textAlign: "right" }}>
+                      {parseFloat(p.avg_monthly_qty).toFixed(1)}
+                    </td>
+                    <td style={{ padding: "10px 10px", color: C.text, textAlign: "right", whiteSpace: "nowrap" }}>
+                      £{parseFloat(p.total_revenue || 0).toFixed(2)}
+                    </td>
+                    <td style={{ padding: "10px 16px", width: 100 }}>
+                      <div style={{ background: C.border, borderRadius: 4, height: 6, overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%", borderRadius: 4,
+                          width: `${Math.round((p.total_qty / maxQty) * 100)}%`,
+                          background: i === 0 ? C.amber : i < 3 ? C.accent : C.blue,
+                          transition: "width .4s ease",
+                        }} />
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        })()}
       </div>
 
       {/* ── Recent Sync Activity Table ── */}
