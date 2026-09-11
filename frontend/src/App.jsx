@@ -5655,6 +5655,11 @@ function OnBuyBulkPage() {
   const [metooLoading, setMetooLoading] = useState(false);
   const [metooErr, setMetooErr]         = useState("");
   const [mDragOver, setMDragOver]       = useState(false);
+  // Metoo history
+  const [metooHistory, setMetooHistory]           = useState([]);
+  const [metooHistLoading, setMetooHistLoading]   = useState(false);
+  const [metooExpanded, setMetooExpanded]         = useState(null);
+  const [metooItemsMap, setMetooItemsMap]         = useState({});
 
   // Pending queue tracking
   const [pendingStatus, setPendingStatus] = useState(null); // { pending, listing_created, failed, total }
@@ -5699,8 +5704,22 @@ function OnBuyBulkPage() {
     }).catch(() => {});
   }, []);
 
+  async function loadMetooHistory() {
+    setMetooHistLoading(true);
+    try { setMetooHistory(await api("/metoo-listings/history")); } catch {}
+    setMetooHistLoading(false);
+  }
+
+  async function loadMetooItems(sessionId) {
+    if (metooItemsMap[sessionId]) return;
+    try {
+      const items = await api(`/metoo-listings/history/${sessionId}/items`);
+      setMetooItemsMap(p => ({ ...p, [sessionId]: items }));
+    } catch {}
+  }
+
   useEffect(() => {
-    if (tab === "history") loadHistory();
+    if (tab === "history") { loadHistory(); loadMetooHistory(); }
     if (tab === "logs") {
       fetchLiveJob(); fetchLiveProductJob();
       liveLogsPollRef.current = setInterval(() => { fetchLiveJob(); fetchLiveProductJob(); }, 5000);
@@ -6528,6 +6547,97 @@ function OnBuyBulkPage() {
               ))}
             </div>
           )}
+        <div style={{ marginTop: 32 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ color: C.text, fontSize: 14, fontWeight: 700 }}>🔗 Metoo Listing Sessions</div>
+            <Btn variant="secondary" onClick={loadMetooHistory} style={{ padding: "6px 14px", fontSize: 12 }}>
+              ↻ Refresh
+            </Btn>
+          </div>
+          {metooHistLoading ? (
+            <div style={{ color: C.muted, padding: 24, textAlign: "center" }}>Loading…</div>
+          ) : metooHistory.length === 0 ? (
+            <div style={{ color: C.muted, padding: 24, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 12 }}>
+              No metoo submissions yet.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {metooHistory.map(s => (
+                <div key={s.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+                  <div onClick={() => {
+                    if (metooExpanded === s.id) { setMetooExpanded(null); return; }
+                    setMetooExpanded(s.id);
+                    loadMetooItems(s.id);
+                  }} style={{
+                    display: "grid", gridTemplateColumns: "1fr auto auto auto auto",
+                    gap: 16, padding: "12px 16px", cursor: "pointer", alignItems: "center",
+                    background: metooExpanded === s.id ? "#ffffff08" : "transparent",
+                  }}>
+                    <div>
+                      <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>{s.account_name || "—"}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{new Date(s.created_at).toLocaleString()}</div>
+                    </div>
+                    {[
+                      ["Total",     s.total,     C.text],
+                      ["Submitted", s.submitted, C.accent],
+                      ["Failed",    s.failed,    parseInt(s.failed) > 0 ? C.red : C.muted],
+                    ].map(([label, val, color]) => (
+                      <div key={label} style={{ textAlign: "center" }}>
+                        <div style={{ color, fontSize: 16, fontWeight: 700 }}>{val}</div>
+                        <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase" }}>{label}</div>
+                      </div>
+                    ))}
+                    <div style={{ color: C.muted, fontSize: 18 }}>{metooExpanded === s.id ? "▲" : "▼"}</div>
+                  </div>
+
+                  {metooExpanded === s.id && (
+                    <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 16px" }}>
+                      {!metooItemsMap[s.id] ? (
+                        <div style={{ color: C.muted, textAlign: "center", padding: 12 }}>Loading rows…</div>
+                      ) : (
+                        <div style={{ overflowX: "auto" }}>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                            <thead>
+                              <tr style={{ background: "#ffffff06" }}>
+                                {["OPC","SKU","Price","Stock","Condition","Status","Error"].map(h => (
+                                  <th key={h} style={{ padding: "6px 10px", color: C.muted, textAlign: "left",
+                                    fontSize: 10, textTransform: "uppercase", whiteSpace: "nowrap",
+                                    borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {metooItemsMap[s.id].map((item, i) => (
+                                <tr key={i} style={{ borderBottom: `1px solid ${C.border}22`,
+                                  background: item.status === "failed" ? "#ef444406" : "transparent" }}>
+                                  <td style={{ padding: "6px 10px", color: C.accent, fontFamily: "monospace" }}>{item.opc}</td>
+                                  <td style={{ padding: "6px 10px", color: C.text, fontFamily: "monospace" }}>{item.sku}</td>
+                                  <td style={{ padding: "6px 10px", color: C.blue }}>£{parseFloat(item.price).toFixed(2)}</td>
+                                  <td style={{ padding: "6px 10px", color: C.text }}>{item.stock}</td>
+                                  <td style={{ padding: "6px 10px", color: C.textDim }}>{item.condition}</td>
+                                  <td style={{ padding: "6px 10px" }}>
+                                    <span style={{
+                                      background: item.status === "submitted" ? "#00d4aa22" : "#ef444422",
+                                      color: item.status === "submitted" ? C.accent : C.red,
+                                      borderRadius: 5, padding: "2px 8px", fontSize: 10, fontWeight: 600,
+                                    }}>{item.status === "submitted" ? "✓ Live" : "✗ Failed"}</span>
+                                  </td>
+                                  <td style={{ padding: "6px 10px", color: C.red, fontSize: 11, maxWidth: 200 }}>
+                                    {item.error_msg || "—"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
         </div>
       )}
 

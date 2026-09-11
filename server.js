@@ -2580,6 +2580,31 @@ async function runMigrations() {
     `CREATE INDEX IF NOT EXISTS idx_bpq_user_status    ON onbuy_bulk_pending_queues(user_id, status)`,
     `CREATE INDEX IF NOT EXISTS idx_bpq_account_status ON onbuy_bulk_pending_queues(account_id, status)`,
     `CREATE INDEX IF NOT EXISTS idx_bpq_session        ON onbuy_bulk_pending_queues(session_id)`,
+    `CREATE TABLE IF NOT EXISTS metoo_listing_sessions (
+       id           SERIAL PRIMARY KEY,
+       user_id      INTEGER NOT NULL,
+       account_id   INTEGER NOT NULL,
+       account_name TEXT NOT NULL DEFAULT '',
+       total        INTEGER NOT NULL DEFAULT 0,
+       submitted    INTEGER NOT NULL DEFAULT 0,
+       failed       INTEGER NOT NULL DEFAULT 0,
+       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_mls_user ON metoo_listing_sessions(user_id)`,
+    `CREATE TABLE IF NOT EXISTS metoo_listing_items (
+       id           SERIAL PRIMARY KEY,
+       session_id   INTEGER NOT NULL,
+       user_id      INTEGER NOT NULL,
+       opc          TEXT,
+       sku          TEXT,
+       price        NUMERIC(10,2),
+       stock        INTEGER,
+       condition    TEXT,
+       status       TEXT NOT NULL DEFAULT 'submitted',
+       error_msg    TEXT,
+       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_mli_session ON metoo_listing_items(session_id)`,
     `CREATE TABLE IF NOT EXISTS daily_sync_stats (
        user_id          INT  NOT NULL,
        onbuy_account_id INT  NOT NULL DEFAULT 0,
@@ -4090,7 +4115,7 @@ app.post('/api/metoo-listings/preview', requireAuth, upload.single('file'), asyn
   }
 });
 
-// POST /api/metoo-listings/submit — call OnBuy batch listings API
+// POST /api/metoo-listings/submit — call OnBuy batch listings API and persist history
 app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
   const { rows, account_id } = req.body;
   if (!Array.isArray(rows) || rows.length === 0)
@@ -4113,11 +4138,12 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
   const token = await getTokenForAccount(account);
   if (!token) return res.status(400).json({ error: 'Could not obtain OnBuy token for this account' });
 
-  const siteId   = account.site_id || '2000';
+  const siteId    = account.site_id || '2000';
   const validRows = rows.filter(r => r.valid !== false && r.opc && r.sku && r.price);
   const CHUNK     = 100;
   let submitted = 0, failed = 0;
-  const errors = [];
+  const errors    = [];
+  const itemResults = []; // {opc, sku, price, stock, condition, status, error_msg}
 
   for (let i = 0; i < validRows.length; i += CHUNK) {
     const chunk = validRows.slice(i, i + CHUNK);
@@ -4128,28 +4154,90 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
       stock:     parseInt(r.stock) || 0,
       condition: r.condition || 'new',
     }));
+    let chunkOk = false, chunkErr = '';
     try {
-      const r = await fetch(`https://api.onbuy.com/v2/listings`, {
+      const resp = await fetch(`https://api.onbuy.com/v2/listings`, {
         method:  'POST',
         headers: { Authorization: token, 'Content-Type': 'application/json' },
         body:    JSON.stringify({ site_id: parseInt(siteId), listings }),
       });
-      const body = await r.json().catch(() => ({}));
-      if (r.ok) {
+      const body = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        chunkOk = true;
         submitted += chunk.length;
       } else {
+        chunkErr = body?.message || body?.error || `HTTP ${resp.status}`;
         failed += chunk.length;
-        const msg = body?.message || body?.error || `HTTP ${r.status}`;
-        errors.push(`Rows ${chunk[0]._row}–${chunk[chunk.length - 1]._row}: ${msg}`);
+        errors.push(`Rows ${chunk[0]._row ?? i+1}–${chunk[chunk.length-1]._row ?? i+chunk.length}: ${chunkErr}`);
       }
     } catch (err) {
+      chunkErr = err.message;
       failed += chunk.length;
-      errors.push(`Rows ${chunk[0]._row}–${chunk[chunk.length - 1]._row}: ${err.message}`);
+      errors.push(`Rows ${chunk[0]._row ?? i+1}–${chunk[chunk.length-1]._row ?? i+chunk.length}: ${err.message}`);
+    }
+    for (const r of chunk) {
+      itemResults.push({
+        opc: r.opc, sku: r.sku, price: r.price, stock: r.stock, condition: r.condition || 'new',
+        status: chunkOk ? 'submitted' : 'failed',
+        error_msg: chunkOk ? null : chunkErr,
+      });
     }
     if (i + CHUNK < validRows.length) await new Promise(r => setTimeout(r, 400));
   }
 
-  res.json({ submitted, failed, total: validRows.length, errors });
+  // Persist session + items to DB
+  try {
+    const { rows: [sess] } = await db.query(
+      `INSERT INTO metoo_listing_sessions (user_id, account_id, account_name, total, submitted, failed)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [req.effectiveUserId, account.id, account.account_name, validRows.length, submitted, failed]
+    );
+    const sessionId = sess.id;
+    for (const item of itemResults) {
+      await db.query(
+        `INSERT INTO metoo_listing_items (session_id, user_id, opc, sku, price, stock, condition, status, error_msg)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [sessionId, req.effectiveUserId, item.opc, item.sku, item.price, item.stock, item.condition, item.status, item.error_msg]
+      ).catch(() => {});
+    }
+  } catch (e) {
+    console.error('[Metoo] DB persist error:', e.message);
+  }
+
+  res.json({ submitted, failed, total: validRows.length, errors, items: itemResults });
+});
+
+// GET /api/metoo-listings/history — last 50 metoo sessions for current user
+app.get('/api/metoo-listings/history', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT s.id, s.account_name, s.total, s.submitted, s.failed, s.created_at
+       FROM metoo_listing_sessions s
+       WHERE s.user_id = $1
+       ORDER BY s.created_at DESC
+       LIMIT 50`,
+      [req.effectiveUserId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/metoo-listings/history/:sessionId/items — rows for a session
+app.get('/api/metoo-listings/history/:sessionId/items', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT opc, sku, price, stock, condition, status, error_msg, created_at
+       FROM metoo_listing_items
+       WHERE session_id = $1 AND user_id = $2
+       ORDER BY id ASC`,
+      [req.params.sessionId, req.effectiveUserId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─────────────────────────────────────────────
