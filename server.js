@@ -4021,6 +4021,138 @@ app.get('/api/import/logs', requireAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// METOO LISTINGS (batch create listings by OPC)
+// ─────────────────────────────────────────────
+
+// GET /api/metoo-listings/template — blank XLSX template with OPC, SKU, Price, Stock, Condition columns
+app.get('/api/metoo-listings/template', requireAuth, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const headers = ['OPC', 'SKU', 'Price (£)', 'Stock', 'Condition'];
+  const ws = XLSX.utils.aoa_to_sheet([
+    headers,
+    ['PX86XV', 'MY-SKU-001', '19.99', '10', 'new'],
+  ]);
+  ws['!cols'] = [{ wch: 14 }, { wch: 20 }, { wch: 12 }, { wch: 10 }, { wch: 14 }];
+  XLSX.utils.book_append_sheet(wb, ws, 'Metoo Listings');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', 'attachment; filename="metoo-listings-template.xlsx"');
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+});
+
+// POST /api/metoo-listings/preview — parse uploaded file, validate rows
+app.post('/api/metoo-listings/preview', requireAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const allRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (allRows.length < 2) return res.json({ total: 0, valid: 0, rows: [] });
+
+    const headers = allRows[0].map(h => String(h || '').trim().toLowerCase());
+    const dataRows = allRows.slice(1);
+
+    const findCol = (...aliases) => {
+      for (const a of aliases) {
+        const i = headers.findIndex(h => h === a || h.startsWith(a));
+        if (i >= 0) return i;
+      }
+      return -1;
+    };
+
+    const iOpc  = findCol('opc', 'oncommerce product code', 'product code');
+    const iSku  = findCol('sku', 'seller sku', 'seller_sku');
+    const iPrice = findCol('price', 'price (£)', 'price(£)', 'selling price', 'selling_price');
+    const iStock = findCol('stock', 'qty', 'quantity');
+    const iCond  = findCol('condition');
+
+    const getCell = (row, idx) => idx >= 0 && row[idx] !== undefined ? String(row[idx]).trim() : '';
+
+    const rows = dataRows.map((row, i) => {
+      if (!row.some(v => String(v).trim())) return null;
+      const opc       = getCell(row, iOpc);
+      const sku       = getCell(row, iSku);
+      const priceRaw  = getCell(row, iPrice).replace(/[£,\s]/g, '');
+      const price     = parseFloat(priceRaw) || null;
+      const stock     = parseInt(getCell(row, iStock)) || 0;
+      const condition = normalizeCondition(getCell(row, iCond));
+      const errors    = [];
+      if (!opc)   errors.push('OPC required');
+      if (!sku)   errors.push('SKU required');
+      if (!price) errors.push('Price required');
+      if (stock <= 0) errors.push('Stock must be > 0');
+      return { _row: i + 2, valid: errors.length === 0, errors, opc, sku, price, stock, condition };
+    }).filter(Boolean);
+
+    res.json({ total: rows.length, valid: rows.filter(r => r.valid).length, rows });
+  } catch (err) {
+    res.status(400).json({ error: `Failed to parse file: ${err.message}` });
+  }
+});
+
+// POST /api/metoo-listings/submit — call OnBuy batch listings API
+app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
+  const { rows, account_id } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: 'No rows provided' });
+  if (!account_id)
+    return res.status(400).json({ error: 'OnBuy account required' });
+
+  let account;
+  try {
+    const { rows: [acc] } = await db.query(
+      `SELECT * FROM onbuy_accounts WHERE id = $1 AND user_id = $2`,
+      [account_id, req.effectiveUserId]
+    );
+    if (!acc) return res.status(404).json({ error: 'Account not found' });
+    account = acc;
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+
+  const token = await getTokenForAccount(account);
+  if (!token) return res.status(400).json({ error: 'Could not obtain OnBuy token for this account' });
+
+  const siteId   = account.site_id || '2000';
+  const validRows = rows.filter(r => r.valid !== false && r.opc && r.sku && r.price);
+  const CHUNK     = 100;
+  let submitted = 0, failed = 0;
+  const errors = [];
+
+  for (let i = 0; i < validRows.length; i += CHUNK) {
+    const chunk = validRows.slice(i, i + CHUNK);
+    const listings = chunk.map(r => ({
+      opc:       r.opc,
+      sku:       r.sku,
+      price:     parseFloat(r.price),
+      stock:     parseInt(r.stock) || 0,
+      condition: r.condition || 'new',
+    }));
+    try {
+      const r = await fetch(`https://api.onbuy.com/v2/listings`, {
+        method:  'POST',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ site_id: parseInt(siteId), listings }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        submitted += chunk.length;
+      } else {
+        failed += chunk.length;
+        const msg = body?.message || body?.error || `HTTP ${r.status}`;
+        errors.push(`Rows ${chunk[0]._row}–${chunk[chunk.length - 1]._row}: ${msg}`);
+      }
+    } catch (err) {
+      failed += chunk.length;
+      errors.push(`Rows ${chunk[0]._row}–${chunk[chunk.length - 1]._row}: ${err.message}`);
+    }
+    if (i + CHUNK < validRows.length) await new Promise(r => setTimeout(r, 400));
+  }
+
+  res.json({ submitted, failed, total: validRows.length, errors });
+});
+
+// ─────────────────────────────────────────────
 // DELETE LISTINGS
 // ─────────────────────────────────────────────
 

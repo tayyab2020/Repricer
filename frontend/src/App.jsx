@@ -5646,6 +5646,16 @@ function OnBuyBulkPage() {
   const [err, setErr]             = useState("");
   const [dragOver, setDragOver]   = useState(false);
 
+  // Metoo Listings tab state
+  const [metooStep, setMetooStep]       = useState(1);
+  const [metooAccountId, setMetooAccountId] = useState("");
+  const [metooFile, setMetooFile]       = useState(null);
+  const [metooPreview, setMetooPreview] = useState(null);
+  const [metooResult, setMetooResult]   = useState(null);
+  const [metooLoading, setMetooLoading] = useState(false);
+  const [metooErr, setMetooErr]         = useState("");
+  const [mDragOver, setMDragOver]       = useState(false);
+
   // Pending queue tracking
   const [pendingStatus, setPendingStatus] = useState(null); // { pending, listing_created, failed, total }
   const pendingPollRef = useRef(null);
@@ -6017,7 +6027,7 @@ function OnBuyBulkPage() {
 
       {/* Tab switcher */}
       <div style={{ display: "flex", gap: 4, marginBottom: 0, borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
-        {[["import","📦 Import"], ["history","📋 History"], ["logs","📊 Live Logs"]].map(([t, label]) => (
+        {[["import","📦 Import"], ["metoo","🔗 Metoo Listings"], ["history","📋 History"], ["logs","📊 Live Logs"]].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)} style={{
             background: "none", border: "none", cursor: "pointer",
             padding: "8px 18px", fontSize: 14, fontWeight: 600,
@@ -6520,6 +6530,286 @@ function OnBuyBulkPage() {
           )}
         </div>
       )}
+
+      {/* ── Metoo Listings Tab ── */}
+      {tab === "metoo" && (() => {
+        const metooDropStyle = {
+          border: `2px dashed ${mDragOver ? C.accent : C.border}`,
+          borderRadius: 12, padding: "40px 24px", textAlign: "center",
+          cursor: "pointer", background: mDragOver ? C.accentDim : "transparent", transition: "all 0.2s",
+        };
+
+        async function parseMetooFile(f) {
+          setMetooErr(""); setMetooLoading(true);
+          const fd = new FormData();
+          fd.append("file", f);
+          try {
+            const token = localStorage.getItem("repricer_token");
+            const r = await fetch(`${API}/metoo-listings/preview`, {
+              method: "POST",
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+              body: fd,
+            });
+            if (!r.ok) {
+              const t = await r.text();
+              let msg; try { msg = JSON.parse(t)?.error; } catch {}
+              throw new Error(msg || t);
+            }
+            setMetooPreview(await r.json());
+            setMetooStep(2);
+          } catch (e) { setMetooErr(String(e.message || e)); }
+          setMetooLoading(false);
+        }
+
+        async function submitMetoo() {
+          if (!metooAccountId) { setMetooErr("Please select an OnBuy account first."); return; }
+          setMetooLoading(true); setMetooErr("");
+          try {
+            const validRows = metooPreview.rows.filter(r => r.valid);
+            const r = await api("/metoo-listings/submit", {
+              method: "POST",
+              body: JSON.stringify({ rows: validRows, account_id: metooAccountId }),
+            });
+            setMetooResult(r);
+            setMetooStep(3);
+          } catch (e) { setMetooErr(String(e.message || e)); }
+          setMetooLoading(false);
+        }
+
+        function resetMetoo() {
+          setMetooStep(1); setMetooFile(null); setMetooPreview(null);
+          setMetooResult(null); setMetooErr(""); setMetooAccountId("");
+        }
+
+        return (
+          <div>
+            {/* Step indicator */}
+            <div style={{ display: "flex", gap: 0, marginBottom: 28 }}>
+              {[["1","Upload File"],["2","Review Rows"],["3","Done"]].map(([n, label], i) => (
+                <div key={n} style={{ display: "flex", alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{
+                      width: 28, height: 28, borderRadius: "50%", display: "flex",
+                      alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700,
+                      background: metooStep > i+1 ? C.accent : metooStep === i+1 ? C.accent : C.border,
+                      color: metooStep >= i+1 ? "#000" : C.muted,
+                    }}>{metooStep > i+1 ? "✓" : n}</div>
+                    <span style={{ fontSize: 13, color: metooStep === i+1 ? C.text : C.muted }}>{label}</span>
+                  </div>
+                  {i < 2 && <div style={{ width: 32, height: 1, background: C.border, margin: "0 8px" }} />}
+                </div>
+              ))}
+            </div>
+
+            {metooErr && (
+              <div style={{ background: "#ef444422", border: `1px solid ${C.red}`, borderRadius: 8,
+                padding: "10px 14px", color: C.red, fontSize: 13, marginBottom: 16 }}>{metooErr}</div>
+            )}
+
+            {/* Step 1 — Upload + account + template */}
+            {metooStep === 1 && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+                <Section title="Upload File">
+                  <div style={metooDropStyle}
+                    onDragOver={e => { e.preventDefault(); setMDragOver(true); }}
+                    onDragLeave={() => setMDragOver(false)}
+                    onDrop={e => { e.preventDefault(); setMDragOver(false); const f = e.dataTransfer.files[0]; if (f) { setMetooFile(f); parseMetooFile(f); } }}
+                    onClick={() => document.getElementById("metoo-file-input").click()}>
+                    <div style={{ fontSize: 36, marginBottom: 8 }}>📂</div>
+                    <div style={{ color: C.text, fontWeight: 600, marginBottom: 4 }}>
+                      {metooFile ? metooFile.name : "Drop your .xlsx or .csv file here"}
+                    </div>
+                    <div style={{ color: C.muted, fontSize: 13 }}>or click to browse</div>
+                    {metooLoading && <div style={{ color: C.accent, marginTop: 12, fontSize: 13 }}>Parsing…</div>}
+                  </div>
+                  <input id="metoo-file-input" type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }}
+                    onChange={e => { const f = e.target.files[0]; if (f) { setMetooFile(f); parseMetooFile(f); } }} />
+                </Section>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  <Section title="Select OnBuy Account">
+                    <select value={metooAccountId} onChange={e => setMetooAccountId(e.target.value)}
+                      style={{
+                        background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8,
+                        color: C.text, padding: "9px 12px", fontSize: 14, width: "100%",
+                      }}>
+                      <option value="">— Select account —</option>
+                      {accounts.map(a => (
+                        <option key={a.id} value={a.id}>{a.account_name} (Site {a.site_id})</option>
+                      ))}
+                    </select>
+                    <p style={{ color: C.muted, fontSize: 12, marginTop: 8 }}>
+                      Listings will be created against existing OnBuy products in this store.
+                    </p>
+                  </Section>
+
+                  <Section title="Download Template">
+                    <p style={{ color: C.textDim, fontSize: 13, marginBottom: 10 }}>
+                      Fill in the template and upload it. Columns marked * are required.
+                    </p>
+                    <div style={{ fontSize: 12, color: C.muted, background: C.bg,
+                      borderRadius: 8, padding: "10px 12px", marginBottom: 12, lineHeight: 1.9 }}>
+                      <div><span style={{ color: C.red }}>*</span> OPC (OnCommerce Product Code)</div>
+                      <div><span style={{ color: C.red }}>*</span> SKU · Price (£) · Stock</div>
+                      <div style={{ color: C.textDim }}>Condition (new / used / refurbished…)</div>
+                    </div>
+                    <button
+                      onClick={async () => {
+                        const token = localStorage.getItem("repricer_token");
+                        const r = await fetch(`${API}/metoo-listings/template`, {
+                          headers: token ? { Authorization: `Bearer ${token}` } : {},
+                        });
+                        if (!r.ok) return;
+                        const blob = await r.blob();
+                        const url  = URL.createObjectURL(blob);
+                        const a    = document.createElement("a");
+                        a.href = url; a.download = "metoo-listings-template.xlsx"; a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                      style={{
+                        display: "inline-block", background: C.accent, color: "#000",
+                        borderRadius: 8, padding: "8px 16px", fontSize: 13, fontWeight: 600,
+                        border: "none", cursor: "pointer",
+                      }}>
+                      ⬇ Download Template (.xlsx)
+                    </button>
+                  </Section>
+                </div>
+              </div>
+            )}
+
+            {/* Step 2 — Review rows */}
+            {metooStep === 2 && metooPreview && (
+              <div>
+                <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+                  {[
+                    ["Total",   metooPreview.total,                           C.text],
+                    ["Valid",   metooPreview.valid,                           C.accent],
+                    ["Invalid", metooPreview.total - metooPreview.valid,      C.red],
+                  ].map(([label, val, color]) => (
+                    <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`,
+                      borderRadius: 10, padding: "12px 20px", minWidth: 100 }}>
+                      <div style={{ color: C.muted, fontSize: 11, textTransform: "uppercase", marginBottom: 4 }}>{label}</div>
+                      <div style={{ color, fontSize: 24, fontWeight: 700 }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {!metooAccountId && (
+                  <div style={{ background: "#f59e0b11", border: `1px solid #f59e0b44`, borderRadius: 8,
+                    padding: "10px 14px", color: C.amber, fontSize: 13, marginBottom: 16 }}>
+                    ⚠ Please go back and select an OnBuy account before submitting.
+                  </div>
+                )}
+
+                {metooPreview.valid > 0 && (
+                  <Section title="Row Preview">
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                            {["Row","OPC","SKU","Price","Stock","Condition","Status"].map(h => (
+                              <th key={h} style={{ padding: "8px 10px", color: C.muted, textAlign: "left",
+                                fontSize: 11, textTransform: "uppercase", whiteSpace: "nowrap" }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {metooPreview.rows.map(r => (
+                            <tr key={r._row} style={{ borderBottom: `1px solid ${C.border}22`,
+                              background: r.valid ? "transparent" : "#ef444408" }}>
+                              <td style={{ padding: "7px 10px", color: C.muted }}>{r._row}</td>
+                              <td style={{ padding: "7px 10px", color: C.accent, fontFamily: "monospace", fontSize: 12 }}>{r.opc || "—"}</td>
+                              <td style={{ padding: "7px 10px", color: C.text, fontFamily: "monospace", fontSize: 12 }}>{r.sku || "—"}</td>
+                              <td style={{ padding: "7px 10px", color: C.blue }}>
+                                {r.price != null ? `£${parseFloat(r.price).toFixed(2)}` : "—"}
+                              </td>
+                              <td style={{ padding: "7px 10px", color: C.text }}>{r.stock}</td>
+                              <td style={{ padding: "7px 10px", color: C.textDim }}>{r.condition || "new"}</td>
+                              <td style={{ padding: "7px 10px" }}>
+                                {r.valid
+                                  ? <span style={{ background: "#00d4aa22", color: C.accent, borderRadius: 5,
+                                      padding: "2px 8px", fontSize: 11, fontWeight: 600 }}>✓ OK</span>
+                                  : <span style={{ color: C.red, fontSize: 11 }} title={r.errors.join(", ")}>
+                                      ✗ {r.errors[0]}
+                                    </span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </Section>
+                )}
+
+                <div style={{ display: "flex", gap: 12, marginTop: 20 }}>
+                  <Btn variant="secondary" onClick={() => { setMetooStep(1); setMetooPreview(null); setMetooFile(null); }}>
+                    ← Back
+                  </Btn>
+                  <Btn
+                    disabled={metooPreview.valid === 0 || !metooAccountId || metooLoading}
+                    onClick={submitMetoo}
+                  >
+                    {metooLoading
+                      ? "Submitting…"
+                      : `Submit ${metooPreview.valid} Listing${metooPreview.valid !== 1 ? "s" : ""} to OnBuy`}
+                  </Btn>
+                </div>
+              </div>
+            )}
+
+            {/* Step 3 — Result */}
+            {metooStep === 3 && metooResult && (
+              <Section title="Submission Complete">
+                <div style={{ padding: "28px 24px" }}>
+                  <div style={{ textAlign: "center", marginBottom: 24 }}>
+                    <div style={{ fontSize: 48, marginBottom: 12 }}>
+                      {metooResult.failed === 0 ? "🎉" : metooResult.submitted === 0 ? "❌" : "⚠️"}
+                    </div>
+                    <div style={{ color: metooResult.submitted > 0 ? C.accent : C.red,
+                      fontSize: 22, fontWeight: 700, marginBottom: 8 }}>
+                      {metooResult.submitted} listing{metooResult.submitted !== 1 ? "s" : ""} submitted to OnBuy
+                    </div>
+                    {metooResult.failed > 0 && (
+                      <div style={{ color: C.red, fontSize: 14, marginBottom: 8 }}>
+                        {metooResult.failed} batch{metooResult.failed !== 1 ? "es" : ""} failed
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 20, flexWrap: "wrap" }}>
+                    {[
+                      ["Total",     metooResult.total,     C.text],
+                      ["Submitted", metooResult.submitted, C.accent],
+                      ["Failed",    metooResult.failed,    metooResult.failed > 0 ? C.red : C.muted],
+                    ].map(([label, val, color]) => (
+                      <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`,
+                        borderRadius: 10, padding: "12px 20px", minWidth: 110 }}>
+                        <div style={{ color: C.muted, fontSize: 10, textTransform: "uppercase", marginBottom: 4 }}>{label}</div>
+                        <div style={{ color, fontSize: 22, fontWeight: 700 }}>{val}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {metooResult.errors?.length > 0 && (
+                    <div style={{ background: "#ef444411", border: `1px solid ${C.red}44`, borderRadius: 8,
+                      padding: "12px 14px", marginBottom: 16 }}>
+                      <div style={{ color: C.red, fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Error Details</div>
+                      {metooResult.errors.map((e, i) => (
+                        <div key={i} style={{ color: C.red, fontSize: 12, marginBottom: 3 }}>• {e}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{ textAlign: "center", display: "flex", gap: 12, justifyContent: "center" }}>
+                    <Btn onClick={resetMetoo}>Submit More</Btn>
+                  </div>
+                </div>
+              </Section>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── Import Tab ── */}
       {tab === "import" && <>
