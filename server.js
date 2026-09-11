@@ -4204,6 +4204,40 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
     console.error('[Metoo] DB persist error:', e.message);
   }
 
+  // Create mapping records for successfully submitted listings (skip if SKU already mapped for this account)
+  const successItems = itemResults.filter(i => i.status === 'submitted');
+  if (successItems.length > 0) {
+    try {
+      // Load user's default ROI for the markup_value
+      let defaultRoi = 20;
+      try {
+        const { rows: [s] } = await db.query(
+          `SELECT value FROM settings WHERE user_id = $1 AND key = 'default_roi_percent' LIMIT 1`,
+          [req.effectiveUserId]
+        );
+        if (s) defaultRoi = parseFloat(s.value) || 20;
+      } catch {}
+
+      for (const item of successItems) {
+        // Only insert if no mapping already exists for this user+account+sku
+        await db.query(
+          `INSERT INTO product_mappings
+             (user_id, onbuy_account_id, onbuy_sku, onbuy_opc, last_onbuy_price,
+              markup_type, markup_value, markup_is_explicit, is_active)
+           SELECT $1, $2, $3, $4, $5, 'roi', $6, false, true
+           WHERE NOT EXISTS (
+             SELECT 1 FROM product_mappings
+             WHERE user_id = $1 AND onbuy_account_id = $2 AND onbuy_sku = $3
+           )`,
+          [req.effectiveUserId, account.id, item.sku, item.opc, item.price, defaultRoi]
+        ).catch(e => console.error('[Metoo] Mapping insert error:', e.message));
+      }
+      console.log(`[Metoo] Created/skipped mappings for ${successItems.length} SKU(s)`);
+    } catch (e) {
+      console.error('[Metoo] Mapping creation error:', e.message);
+    }
+  }
+
   res.json({ submitted, failed, total: validRows.length, errors, items: itemResults });
 });
 
