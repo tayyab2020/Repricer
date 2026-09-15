@@ -288,32 +288,46 @@ async function _login(page, email, password, log) {
 
   if (await _isLoggedIn(page)) { log('[Hunt] Already logged in ✓'); return; }
 
+  // Try clicking the login trigger using multiple selector fallbacks
   log('[Hunt] Opening login form…');
-  await page.waitForSelector('#panelUserRegisterLogin', { timeout: 10_000 });
-  await page.click('#panelUserRegisterLogin');
-  await page.evaluate(() =>
-    document.querySelector('#panelUserRegisterLogin')
-      ?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })),
-  );
-  await _sleep(1500);
-
-  let overlayVisible = await page.evaluate(() => {
-    const ov = document.querySelector('#loginOverlay');
-    return ov ? ov.offsetParent !== null : false;
+  const triggered = await page.evaluate(() => {
+    const candidates = [
+      'button[data-login]',
+      '#panelUserRegisterLogin',
+      '[data-action="login"]',
+      '[class*="loginBtn"]',
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el) { el.click(); return sel; }
+    }
+    // Text-based fallback
+    const btn = [...document.querySelectorAll('button, a, span')]
+      .find(e => /^(log in(\s*\/\s*register)?|login|sign in)$/i.test(e.textContent.trim()) && e.offsetParent !== null);
+    if (btn) { btn.click(); return 'text:' + btn.textContent.trim(); }
+    return null;
   });
 
-  if (!overlayVisible) {
-    await page.evaluate(() => {
-      const ov = document.querySelector('#loginOverlay');
-      if (ov) { ov.classList.remove('hidden'); ov.style.display = 'block'; }
-    });
-    await _sleep(500);
-    overlayVisible = await page.evaluate(
-      () => (document.querySelector('#loginOverlay')?.offsetParent) !== null,
-    );
+  if (!triggered) {
+    log('[Hunt] No login trigger found — navigating to keepa.com/#!login…');
+    await page.goto('https://keepa.com/#!login', { waitUntil: 'networkidle2', timeout: 20_000 });
+    await _sleep(2000);
+  } else {
+    log(`[Hunt] Login trigger clicked (${triggered})`);
+    await _sleep(1500);
   }
 
-  if (!overlayVisible) throw new Error('[Hunt] Login overlay could not be shown');
+  // Force overlay visible if still hidden
+  await page.evaluate(() => {
+    const ov = document.querySelector('#loginOverlay');
+    if (ov) { ov.classList.remove('hidden'); }
+  });
+  await _sleep(300);
+
+  // Wait for username field
+  await page.waitForSelector('#username', { timeout: 8_000 })
+    .catch(() => { throw new Error('Login form (#username) not found — Keepa UI may have changed'); });
+  log('[Hunt] Login form ready');
 
   await page.evaluate((em, pw) => {
     const fill = (el, val) => {
@@ -335,29 +349,33 @@ async function _login(page, email, password, log) {
 
   await page.waitForFunction(
     () => {
-      const trigger = document.querySelector('#panelUserRegisterLogin');
-      const menu    = document.querySelector('#panelUserMenu');
-      if (trigger && trigger.style.display === 'none') return true;
-      if (menu    && menu.style.display    !== 'none') return true;
+      const loginBtn = document.querySelector('button[data-login]');
+      if (!loginBtn) return true;
       const t = (document.body?.textContent || '').toLowerCase();
-      return t.includes('log out') || t.includes('logout');
+      return t.includes('log out') || t.includes('logout') ||
+             t.includes('sign out') || t.includes('quota:');
     },
     { timeout: 25_000 },
   ).catch(() => log('[Hunt] Login confirmation not detected — proceeding'));
 
   const ok = await _isLoggedIn(page);
   if (ok) { log('[Hunt] Login successful ✓'); }
-  else    { log('[Hunt] Warning: login may have failed — check Keepa credentials in account settings'); }
+  else {
+    const errMsg = await page.evaluate(
+      () => document.querySelector('#loginError')?.textContent?.trim() || null
+    );
+    if (errMsg) log(`[Hunt] Login error: "${errMsg}"`);
+    log('[Hunt] Warning: login may have failed — check Keepa credentials in account settings');
+  }
 }
 
 async function _isLoggedIn(page) {
   return page.evaluate(() => {
-    const trigger = document.querySelector('#panelUserRegisterLogin');
-    const menu    = document.querySelector('#panelUserMenu');
-    if (trigger && trigger.style.display === 'none') return true;
-    if (menu    && menu.style.display    !== 'none') return true;
+    const loginBtn = document.querySelector('button[data-login]');
+    if (!loginBtn) return true;
     const t = (document.body?.textContent || '').toLowerCase();
-    return t.includes('log out') || t.includes('logout');
+    return t.includes('log out') || t.includes('logout') ||
+           t.includes('sign out') || t.includes('quota:');
   });
 }
 
