@@ -4170,20 +4170,31 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
           submitted += chunk.length;
           break;
         }
+        // Build a detailed error string from the full response body
+        const fullErr = (() => {
+          try {
+            const msg  = body?.message || body?.error || body?.errors?.[0]?.message || '';
+            const code = body?.errorCode || body?.error_code || body?.code || '';
+            const detail = body?.errors ? JSON.stringify(body.errors) : '';
+            const parts = [msg, code && `[${code}]`, detail].filter(Boolean).join(' ');
+            return parts || JSON.stringify(body).slice(0, 300) || `HTTP ${resp.status}`;
+          } catch { return `HTTP ${resp.status}`; }
+        })();
+        console.warn(`[Metoo] HTTP ${resp.status} chunk attempt ${attempt + 1}: ${fullErr}`);
         // 401 — token expired: refresh and retry immediately
         if (resp.status === 401 && attempt < MAX_RETRIES) {
           console.warn('[Metoo] 401 badToken — refreshing token and retrying chunk…');
           token = await getTokenForAccount(account);
           if (!token) { chunkErr = 'Could not refresh OnBuy token'; break; }
-          continue; // retry with new token, no delay
+          continue;
         }
         // 5xx — transient server error: backoff and retry
         if (resp.status >= 500 && attempt < MAX_RETRIES) {
-          chunkErr = body?.message || body?.error || `HTTP ${resp.status}`;
+          chunkErr = fullErr;
           await new Promise(r => setTimeout(r, (attempt + 1) * 1500));
           continue;
         }
-        chunkErr = body?.message || body?.error || `HTTP ${resp.status}`;
+        chunkErr = fullErr;
         break;
       } catch (err) {
         chunkErr = err.message;
