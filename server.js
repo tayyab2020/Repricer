@@ -4135,15 +4135,16 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 
-  const token = await getTokenForAccount(account);
+  let token = await getTokenForAccount(account);
   if (!token) return res.status(400).json({ error: 'Could not obtain OnBuy token for this account' });
 
   const siteId    = account.site_id || '2000';
   const validRows = rows.filter(r => r.valid !== false && r.opc && r.sku && r.price);
   const CHUNK     = 100;
+  const MAX_RETRIES = 2;
   let submitted = 0, failed = 0;
   const errors    = [];
-  const itemResults = []; // {opc, sku, price, stock, condition, status, error_msg}
+  const itemResults = [];
 
   for (let i = 0; i < validRows.length; i += CHUNK) {
     const chunk = validRows.slice(i, i + CHUNK);
@@ -4155,25 +4156,46 @@ app.post('/api/metoo-listings/submit', requireAuth, async (req, res) => {
       condition: r.condition || 'new',
     }));
     let chunkOk = false, chunkErr = '';
-    try {
-      const resp = await fetch(`https://api.onbuy.com/v2/listings`, {
-        method:  'POST',
-        headers: { Authorization: token, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ site_id: parseInt(siteId), listings }),
-      });
-      const body = await resp.json().catch(() => ({}));
-      if (resp.ok) {
-        chunkOk = true;
-        submitted += chunk.length;
-      } else {
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const resp = await fetch(`https://api.onbuy.com/v2/listings`, {
+          method:  'POST',
+          headers: { Authorization: token, 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ site_id: parseInt(siteId), listings }),
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+          chunkOk = true;
+          submitted += chunk.length;
+          break;
+        }
+        // 401 — token expired: refresh and retry immediately
+        if (resp.status === 401 && attempt < MAX_RETRIES) {
+          console.warn('[Metoo] 401 badToken — refreshing token and retrying chunk…');
+          token = await getTokenForAccount(account);
+          if (!token) { chunkErr = 'Could not refresh OnBuy token'; break; }
+          continue; // retry with new token, no delay
+        }
+        // 5xx — transient server error: backoff and retry
+        if (resp.status >= 500 && attempt < MAX_RETRIES) {
+          chunkErr = body?.message || body?.error || `HTTP ${resp.status}`;
+          await new Promise(r => setTimeout(r, (attempt + 1) * 1500));
+          continue;
+        }
         chunkErr = body?.message || body?.error || `HTTP ${resp.status}`;
-        failed += chunk.length;
-        errors.push(`Rows ${chunk[0]._row ?? i+1}–${chunk[chunk.length-1]._row ?? i+chunk.length}: ${chunkErr}`);
+        break;
+      } catch (err) {
+        chunkErr = err.message;
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (attempt + 1) * 1500));
+        }
       }
-    } catch (err) {
-      chunkErr = err.message;
+    }
+
+    if (!chunkOk) {
       failed += chunk.length;
-      errors.push(`Rows ${chunk[0]._row ?? i+1}–${chunk[chunk.length-1]._row ?? i+chunk.length}: ${err.message}`);
+      errors.push(`Rows ${chunk[0]._row ?? i+1}–${chunk[chunk.length-1]._row ?? i+chunk.length}: ${chunkErr}`);
     }
     for (const r of chunk) {
       itemResults.push({
