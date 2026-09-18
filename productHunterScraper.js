@@ -82,7 +82,7 @@ export async function runProductHunting(
 
   const browser = await puppeteer.launch({
     headless: true,
-    protocolTimeout: 300_000,
+    protocolTimeout: 900_000,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--window-size=1440,900',
@@ -143,9 +143,15 @@ export async function runProductHunting(
                    : targetRows >= 5000  ? 65
                    : targetRows >= 2000  ? 35
                    : targetRows >= 1000  ? 15
-                   : 6;
+                   : 10;
     log(`[Hunt] Waiting ${waitSecs}s for Keepa to fetch and render ${targetRows} rows…`);
     await _sleep(waitSecs * 1000);
+
+    // Wait for Keepa's network request (data re-fetch) to finish before touching the DOM
+    log('[Hunt] Waiting for network idle after row-count change…');
+    await page.waitForNetworkIdle({ idleTime: 1500, timeout: 60_000 }).catch(() => {
+      log('[Hunt] Network idle wait timed out — proceeding');
+    });
 
     _checkCancelled(signal);
 
@@ -479,7 +485,8 @@ async function _waitForRows(page, log) {
     const val = await sig.jsonValue().catch(() => '?');
     log(`[Hunt] Table ready (${val})`);
   } else {
-    log('[Hunt] Warning: table rows not detected within 2 min — proceeding anyway');
+    log('[Hunt] Warning: table rows not detected within 2 min — waiting 30s for browser to settle…');
+    await _sleep(30_000); // extra settle time so the main thread isn't still busy when evaluate calls run
   }
 
   await _sleep(1000);
