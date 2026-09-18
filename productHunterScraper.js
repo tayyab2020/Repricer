@@ -819,14 +819,18 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
   const iFeature3 = _findCol(headers, ['Description & Features: Feature 3', 'Feature 3']);
   const iFeature4 = _findCol(headers, ['Description & Features: Feature 4', 'Feature 4']);
   const iFeature5 = _findCol(headers, ['Description & Features: Feature 5', 'Feature 5']);
-  const iNewCur   = _findCol(headers, ['New: Current', 'Amazon: Current']);
+  const iNewCur   = _findCol(headers, [
+    'New: Current', 'Amazon: Current', 'New, Current', 'Amazon, Current',
+    'New:Current', 'Amazon:Current', 'New Price', 'Current Price', 'Price',
+  ]);
   const iCatTree  = _findCol(headers, ['Categories: Tree', 'Category Tree', 'Categories Tree']);
   const iASIN     = col('ASIN');
   const iBrand    = col('Brand');
   const iColor    = _findCol(headers, ['Color', 'Colour']);
   const iEan      = _findCol(headers, ['EAN', 'Product Codes: EAN', 'Ean', 'GTIN', 'Barcode', 'UPC']);
 
-  log(`[Hunt] CSV columns (${headers.length}): ${headers.slice(0, 16).join(' | ')}`);
+  log(`[Hunt] CSV columns (${headers.length}): ${headers.slice(0, 20).join(' | ')}`);
+  if (iNewCur < 0) log('[Hunt] Warning: price column ("New: Current") not found in CSV — rows will upload without seed price (Amazon price fetched during import)');
 
   const rows = [];
 
@@ -869,10 +873,9 @@ function _mapKeepaToOnBuy(csvPath, maxListings, log) {
 
     rows.push({
       _row:     i + 1,
-      valid:    !!(title && price),
+      valid:    !!title,
       errors:   [
         ...(!title ? ['Product Name required'] : []),
-        ...(!price ? ['Price required'] : []),
       ],
       name:      title,
       sku:       asin || `HUNT-${Date.now()}-${i}`,
