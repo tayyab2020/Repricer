@@ -421,31 +421,27 @@ async function _selectCategory(page, category, log) {
 
       const textLower = text.trim().toLowerCase();
 
+      // offsetParent check is intentionally omitted: in headless mode the category
+      // grid renders all links in the DOM but many are below-viewport, making
+      // offsetParent === null even though the link is fully clickable.
+
       // 1. Exact text match
-      const exact = links.find(el =>
-        el.textContent.trim() === text.trim() && el.offsetParent !== null,
-      );
+      const exact = links.find(el => el.textContent.trim() === text.trim());
       if (exact) { exact.click(); return { found: true, method: 'exact', href: exact.href }; }
 
       // 2. Case-insensitive exact match
-      const ci = links.find(el =>
-        el.textContent.trim().toLowerCase() === textLower && el.offsetParent !== null,
-      );
+      const ci = links.find(el => el.textContent.trim().toLowerCase() === textLower);
       if (ci) { ci.click(); return { found: true, method: 'ci', href: ci.href }; }
 
       // 3. Partial / starts-with match
-      const partial = links.find(el =>
-        el.textContent.trim().toLowerCase().startsWith(textLower) && el.offsetParent !== null,
-      );
+      const partial = links.find(el => el.textContent.trim().toLowerCase().startsWith(textLower));
       if (partial) {
         partial.click();
         return { found: true, method: 'partial', matched: partial.textContent.trim(), href: partial.href };
       }
 
       // 4. Contains match (last resort)
-      const contains = links.find(el =>
-        el.textContent.trim().toLowerCase().includes(textLower) && el.offsetParent !== null,
-      );
+      const contains = links.find(el => el.textContent.trim().toLowerCase().includes(textLower));
       if (contains) {
         contains.click();
         return { found: true, method: 'contains', matched: contains.textContent.trim(), href: contains.href };
@@ -609,15 +605,13 @@ async function _configureColumns(page, log) {
         .filter(n => n.nodeType === Node.TEXT_NODE)
         .map(n => n.textContent.trim())
         .join('');
-      return /configure\s*columns?/i.test(own) && el.offsetParent !== null;
+      return /configure\s*columns?/i.test(own);
     });
     if (exact) { exact.click(); return 'exact:Configure Columns'; }
 
     // Broad fallback: any span/button with exact text "Configure Columns"
     const all = [...document.querySelectorAll('span, button, a')];
-    const btn = all.find(el =>
-      el.textContent.trim() === 'Configure Columns' && el.offsetParent !== null,
-    );
+    const btn = all.find(el => el.textContent.trim() === 'Configure Columns');
     if (btn) { btn.click(); return 'global-exact:Configure Columns'; }
 
     return null;
@@ -709,10 +703,10 @@ async function _exportCSV(page, dlDir, log) {
         '.tool__export',         '.tool_export',
       ]) {
         const el = root.querySelector(sel);
-        if (el && el.offsetParent !== null) { el.click(); return 'scope:' + sel; }
+        if (el) { el.click(); return 'scope:' + sel; }
       }
       const btn = [...root.querySelectorAll('span, a, button')].find(e =>
-        /^\s*export\s*$/i.test(e.textContent.trim()) && e.offsetParent !== null,
+        /^\s*export\s*$/i.test(e.textContent.trim()),
       );
       if (btn) { btn.click(); return 'text:' + btn.className.slice(0, 30); }
       return null;
