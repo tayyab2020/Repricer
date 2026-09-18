@@ -214,68 +214,91 @@ function _checkCancelled(signal) {
 
 // ─────────────────────────────────────────────────────────────
 // Switch Keepa to the correct Amazon marketplace for the given
-// OnBuy site_id.  Keepa shows the current Amazon locale in
-// #currentLanguage → clicks it to open #languageOverlay →
-// then clicks the matching span[rel="domain"][setting="X"] in
-// #language_domains.
+// OnBuy site_id.
+//
+// New Keepa UI (2024+):
+//   nav trigger: button.knav-mk[aria-current="true"]  (the active one shown in nav)
+//   marketplace panel: div.knav-mkgrid  (appears when nav marketplace item is clicked)
+//   marketplace buttons: button.knav-mk[data-domain="N"]
+//
+// data-domain values mirror the old "setting" values (2=UK, 3=DE, 4=FR, etc.)
 // ─────────────────────────────────────────────────────────────
 async function _selectKeepaMarketplace(page, siteId, log) {
   const setting = SITE_TO_KEEPA_SETTING[parseInt(siteId)] ?? '2'; // default .uk
 
-  // Check the currently active domain setting
-  const currentSetting = await page.evaluate(() => {
-    // The overlay may be hidden; we can still read the active span if visible,
-    // or fall back to the text shown in #currentLanguage
-    const active = document.querySelector('#language_domains span[rel="domain"].active');
-    if (active) return active.getAttribute('setting');
-    // Not visible — open overlay briefly to read it, then read from current display
-    const cur = document.querySelector('#currentLanguage span.languageMenuImg[rel="domain"]');
-    if (cur) {
-      const txt = cur.textContent.trim().replace(/^\./, ''); // ".uk" → "uk" / ".de" → "de"
-      const map = { uk: '2', fr: '4', de: '3', it: '8', es: '9',
-                    com: '1', ca: '5', mx: '6', br: '7', jp: '10', 'in': '11', 'co.uk': '2' };
-      return map[txt] ?? null;
-    }
+  // Check current marketplace via the active knav-mk button
+  const currentDomain = await page.evaluate(() => {
+    const active = document.querySelector('button.knav-mk[aria-current="true"]');
+    if (active) return active.getAttribute('data-domain');
+    // Old UI fallback
+    const oldActive = document.querySelector('#language_domains span[rel="domain"].active');
+    if (oldActive) return oldActive.getAttribute('setting');
     return null;
   });
 
-  if (currentSetting === setting) {
-    log(`[Hunt] Keepa marketplace already correct (setting=${setting})`);
+  if (currentDomain === setting) {
+    log(`[Hunt] Keepa marketplace already correct (domain=${setting})`);
     return;
   }
 
-  log(`[Hunt] Switching Keepa marketplace to setting=${setting} (site_id=${siteId})…`);
+  log(`[Hunt] Switching Keepa marketplace to domain=${setting} (site_id=${siteId})…`);
 
-  // 1. Open language overlay by clicking #currentLanguage
-  await page.evaluate(() => {
-    const el = document.querySelector('#currentLanguage') ??
-               document.querySelector('#panelLanguage');
-    if (el) el.click();
-  });
-  await _sleep(1500);
+  // 1. Open marketplace panel — click the nav item that holds the marketplace selector.
+  //    In the new UI it's a .knav-item that wraps the active button in the top nav.
+  const opened = await page.evaluate((s) => {
+    // Try new UI: find the .knav-item that is the parent/ancestor of button.knav-mk buttons
+    const grid = document.querySelector('div.knav-mkgrid');
+    if (grid) {
+      // panel already open — just click target button directly
+      const btn = grid.querySelector(`button.knav-mk[data-domain="${s}"]`);
+      if (btn) { btn.click(); return 'direct'; }
+    }
+    // Find the trigger: the nav item that opens the marketplace panel
+    // It's the .knav-item containing button.knav-mk[aria-current="true"]
+    const trigger = document.querySelector('.knav-item:has(button.knav-mk), button.knav-mk[aria-current="true"]');
+    const navItem = trigger?.closest?.('.knav-item') ?? trigger?.parentElement;
+    if (navItem) { navItem.click(); return 'navItem'; }
+    // Fallback: click the old #currentLanguage selector
+    const old = document.querySelector('#currentLanguage') ?? document.querySelector('#panelLanguage');
+    if (old) { old.click(); return 'oldUI'; }
+    return null;
+  }, setting);
 
-  // 2. Wait for #language_domains to be visible
+  if (!opened) {
+    log('[Hunt] Warning: could not open marketplace selector — proceeding with current locale');
+    return;
+  }
+
+  if (opened === 'direct') {
+    log(`[Hunt] Keepa marketplace switched ✓ (panel was already open)`);
+    await _sleep(3000);
+    return;
+  }
+
+  await _sleep(1200);
+
+  // 2. Wait for the marketplace grid to appear
   await page.waitForFunction(
-    () => {
-      const ov = document.querySelector('#languageOverlay');
-      return ov && (ov.style.display !== 'none') && ov.offsetParent !== null;
-    },
+    () => !!document.querySelector('div.knav-mkgrid, #languageOverlay'),
     { timeout: 8000 },
-  ).catch(() => log('[Hunt] Warning: language overlay did not open'));
+  ).catch(() => log('[Hunt] Warning: marketplace panel did not open'));
 
-  // 3. Click the matching domain span
+  // 3. Click the target marketplace button (new UI) or old span
   const clicked = await page.evaluate((s) => {
+    // New UI
+    const btn = document.querySelector(`button.knav-mk[data-domain="${s}"]`);
+    if (btn) { btn.click(); return 'new:' + s; }
+    // Old UI fallback
     const span = document.querySelector(`#language_domains span[rel="domain"][setting="${s}"]`);
-    if (span) { span.click(); return true; }
-    return false;
+    if (span) { span.click(); return 'old:' + s; }
+    return null;
   }, setting);
 
   if (clicked) {
-    log(`[Hunt] Keepa marketplace switched ✓ — waiting for page to reload…`);
+    log(`[Hunt] Keepa marketplace switched ✓ (${clicked}) — waiting for page to reload…`);
     await _sleep(3000);
   } else {
-    log(`[Hunt] Warning: domain setting="${setting}" not found in Keepa overlay — proceeding with current locale`);
-    // Close overlay
+    log(`[Hunt] Warning: domain ${setting} button not found in marketplace panel — proceeding with current locale`);
     await page.keyboard.press('Escape');
     await _sleep(500);
   }
@@ -404,10 +427,12 @@ async function _selectCategory(page, category, log) {
 
     log(`[Hunt] Looking for category "${label}"…`);
 
-    // Wait for category nav links to appear (they load after the page SPA renders)
+    // Wait for category links to fully render. Use length >= 20 (not > 0) because
+    // Keepa's SPA can render A-B links first; waiting for a stable batch ensures
+    // categories from later in the alphabet (e.g. "Health & Personal Care") are present.
     await page.waitForFunction(
-      () => document.querySelectorAll('#besteller-category-container a, a[href*="bestseller/"]').length > 0,
-      { timeout: 15_000 },
+      () => document.querySelectorAll('#besteller-category-container a, a[href*="bestseller/"]').length >= 20,
+      { timeout: 20_000 },
     ).catch(() => log('[Hunt] Timeout waiting for category links — trying anyway'));
 
     const found = await page.evaluate((text) => {
