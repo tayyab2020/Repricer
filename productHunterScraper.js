@@ -55,10 +55,9 @@ const TARGET_COLUMNS = [
   { dataSearch: 'description features feature 3',   label: 'Feature 3' },
   { dataSearch: 'description features feature 4',   label: 'Feature 4' },
   { dataSearch: 'description features feature 5',   label: 'Feature 5' },
-  // TODO: confirm exact data-search values for these three from DevTools
-  { dataSearch: 'categories rank categories tree',  label: 'Categories: Tree' },
+  { dataSearch: 'categories tree',                  label: 'Categories: Tree' },
   { dataSearch: 'new current',                      label: 'New: Current' },
-  { dataSearch: 'ungrouped ean',                    label: 'Product Codes: EAN' },
+  { dataSearch: 'product codes ean',                label: 'Product Codes: EAN' },
 ];
 
 // ─────────────────────────────────────────────────────────────
