@@ -41,21 +41,24 @@ const SITE_TO_KEEPA_SETTING = {
 // ─────────────────────────────────────────────────────────────
 // Column names to enable (exact Keepa column headers)
 // ─────────────────────────────────────────────────────────────
+// Each entry: dataSearch = current Keepa data-search attribute value (confirmed from DevTools)
+//             label      = visible label text (fallback if dataSearch not found)
 const TARGET_COLUMNS = [
-  'ASIN',
-  'Title',
-  'Description',
-  'Image',
-  'Brand',
-  'Categories: Tree',
-  'New: Current',
-  'Color',
-  'Description & Features: Feature 1',
-  'Description & Features: Feature 2',
-  'Description & Features: Feature 3',
-  'Description & Features: Feature 4',
-  'Description & Features: Feature 5',
-  'Product Codes: EAN',
+  { dataSearch: 'ungrouped asin',                   label: 'ASIN' },
+  { dataSearch: 'ungrouped title',                  label: 'Title' },
+  { dataSearch: 'ungrouped brand',                  label: 'Brand' },
+  { dataSearch: 'ungrouped image',                  label: 'Image' },
+  { dataSearch: 'ungrouped color',                  label: 'Color' },
+  { dataSearch: 'description features description', label: 'Description' },
+  { dataSearch: 'description features feature 1',   label: 'Feature 1' },
+  { dataSearch: 'description features feature 2',   label: 'Feature 2' },
+  { dataSearch: 'description features feature 3',   label: 'Feature 3' },
+  { dataSearch: 'description features feature 4',   label: 'Feature 4' },
+  { dataSearch: 'description features feature 5',   label: 'Feature 5' },
+  // TODO: confirm exact data-search values for these three from DevTools
+  { dataSearch: 'categories rank categories tree',  label: 'Categories: Tree' },
+  { dataSearch: 'new current',                      label: 'New: Current' },
+  { dataSearch: 'ungrouped ean',                    label: 'Product Codes: EAN' },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -643,44 +646,42 @@ async function _configureColumns(page, log) {
   await _sleep(800);
 
   // ── 3. Enable each target column ──────────────────────────────────────
-  for (const colName of TARGET_COLUMNS) {
-    const enabled = await page.evaluate((name) => {
-      // Strategy 1: p[data-search="${name}"] — handles nested columns like "New: Current",
-      //             "Categories: Tree", "Buy Box: Current" whose label text is just the
-      //             leaf word ("Current", "Tree") not the full qualified name.
-      const bySearch = [...document.querySelectorAll('p[data-search]')]
-        .find(p => p.getAttribute('data-search') === name);
-      if (bySearch) {
-        const cb = bySearch.querySelector('input[type="checkbox"]');
-        if (cb) { if (!cb.checked) cb.click(); return true; }
+  for (const col of TARGET_COLUMNS) {
+    const enabled = await page.evaluate((dataSearch, label) => {
+      // Strategy 1: exact data-search match (new Keepa UI format)
+      const byNewSearch = document.querySelector(`p[data-search="${dataSearch}"]`);
+      if (byNewSearch) {
+        const cb = byNewSearch.querySelector('input[type="checkbox"]');
+        if (cb) { if (!cb.checked) cb.click(); return `data-search:${dataSearch}`; }
       }
 
-      // Strategy 2: label whose text exactly matches the column name
+      // Strategy 2: label text exact match (title attribute or text content)
       const labels = [...document.querySelectorAll('label')];
       for (const lbl of labels) {
-        if (lbl.textContent.trim().toLowerCase() === name.toLowerCase()) {
+        const t = (lbl.getAttribute('title') || lbl.textContent).trim();
+        if (t.toLowerCase() === label.toLowerCase()) {
           const inp = document.getElementById(lbl.htmlFor) ??
                       lbl.previousElementSibling ??
                       lbl.parentElement?.querySelector('input[type="checkbox"]');
-          if (inp?.type === 'checkbox') { if (!inp.checked) inp.click(); return true; }
+          if (inp?.type === 'checkbox') { if (!inp.checked) inp.click(); return `label:${t}`; }
         }
       }
 
-      // Strategy 3: checkbox whose associated label contains the column name
-      const allCBs = [...document.querySelectorAll('input[type="checkbox"]')];
-      for (const cb of allCBs) {
-        const lbl = document.querySelector(`label[for="${cb.id}"]`);
-        const labelText = lbl?.textContent?.trim() ?? '';
-        if (labelText.toLowerCase().includes(name.toLowerCase())) {
-          if (!cb.checked) cb.click();
-          return true;
+      // Strategy 3: partial label match
+      for (const lbl of labels) {
+        const t = (lbl.getAttribute('title') || lbl.textContent).trim();
+        if (t.toLowerCase().includes(label.toLowerCase())) {
+          const inp = document.getElementById(lbl.htmlFor) ??
+                      lbl.previousElementSibling ??
+                      lbl.parentElement?.querySelector('input[type="checkbox"]');
+          if (inp?.type === 'checkbox') { if (!inp.checked) inp.click(); return `partial:${t}`; }
         }
       }
 
-      return false;
-    }, colName);
+      return null;
+    }, col.dataSearch, col.label);
 
-    log(`[Hunt] Column "${colName}": ${enabled ? 'enabled ✓' : 'not found'}`);
+    log(`[Hunt] Column "${col.label}": ${enabled ? `enabled ✓ (${enabled})` : 'not found ✗'}`);
     await _sleep(250);
   }
 
