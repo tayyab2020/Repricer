@@ -2529,8 +2529,15 @@ async function processBulkImportJob(job) {
           body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings }),
         });
         if (listingRes.status === 401) { await refreshToken(); continue; }
-        listingData = await listingRes.json();
-        if (!/does not yet exist for the site/i.test(JSON.stringify(listingData))) break;
+        // Use .text() first — OnBuy can return non-JSON on 5xx, which .json() would throw on
+        const listingTxt = await listingRes.text().catch(() => '');
+        try { listingData = JSON.parse(listingTxt); } catch { listingData = null; }
+        if (!listingData) {
+          blog(`Phase 4 HTTP ${listingRes.status} non-JSON (attempt ${attempt}/3): ${listingTxt.slice(0, 200)}`);
+          if (attempt < 3) { await new Promise(r => setTimeout(r, attempt * 3_000)); continue; }
+          break;
+        }
+        if (!/does not yet exist for the site/i.test(listingTxt)) break;
         if (attempt < 3) { blog(`OPC not propagated — waiting 15 s`); await new Promise(res => setTimeout(res, 15_000)); }
       }
       if (!listingData) listingData = {};
