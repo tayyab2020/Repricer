@@ -2575,7 +2575,9 @@ async function processBulkImportJob(job) {
           await refreshToken();
           updRes = await fetch(`https://api.onbuy.com/v2/listings?site_id=${siteId}`, { method: 'PUT', headers: { Authorization: currentToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ site_id: parseInt(siteId)||2000, listings: upd }) });
         }
-        const updData = await updRes.json();
+        const updTxt = await updRes.text().catch(() => '');
+        let updData; try { updData = JSON.parse(updTxt); } catch { updData = null; }
+        if (!updData) { blog(`Phase 4 update HTTP ${updRes.status} non-JSON: ${updTxt.slice(0, 200)}`); updData = {}; }
         const updResults = updData?.results ?? updData?.payload ?? [];
         for (let j = 0; j < updateNeeded.length; j++) {
           const m   = updateNeeded[j];
