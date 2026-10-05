@@ -6,6 +6,7 @@ services:
   app:
     environment:
       DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
       NODE_ENV: "production"
     logging:
       driver: "json-file"
@@ -16,6 +17,7 @@ services:
   repricer:
     environment:
       DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
       NODE_ENV: "production"
     logging:
       driver: "json-file"
@@ -26,6 +28,7 @@ services:
   orders:
     environment:
       DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
@@ -40,6 +43,7 @@ services:
   compliance:
     environment:
       DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
