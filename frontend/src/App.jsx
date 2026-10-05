@@ -483,7 +483,7 @@ function DashboardPage({ stats }) {
         <StatCard label="Compliance Violations (Total)" value={stats?.complianceViolationsTotal ?? 0} color={C.red}   icon={ShieldAlert} />
         <StatCard label="Actioned (7d)"                 value={stats?.complianceLast7d ?? 0}          color={C.amber} icon={AlertTriangle} />
         <StatCard
-          label="Last Patrol"
+          label="Last Compliance Violation"
           value={stats?.complianceLastRun ? ago(stats.complianceLastRun) : "Never"}
           color={C.muted}
           icon={Clock}
