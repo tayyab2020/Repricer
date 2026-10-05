@@ -97,6 +97,7 @@ services:
   # ── Node.js — Repricer Worker ───────────────────────────────────────────────
   repricer:
     build: .
+    init: true
     command: node repricerJob.js
     environment:
       DATABASE_URL:        "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-StrongPassword123!}@postgres:5432/${POSTGRES_DB:-repricer}"

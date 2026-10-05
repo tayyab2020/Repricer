@@ -4,7 +4,7 @@
 services:
   app:
     environment:
-      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      DATABASE_URL: "${DATABASE_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
@@ -18,7 +18,7 @@ services:
 
   repricer:
     environment:
-      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      DATABASE_URL: "${DATABASE_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
@@ -32,7 +32,7 @@ services:
 
   orders:
     environment:
-      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      DATABASE_URL: "${DATABASE_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
@@ -46,7 +46,7 @@ services:
 
   compliance:
     environment:
-      DATABASE_URL: "postgresql://repricer:h111j333!@172.17.0.1:5432/repricer_db"
+      DATABASE_URL: "${DATABASE_URL}"
       NODE_ENV: "production"
     deploy:
       resources:
